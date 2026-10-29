@@ -110,18 +110,35 @@ def find_wheels(m, config):
     return centres, radius
 
 
+# How far the width may be stretched or squeezed to put the model's wheel arches over the template's wheels.
+MAX_TRACK_STRETCH = 0.08
+
+
 def fit(m, centres, radius, target):
-    """Scales and moves the model so its axles sit on the template's."""
+    """Scales and moves the model so its axles sit on the template's. The scale
+    is uniform (from the wheelbase), then the width alone is stretched or
+    squeezed slightly so the model's track matches the template's: the game
+    draws the template's wheels at the template's track, and on a model with a
+    narrower track they stick out through the wheel arches. Returns the model,
+    its wheel centres, the wheel radius, the scale and the width factor."""
     src_base = np.mean(centres[:2, 2]) - np.mean(centres[2:, 2])
     dst_base = np.mean(target[:2, 2]) - np.mean(target[2:, 2])
     s = dst_base / src_base
+    track = np.mean(np.abs(target[:, 0])) / (s * np.mean(np.abs(centres[:, 0])))
+    if abs(track - 1.0) > MAX_TRACK_STRETCH:
+        raise ValueError(f"the model's track differs from the template's by {abs(track - 1.0):.0%}; "
+                         'choose a template car of a more similar shape')
+    scale = np.array([s * track, s, s])
     offset = np.array([
         0.0,
         np.mean(target[:, 1]) - s * np.mean(centres[:, 1]),
         np.mean(target[:, 2]) - s * np.mean(centres[:, 2]),
     ])
-    out = mesh.Mesh(m.positions * s + offset, m.normals, m.uvs, m.material, m.materials, 1.0, 'Y')
-    return out, centres * s + offset, radius * s, s
+    # The normals of a surface scaled unevenly scale by the inverse.
+    normals = m.normals / scale
+    normals /= np.maximum(np.linalg.norm(normals, axis=-1, keepdims=True), 1e-12)
+    out = mesh.Mesh(m.positions * scale + offset, normals, m.uvs, m.material, m.materials, 1.0, 'Y')
+    return out, centres * scale + offset, radius * s, s, track
 
 
 def remove_wheels(m, centres, radius, margin=1.04):
@@ -539,9 +556,9 @@ def convert(config):
     drop = [i for i, x in enumerate(src.materials) if any(fnmatch.fnmatchcase(x.name, p) for p in config.remove)]
     if drop:
         src = _faces_keep(src, ~np.isin(src.material, drop))
-    src, centres, radius, s = fit(src, centres, radius, template_wheels(template))
+    src, centres, radius, s, track = fit(src, centres, radius, template_wheels(template))
     src, gone = remove_wheels(src, centres, radius)
-    log(f'fitted: scale {s:.4f}, wheel radius {radius:.3f} m, {gone} wheel triangles removed, '
+    log(f'fitted: scale {s:.4f}, width x{track:.3f}, wheel radius {radius:.3f} m, {gone} wheel triangles removed, '
         f'{src.triangles} left; size {np.ptp(src.positions, axis=0).round(2)} m')
     roles = [role_of(x.name, config) for x in src.materials]
     welded, keep = decimate.weld_positions(src.positions)

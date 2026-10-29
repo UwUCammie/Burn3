@@ -17,7 +17,11 @@ file(CONFIGURE OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/generated/takedown/version.hpp
      CONTENT "#pragma once\n#define TAKEDOWN_RENDERER_VERSION \"v${TAKEDOWN_GAME_VERSION}\"\n" @ONLY)
 target_include_directories(parallel-gs-stream PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
 # The application talks to SDL3 directly (event filter, display modes).
-if (TARGET SDL3::Headers)
+if (GRANITE_PLATFORM STREQUAL "headless")
+    # Granite's headless platform does not bring SDL in; the application's direct calls need the library.
+    find_package(SDL3 REQUIRED)
+    target_link_libraries(parallel-gs-stream PRIVATE SDL3::SDL3)
+elseif (TARGET SDL3::Headers)
     target_link_libraries(parallel-gs-stream PRIVATE SDL3::Headers)
 endif()
 

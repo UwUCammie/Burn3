@@ -50,7 +50,10 @@ else()
     set(GRANITE_VULKAN_SYSTEM_HANDLES ON CACHE BOOL "" FORCE)
     set(GRANITE_SHADER_COMPILER_OPTIMIZE ON CACHE BOOL "" FORCE)
     set(GRANITE_SHIPPING OFF CACHE BOOL "" FORCE)
-    set(GRANITE_PLATFORM "SDL" CACHE STRING "" FORCE)
+    # TAKEDOWN_RENDERER_PLATFORM=headless builds a replayer that needs no display (automated tests replay recorded
+    # streams with it, see tools/gametest); the shipped renderer is SDL.
+    set(TAKEDOWN_RENDERER_PLATFORM "SDL" CACHE STRING "Granite platform of the renderer (SDL or headless)")
+    set(GRANITE_PLATFORM "${TAKEDOWN_RENDERER_PLATFORM}" CACHE STRING "" FORCE)
 endif()
 
 add_subdirectory(Granite EXCLUDE_FROM_ALL)
