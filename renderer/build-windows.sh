@@ -21,6 +21,16 @@ JOBS=${JOBS:-12}
 export WINEPREFIX=${WINEPREFIX:-$HERE/../tmp/burnout-wineprefix}
 export WINEDEBUG=${WINEDEBUG:--all}
 
+# Takedown changes to the Granite submodule (upstream commit pinned by the
+# submodule) are kept as patches; apply each once.
+for p in "$SRC"/takedown/patches/granite-*.patch; do
+    [ -e "$p" ] || continue
+    if git -C "$SRC/Granite" apply --reverse --check "$p" 2>/dev/null; then
+        continue
+    fi
+    git -C "$SRC/Granite" apply "$p"
+done
+
 cmake -S "$SRC" -B "$BUILD_DIR" -G Ninja \
     -C "$HERE/cmake/windows-renderer-options.cmake" \
     -DCMAKE_TOOLCHAIN_FILE="$HERE/cmake/wine-mingw-renderer.cmake" \
