@@ -1,4 +1,4 @@
-# Takedown Recomp
+# Burn3 - Takedown Recomp
 
 An unofficial native runtime and renderer for the PlayStation 2 version of *Burnout 3: Takedown*
 on PC.
