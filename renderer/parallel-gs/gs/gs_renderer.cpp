@@ -854,6 +854,8 @@ bool GSRenderer::init(Vulkan::Device *device_, const GSOptions &options)
 {
 	drain_compilation_tasks();
 
+	// Takedown: step lines (as in the release renderer) to locate startup failures.
+	LOGI("GS init: creating shader programs.\n");
 	Vulkan::ResourceLayout layout;
 	shaders = Shaders<>(*device_, layout, 0);
 	blit_quad = device_->request_program(shaders.quad, shaders.blit_circuit);
@@ -861,6 +863,7 @@ bool GSRenderer::init(Vulkan::Device *device_, const GSOptions &options)
 	sample_quad[1] = device_->request_program(shaders.quad, shaders.sample_circuit[1]);
 	weave_quad = device_->request_program(shaders.quad, shaders.weave);
 
+	LOGI("GS init: first submit.\n");
 	flush_submit(0);
 	// Descriptor indexing is a hard requirement, but timeline semaphore could be elided if really needed.
 	// Wave-ops is critical.
@@ -906,6 +909,7 @@ bool GSRenderer::init(Vulkan::Device *device_, const GSOptions &options)
 	buffers.ssbo_alignment =
 			std::max<VkDeviceSize>(16, device->get_gpu_properties().limits.minStorageBufferOffsetAlignment);
 
+	LOGI("GS init: allocating VRAM.\n");
 	init_vram(options);
 	timeline = device->request_semaphore(VK_SEMAPHORE_TYPE_TIMELINE);
 	descriptor_timeline = device->request_semaphore(VK_SEMAPHORE_TYPE_TIMELINE);

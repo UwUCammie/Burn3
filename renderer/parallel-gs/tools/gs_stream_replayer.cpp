@@ -23,6 +23,7 @@
 #include "math.hpp"
 
 #include "completion_writer.hpp"
+#include "crash_report.hpp"
 #include "discord_presence.hpp"
 #include "host_ui_renderer.hpp"
 #include "input_writer.hpp"
@@ -2684,6 +2685,18 @@ namespace Granite
 {
 Application *application_create(int argc, char **argv)
 {
+	TakedownRenderer::install_crash_report();
+	// TAKEDOWN_DEV_CRASH_TEST=segv|abort|throw: crash on purpose to check the crash report.
+	if (const char *test = getenv("TAKEDOWN_DEV_CRASH_TEST"))
+	{
+		const std::string kind = test;
+		if (kind == "segv")
+			*static_cast<volatile int *>(nullptr) = 1;
+		else if (kind == "abort")
+			abort();
+		else if (kind == "throw")
+			std::thread([]() { throw std::runtime_error("crash test"); }).join();
+	}
 	load_dev_environment(argc > 0 ? argv[0] : nullptr);
 	ParallelGS::StreamOptions options;
 	if (argc > 0 && argv[0])

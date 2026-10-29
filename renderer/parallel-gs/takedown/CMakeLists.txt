@@ -4,6 +4,7 @@
 # no Granite, so its tests build and run anywhere.
 add_library(takedown-io STATIC
     completion_writer.cpp
+    crash_report.cpp
     discord_presence.cpp
     input_writer.cpp
     stream_pipe.cpp)
