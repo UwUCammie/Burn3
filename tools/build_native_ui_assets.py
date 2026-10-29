@@ -6,7 +6,10 @@ metrics; no retail data is distributed and no console UI buffers are extended.
 """
 from pathlib import Path
 import argparse
+import hashlib
+import io
 import json
+import os
 import struct
 import numpy as np
 from PIL import Image
@@ -99,10 +102,35 @@ def dictionary(data):
         yield name, at
 
 
+def store(path, data):
+    # Writes only files whose content changed. Every runtime update reruns this, and the launcher keeps
+    # some of these images (COMPCAR1.png) open while it is running, so on Windows and Wine an unchanged
+    # file must not be reopened for writing; a file that cannot be replaced keeps its previous copy.
+    if path.is_file() and path.read_bytes() == data:
+        return
+    pending = path.with_name(path.name + '.new')
+    pending.write_bytes(data)
+    try:
+        os.replace(pending, path)
+    except OSError as error:
+        pending.unlink(missing_ok=True)
+        if not path.is_file():
+            raise
+        print(f'Kept the existing {path.name} ({error.strerror})', flush=True)
+
+
+def store_png(path, image):
+    stream = io.BytesIO()
+    image.save(stream, format='PNG')
+    store(path, stream.getvalue())
+
+
 def build(game, output):
     output.mkdir(parents=True, exist_ok=True)
-    sources = [Path(__file__), game / 'SLUS_210.50', game / 'DATA/GLOBAL.TXD', game / 'DATA/FRONTEND.TXD']
+    sources = [game / 'SLUS_210.50', game / 'DATA/GLOBAL.TXD', game / 'DATA/FRONTEND.TXD']
     stamp = {str(p.absolute()): [p.stat().st_size, p.stat().st_mtime_ns] for p in sources}
+    # The tool is identified by its content, not its path: each runtime update installs it in a new folder.
+    stamp['tool'] = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
     marker = output / 'source-stamp.json'
     if marker.is_file() and json.loads(marker.read_text()) == stamp and all(
             (output / name).is_file() for name in ('GlobalFont.png', 'GlobalFont.tdfont', 'HeadFont.png',
@@ -120,27 +148,27 @@ def build(game, output):
         end = struct.unpack_from('<I', elf, font + 28)[0]
         if end < 0x220 or end > 65536 or (end - 0x220) % 32:
             raise ValueError('unsupported glyph metrics')
-        texture(elf, at).save(output / (name + '.png'))
+        store_png(output / (name + '.png'), texture(elf, at))
         records = []
         for cursor in range(font + 0x220, font + end, 32):
             *metrics, code, _ = struct.unpack_from('<7fHH', elf, cursor)
             records.append(struct.pack('<I7f', code, *metrics))
-        (output / (name + '.tdfont')).write_bytes(b'TDFONT01' + elf[font + 8:font + 16] +
-                                                 struct.pack('<I', len(records)) + b''.join(records))
+        store(output / (name + '.tdfont'), b'TDFONT01' + elf[font + 8:font + 16] +
+              struct.pack('<I', len(records)) + b''.join(records))
     for file, wanted in (('GLOBAL.TXD', {'Arrow', 'CarArrow', 'box_curve', 'box_curveb', 'grid', 'FE_Element01',
                                          'R1Button'}),
                          ('FRONTEND.TXD', {'CarArrow', 'Padlock', 'FE_element03'})):
         data = (game / 'DATA' / file).read_bytes()
         for name, at in dictionary(data):
             if name in wanted or (file == 'FRONTEND.TXD' and 'CAR' in name.upper()):
-                texture(data, at).save(output / (name + '.png'))
+                store_png(output / (name + '.png'), texture(data, at))
     arrows = Image.open(output / 'CarArrow.png')
     up = arrows.crop((0, 0, 20, 12))
     left = arrows.crop((21, 0, 32, 20))
-    up.save(output / 'arrow-up.png')
-    up.transpose(Image.Transpose.FLIP_TOP_BOTTOM).save(output / 'arrow-down.png')
-    left.save(output / 'arrow-left.png')
-    left.transpose(Image.Transpose.FLIP_LEFT_RIGHT).save(output / 'arrow-right.png')
+    store_png(output / 'arrow-up.png', up)
+    store_png(output / 'arrow-down.png', up.transpose(Image.Transpose.FLIP_TOP_BOTTOM))
+    store_png(output / 'arrow-left.png', left)
+    store_png(output / 'arrow-right.png', left.transpose(Image.Transpose.FLIP_LEFT_RIGHT))
     marker.write_text(json.dumps(stamp), encoding='utf-8')
     print('Imported original menu fonts and artwork into ' + str(output))
 
