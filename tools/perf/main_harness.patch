@@ -1,0 +1,455 @@
+--- src/app/main.cpp
++++ src/app/main.cpp
+@@ -120,6 +120,8 @@
+ #include "takedown/runtime/slus_21050_graphics_options.hpp"
+ #include "takedown/runtime/slus_21050_instance_batch_capture.hpp"
+ #include "takedown/runtime/slus_21050_menu_mouse.hpp"
++extern std::size_t g_harness_nav_done_vblank; // PROFILING HARNESS
++extern double g_harness_nav_done_seconds; // PROFILING HARNESS (guest time, TAKEDOWN_HARNESS_GUEST_TIME_NAV)
+ #include "takedown/runtime/slus_21050_model_live.hpp"
+ #include "takedown/runtime/slus_21050_model_submission_probe.hpp"
+ #include "takedown/runtime/slus_21050_movie_player.hpp"
+@@ -3460,7 +3462,9 @@
+     if (parallel_gs_only && !parallel_gs_live_fifo_path.has_value()) {
+         throw std::invalid_argument("--parallel-gs-only requires --parallel-gs-live <fifo>");
+     }
+-    if (parallel_gs_only && !window_requested) {
++    // PROFILING HARNESS: windowless --parallel-gs-only when TAKEDOWN_NAV_SCRIPT or TAKEDOWN_INPUT_SCRIPT supplies input.
++    if (parallel_gs_only && !window_requested && std::getenv("TAKEDOWN_NAV_SCRIPT") == nullptr &&
++        std::getenv("TAKEDOWN_INPUT_SCRIPT") == nullptr) {
+         throw std::invalid_argument(
+             "--parallel-gs-only requires --window for guest keyboard/controller input");
+     }
+@@ -4905,7 +4909,11 @@
+             return;
+         }
+         auto& audio_sink = spu2_renderer.sink();
+-        if (audio_sink.status() != audio::HostAudioSink::Status::Playing) {
++        // PROFILING HARNESS: with no audio device at all (nothing for a stream capture to hear) the real-time
++        // pacing the audio output normally provides is kept by pacing against the wall clock instead.
++        static const bool harness_pace_without_device =
++            std::getenv("TAKEDOWN_HARNESS_PACE_WITHOUT_AUDIO_DEVICE") != nullptr;
++        if (!harness_pace_without_device && audio_sink.status() != audio::HostAudioSink::Status::Playing) {
+             return;
+         }
+         if (spu2_renderer.samples_rendered() == audio_master_checked_samples) {
+@@ -4936,7 +4944,7 @@
+         }
+         const auto block_start = std::chrono::steady_clock::now();
+         ++audio_master_blocks;
+-        while (audio_sink.status() == audio::HostAudioSink::Status::Playing &&
++        while ((harness_pace_without_device || audio_sink.status() == audio::HostAudioSink::Status::Playing) &&
+                guest_lead_frames() > kAudioMasterResumeFrames &&
+                std::chrono::steady_clock::now() - block_start < std::chrono::milliseconds(100)) {
+             std::this_thread::sleep_for(std::chrono::milliseconds(2));
+@@ -5255,9 +5263,11 @@
+     struct ScriptedInputPress {
+         double at_seconds;
+         platform::HostControllerState state;
++        double duration_seconds;
+     };
+     std::vector<ScriptedInputPress> scripted_input_presses{};
+     std::size_t scripted_input_next = 0U;
++    platform::HostControllerState scripted_merged_state{};
+     if (const char* const script_path = std::getenv("TAKEDOWN_INPUT_SCRIPT")) {
+         std::ifstream script(script_path);
+         std::string line;
+@@ -5271,6 +5281,8 @@
+             if (!(stream >> at >> button)) {
+                 continue;
+             }
++            double duration = 0.1;
++            stream >> duration;
+             platform::HostControllerState press{};
+             if (button == "up") {
+                 press.dpad_up = true;
+@@ -5292,10 +5304,18 @@
+                 press.left_shoulder = true;
+             } else if (button == "r1") {
+                 press.right_shoulder = true;
++            } else if (button == "square") {
++                press.square = true;
++            } else if (button == "triangle") {
++                press.triangle = true;
++            } else if (button == "l2") {
++                press.left_trigger = true;
++            } else if (button == "r2") {
++                press.right_trigger = true;
+             } else {
+                 continue;
+             }
+-            scripted_input_presses.push_back({at, press});
++            scripted_input_presses.push_back({at, press, duration});
+         }
+         std::sort(scripted_input_presses.begin(), scripted_input_presses.end(),
+                   [](const ScriptedInputPress& left, const ScriptedInputPress& right) {
+@@ -6088,6 +6108,15 @@
+             }
+             return (rendered_samples - *host_movie_clock_anchor_samples) * 1000000000U / 48000U;
+         }
++        // PROFILING HARNESS: TAKEDOWN_HARNESS_GUEST_MOVIE_CLOCK=1 paces movies by guest audio only (not the
++        // wall clock), so scripted input keyed to vblanks lines up at any emulation speed.
++        static const bool harness_guest_movie_clock = std::getenv("TAKEDOWN_HARNESS_GUEST_MOVIE_CLOCK") != nullptr;
++        if (harness_guest_movie_clock && host_movie_clock_anchor_samples.has_value()) {
++            const auto rendered_samples = spu2_renderer.samples_rendered();
++            return rendered_samples <= *host_movie_clock_anchor_samples
++                       ? 0U
++                       : (rendered_samples - *host_movie_clock_anchor_samples) * 1000000000U / 48000U;
++        }
+         const std::uint64_t now = host_steady_now_nanoseconds();
+         const auto session_elapsed = now >= *host_movie_clock_start_nanoseconds ? now - *host_movie_clock_start_nanoseconds : 0U;
+         auto paused = host_movie_clock_paused_nanoseconds;
+@@ -6307,7 +6336,7 @@
+         // controller gate has accepted its synthetic press. Connecting it earlier skips the gate at
+         // boot, and the pending gate press then lands on a later menu (it confirmed LOAD PROFILE).
+         if (save_card_hotplug && save_card_device != nullptr && !kernel.save_card_present() &&
+-            (!host_controller_bridge ||
++            (!host_controller_bridge || 
+              (virtual_ds2_trace.has_value() && virtual_ds2_trace->gate_accepted_step.has_value()))) {
+             kernel.set_save_card_present(memory, true);
+             std::cerr << "Save data: profile slot " << save_card_device->attached_slot().value_or(0U)
+@@ -6932,7 +6961,6 @@
+         !memory.ram_write_watch_active() &&
+         !femain_live_transaction_enabled &&
+         !subframe_input_bridge.has_value() &&
+-        scripted_input_presses.empty() &&
+         !rwa_iop_shadow.has_value() &&
+         !native_only &&
+         !compiled_coverage_available &&
+@@ -7499,17 +7527,135 @@
+             rwa_first_op05_step_valid = true;
+         }
+ 
++        {
++            static const std::size_t stop_vblank = [] { const char* v = std::getenv("TAKEDOWN_STOP_VBLANK"); return v ? static_cast<std::size_t>(std::stoul(v)) : 0U; }();
++            if (stop_vblank != 0U && raised_vblank_starts >= stop_vblank) {
++                std::fprintf(stderr, "[HARNESS] stop at vblank %zu\n", raised_vblank_starts);
++                std::fflush(stderr); std::fflush(stdout);
++                std::_Exit(0);
++            }
++        }
++        // PROFILING HARNESS: headless runs never pass the controller gate that connects the save card.
++        if (save_card_device != nullptr && !kernel.save_card_present() && raised_vblank_starts >= 600U) {
++            kernel.set_save_card_present(memory, true);
++            std::fprintf(stderr, "[HARNESS] save card connected at vblank %zu\n", raised_vblank_starts);
++        }
++        // PROFILING HARNESS: TAKEDOWN_HARNESS_MARK=<file>,<vblank> creates <file> once that vblank is reached
++        // (an external sampler waits for it) and logs wall time per 600 vblanks after it.
++        {
++            static const auto mark = []() -> std::optional<std::pair<std::string, std::size_t>> {
++                const char* v = std::getenv("TAKEDOWN_HARNESS_MARK");
++                if (v == nullptr) return std::nullopt;
++                std::string_view sv{v};
++                const auto comma = sv.rfind(',');
++                // "<file>,<vblank>" or "<file>,nav+<seconds>" (that long after the nav script finished).
++                const std::string when(sv.substr(comma + 1));
++                if (when.rfind("nav+", 0) == 0) {
++                    return std::make_pair(std::string(sv.substr(0, comma)),
++                                          static_cast<std::size_t>(~static_cast<std::size_t>(0) - static_cast<std::size_t>(std::stod(when.substr(4)) * 60.0)));
++                }
++                return std::make_pair(std::string(sv.substr(0, comma)), static_cast<std::size_t>(std::stoul(when)));
++            }();
++            static std::uint64_t wait_iterations = 0U, wait_cycles = 0U, last_cycles = 0U, window_cycles_start = 0U;
++            static bool marked = false;
++            static std::chrono::steady_clock::time_point mark_time{};
++            static std::size_t next_report = 0U;
++            static std::size_t mark_vblank = 0U, stop_after = 0U;
++            if (mark.has_value() && mark_vblank == 0U) {
++                if (mark->second > ~static_cast<std::size_t>(0) / 2U) { // nav-relative
++                    static const bool guest_time_nav = std::getenv("TAKEDOWN_HARNESS_GUEST_TIME_NAV") != nullptr;
++                    if (guest_time_nav) {
++                        // Variable frame rate: a vblank is not 1/60 s, so the delay after the nav script is guest time.
++                        if (g_harness_nav_done_seconds >= 0.0 &&
++                            static_cast<double>(emulated_ee_cycles) / 294912000.0 >=
++                                g_harness_nav_done_seconds + static_cast<double>(~static_cast<std::size_t>(0) - mark->second) / 60.0)
++                            mark_vblank = raised_vblank_starts == 0U ? 1U : raised_vblank_starts;
++                    } else if (g_harness_nav_done_vblank != 0U) mark_vblank = g_harness_nav_done_vblank + (~static_cast<std::size_t>(0) - mark->second);
++                } else {
++                    mark_vblank = mark->second;
++                }
++            }
++            if (mark.has_value() && !marked && mark_vblank != 0U && raised_vblank_starts >= mark_vblank) {
++                if (const char* r = std::getenv("TAKEDOWN_HARNESS_RACE_VBLANKS")) stop_after = raised_vblank_starts + std::stoul(r);
++                marked = true;
++                mark_time = std::chrono::steady_clock::now();
++                next_report = raised_vblank_starts + 600U;
++                window_cycles_start = emulated_ee_cycles; wait_cycles = 0U; wait_iterations = 0U;
++                std::ofstream(mark->first) << raised_vblank_starts << '\n';
++                std::fprintf(stderr, "[HARNESS] mark at vblank %zu\n", raised_vblank_starts);
++            }
++            static bool last_in_wait = false;
++            const bool in_wait = state.pc() >= 0x001f1a1cU && state.pc() <= 0x001f1a44U;
++            if (marked) {
++                if (last_in_wait) wait_cycles += emulated_ee_cycles - last_cycles;
++                if (in_wait) ++wait_iterations;
++            }
++            last_in_wait = in_wait;
++            last_cycles = emulated_ee_cycles;
++            if (marked && stop_after != 0U && raised_vblank_starts >= stop_after) {
++                std::fprintf(stderr, "[HARNESS] stop at vblank %zu (%zu after mark)\n", raised_vblank_starts, raised_vblank_starts - mark_vblank);
++                std::fflush(stderr); std::fflush(stdout);
++                std::_Exit(0);
++            }
++            if (marked && raised_vblank_starts >= next_report) {
++                std::fprintf(stderr, "[HARNESS] gif-wait loop: %llu main-loop visits, %.1f%% of guest cycles\n",
++                             static_cast<unsigned long long>(wait_iterations),
++                             100.0 * static_cast<double>(wait_cycles) / static_cast<double>(emulated_ee_cycles - window_cycles_start));
++                wait_iterations = 0U; wait_cycles = 0U; window_cycles_start = emulated_ee_cycles;
++                const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - mark_time).count();
++                std::fprintf(stderr, "[HARNESS] vblank %zu wall %.3fs since mark (%.1f guest-fps)\n", raised_vblank_starts, secs,
++                             static_cast<double>(raised_vblank_starts - mark_vblank) / secs);
++                next_report += 600U;
++            }
++        }
++        // PROFILING HARNESS: TAKEDOWN_PERIODIC_PPM=<dir>,<every-vblanks> writes <dir>/f<vblank>.ppm (needs --scanout-ppm).
++        {
++            static const auto periodic = []() -> std::optional<std::pair<std::filesystem::path, std::size_t>> {
++                const char* v = std::getenv("TAKEDOWN_PERIODIC_PPM");
++                if (v == nullptr) return std::nullopt;
++                std::string_view sv{v};
++                const auto comma = sv.rfind(',');
++                if (comma == sv.npos) return std::nullopt;
++                return std::make_pair(std::filesystem::path(std::string(sv.substr(0, comma))),
++                                      static_cast<std::size_t>(std::stoul(std::string(sv.substr(comma + 1)))));
++            }();
++            static std::size_t periodic_last = 0U;
++            if (periodic.has_value() && gs_renderer_worker.has_value() &&
++                raised_vblank_starts >= periodic_last + periodic->second) {
++                periodic_last = raised_vblank_starts;
++                const auto plan = presentation::plan_gs_scanout(memory.gs_privileged_display().state());
++                if (plan.status == presentation::GsScanoutPlanStatus::Ready) {
++                    auto snap = gs_renderer_worker->synchronize(plan);
++                    if (snap.scanout_frame.has_value() &&
++                        snap.scanout_frame->status == presentation::GsScanoutRenderStatus::Rendered) {
++                        char name[64];
++                        std::snprintf(name, sizeof name, "f%06zu.ppm", raised_vblank_starts);
++                        write_rgba_ppm(periodic->first / name, snap.scanout_frame->width, snap.scanout_frame->height,
++                                       snap.scanout_frame->rgba);
++                    }
++                }
++            }
++        }
+         if (!scripted_input_presses.empty()) {
+-            const double now_seconds = static_cast<double>(emulated_ee_cycles) / 294912000.0;
+-            while (scripted_input_next < scripted_input_presses.size() &&
+-                   scripted_input_presses[scripted_input_next].at_seconds <= now_seconds) {
+-                const auto& press = scripted_input_presses[scripted_input_next++];
+-                write_virtual_ds2_host_input(press.state);
+-                std::fprintf(stderr, "[INPUT-SCRIPT] fired %.2fs\n", press.at_seconds);
+-            }
+-            if (scripted_input_next != 0U &&
+-                now_seconds - scripted_input_presses[scripted_input_next - 1U].at_seconds > 0.1) {
+-                write_virtual_ds2_host_input(platform::HostControllerState{});
++            // PROFILING HARNESS: held presses (at, button, duration) merged each iteration; time is vblanks / 60.
++            const double now_seconds = static_cast<double>(raised_vblank_starts) / 60.0;
++            static std::uint32_t last_mask = 0xffffffffU;
++            platform::HostControllerState merged{};
++            std::uint32_t mask = 0U;
++            for (std::size_t k = 0; k < scripted_input_presses.size(); ++k) {
++                const auto& press = scripted_input_presses[k];
++                if (press.at_seconds > now_seconds) break;
++                if (now_seconds < press.at_seconds + press.duration_seconds) {
++                    merged = platform::merge_host_controller_states(merged, press.state);
++                    mask |= 1U << (k & 31U);
++                }
++            }
++            if (mask != last_mask) {
++                const bool* const b = &merged.dpad_up;
++                for (std::size_t k = 0; k < 14U; ++k) merged.button_pressure[k] = b[k] ? 255U : 0U;
++                scripted_merged_state = merged;
++                std::fprintf(stderr, "[INPUT-SCRIPT] t=%.2fs vb=%zu mask=%08x\n", now_seconds, raised_vblank_starts, mask);
++                last_mask = mask;
+             }
+         }
+ 
+@@ -7626,7 +7772,8 @@
+                 guest_input_recorder != nullptr
+                     ? guest_input_recorder->retail_poll_controller_state().start
+                     : (guest_input_replay != nullptr ? guest_input_replay->retail_poll_controller_state().start
+-                                                     : current_host_controller_state().start);
++                                                     : (current_host_controller_state().start ||
++                                                        scripted_merged_state.start /* PROFILING HARNESS */));
+             if ((guest_input_recorder != nullptr
+                      ? guest_input_recorder->format() == runtime::GuestInputTimelineFormat::B3IR2
+                      : (guest_input_replay == nullptr ||
+@@ -7832,6 +7979,160 @@
+             ++virtual_ds2_trace->update_count;
+             seed_virtual_ds2_profile();
+             write_virtual_ds2_neutral_sample();
++            // PROFILING HARNESS: TAKEDOWN_NAV_SCRIPT=<file> drives the menus by what is on screen (the menu-mouse
++            // reader's lists: row counts and highlight), not by time. Steps, one per line:
++            //   list <rows> <index> <button>   wait for a stable list of <rows> rows, move the highlight to <index>, press
++            //   big <min-rows> <button>         wait for a stable list of at least <min-rows> rows, press
++            //   footer <button>                 wait for a stable screen with footer prompts and no lists (keyboard, car select)
++            //   wait <seconds>                  wait (vblanks / 60)
++            //   press <button>                  press now
++            //   hold <button>                   hold from now on
++            //   nomovie                         wait until no movie has been playing for ~0.5 s
++            //   skip on|off                     while on, tap Start every ~3 s while a movie plays and no menu is shown
++            // Each press waits for the screen to change (retrying every 5 s). Screen changes are logged as [NAV].
++            {
++                struct NavStep { std::string kind; int a{}; int b{}; std::string button; double seconds{}; };
++                static const std::vector<NavStep> nav = [] {
++                    std::vector<NavStep> steps;
++                    const char* path = std::getenv("TAKEDOWN_NAV_SCRIPT");
++                    if (path == nullptr) return steps;
++                    std::ifstream in(path);
++                    std::string line;
++                    while (std::getline(in, line)) {
++                        std::istringstream ls(line);
++                        NavStep st;
++                        if (!(ls >> st.kind) || st.kind[0] == '#') continue;
++                        if (st.kind == "list") ls >> st.a >> st.b >> st.button;
++                        else if (st.kind == "big") ls >> st.a >> st.button;
++                        else if (st.kind == "footer") ls >> st.button;
++                        else if (st.kind == "wait") ls >> st.seconds;
++                        else ls >> st.button;
++                        steps.push_back(st);
++                    }
++                    std::fprintf(stderr, "[NAV] %zu steps\n", steps.size());
++                    return steps;
++                }();
++                if (!nav.empty()) {
++                    static std::size_t step = 0U;
++                    static int phase = 0; // 0 wait for match, 1 pressing, 2 wait for change
++                    static std::uint64_t poll = 0U, phase_start = 0U, stable_since = 0U, press_until = 0U, next_move = 0U;
++                    static std::string signature, pressed_signature;
++                    static platform::HostControllerState held{};
++                    static double wait_until = -1.0;
++                    static bool skip_movies = false;
++                    static std::uint64_t next_skip = 0U, skip_press_until = 0U;
++                    static unsigned skip_count = 0U;
++                    const auto set_button = [](platform::HostControllerState& pad, const std::string& b) {
++                        if (b == "cross") pad.cross = true; else if (b == "circle") pad.circle = true;
++                        else if (b == "square") pad.square = true; else if (b == "triangle") pad.triangle = true;
++                        else if (b == "start") pad.start = true; else if (b == "select") pad.select = true;
++                        else if (b == "up") pad.dpad_up = true; else if (b == "down") pad.dpad_down = true;
++                        else if (b == "left") pad.dpad_left = true; else if (b == "right") pad.dpad_right = true;
++                        else if (b == "l1") pad.left_shoulder = true; else if (b == "r1") pad.right_shoulder = true;
++                        else if (b == "l2") pad.left_trigger = true; else if (b == "r2") pad.right_trigger = true;
++                    };
++                    // TAKEDOWN_HARNESS_GUEST_TIME_NAV=1 (variable frame rate): the nav clock is guest time, 30 ticks/s
++                    // like the retail frontend's pad polls, because pad polls and vblanks run at the (uncapped) frame
++                    // rate there and menus/animations take guest time, not frames.
++                    static const bool guest_time_nav = std::getenv("TAKEDOWN_HARNESS_GUEST_TIME_NAV") != nullptr;
++                    const double nav_seconds = guest_time_nav ? static_cast<double>(emulated_ee_cycles) / 294912000.0
++                                                              : static_cast<double>(raised_vblank_starts) / 60.0;
++                    if (guest_time_nav) poll = std::max<std::uint64_t>(poll, static_cast<std::uint64_t>(nav_seconds * 30.0) + 1U);
++                    else ++poll;
++                    const auto screen = runtime::read_menu_mouse_screen(memory);
++                    std::string sig;
++                    for (const auto& list : screen.lists) {
++                        sig += std::to_string(list.rows.size()) + "h" +
++                               (list.highlighted.has_value() ? std::to_string(*list.highlighted) : std::string("-")) +
++                               (list.values ? "v" : "") + (list.horizontal ? "x" : "");
++                        if (!list.rows.empty()) {
++                            char where[48];
++                            std::snprintf(where, sizeof where, "@%08x/%.0f", list.rows.front().parent, list.rows.front().y);
++                            sig += where;
++                        }
++                        sig += " ";
++                    }
++                    sig += screen.footer ? "F" : "-";
++                    if (sig != signature) {
++                        std::fprintf(stderr, "[NAV] poll %llu vb=%zu step %zu screen [%s]\n",
++                                     static_cast<unsigned long long>(poll), raised_vblank_starts, step, sig.c_str());
++                        signature = sig;
++                        stable_since = poll;
++                    }
++                    const bool movie_playing = host_movie_player.active() && !headless_movie_eos_traces.empty() &&
++                                               !headless_movie_eos_traces.back().destroyed_step.has_value();
++                    platform::HostControllerState pad = held;
++                    if (step < nav.size()) {
++                        const NavStep& st = nav[step];
++                        const auto advance = [&] { ++step; phase = 0; phase_start = poll; wait_until = -1.0; };
++                        if (st.kind == "skip") { skip_movies = st.button == "on"; advance(); }
++                        else if (st.kind == "nomovie") {
++                            static std::uint64_t movie_clear_since = 0U;
++                            if (movie_playing) movie_clear_since = poll;
++                            else if (poll - movie_clear_since >= 60U) advance();
++                        }
++                        else if (st.kind == "hold") { set_button(held, st.button); set_button(pad, st.button); advance(); }
++                        else if (st.kind == "wait") {
++                            if (wait_until < 0.0) wait_until = nav_seconds + st.seconds;
++                            if (nav_seconds >= wait_until) advance();
++                        } else if (st.kind == "press") {
++                            if (phase == 0) { phase = 1; press_until = poll + 3U; }
++                            if (poll < press_until) set_button(pad, st.button); else advance();
++                        } else {
++                            static const runtime::MenuMouseList footer_only{};
++                            const runtime::MenuMouseList* match = nullptr;
++                            if (st.kind == "footer" && screen.lists.empty() && screen.footer) match = &footer_only;
++                            for (const auto& list : screen.lists) {
++                                if ((st.kind == "list" && static_cast<int>(list.rows.size()) == st.a) ||
++                                    (st.kind == "big" && static_cast<int>(list.rows.size()) >= st.a)) { match = &list; break; }
++                            }
++                            if (phase == 0 && match != nullptr && poll - stable_since >= 20U && poll >= next_move) {
++                                const int hl = match->highlighted.has_value() ? static_cast<int>(*match->highlighted) : -1;
++                                if (st.kind == "list" && hl >= 0 && hl != st.b) {
++                                    set_button(pad, hl < st.b ? (match->horizontal ? "right" : "down") : (match->horizontal ? "left" : "up"));
++                                    next_move = poll + 8U;
++                                } else {
++                                    phase = 1; press_until = poll + 3U; pressed_signature = signature; phase_start = poll;
++                                }
++                            }
++                            if (phase == 1) {
++                                if (poll < press_until) set_button(pad, st.button); else phase = 2;
++                            } else if (phase == 2) {
++                                if (signature != pressed_signature && poll - stable_since >= 4U) advance();
++                                else if (poll - phase_start > 150U) {
++                                    // Same-shaped follow-up dialogs (save? / autosave off?) look unchanged: move on.
++                                    std::fprintf(stderr, "[NAV] step %zu: no visible change, assuming done\n", step);
++                                    advance();
++                                }
++                            }
++                        }
++                    }
++                    if (step >= nav.size() && g_harness_nav_done_vblank == 0U) {
++                        g_harness_nav_done_vblank = raised_vblank_starts == 0U ? 1U : raised_vblank_starts;
++                        g_harness_nav_done_seconds = static_cast<double>(emulated_ee_cycles) / 294912000.0;
++                        std::fprintf(stderr, "[NAV] done at vb=%zu\n", raised_vblank_starts);
++                    }
++                    if (skip_movies && movie_playing && screen.lists.empty() && !screen.footer && poll - stable_since >= 60U &&
++                        poll >= next_skip) {
++                        next_skip = poll + 180U;
++                        skip_press_until = poll + 3U;
++                        ++skip_count;
++                        std::fprintf(stderr, "[NAV] start (skip movie) vb=%zu\n", raised_vblank_starts);
++                    }
++                    if (poll < skip_press_until) set_button(pad, "start");
++                    const bool* const bits = &pad.dpad_up;
++                    for (std::size_t k = 0; k < 14U; ++k) pad.button_pressure[k] = bits[k] ? 255U : 0U;
++                    write_virtual_ds2_host_input(pad);
++                    scripted_merged_state = pad;
++                }
++            }
++            if (!scripted_input_presses.empty()) {
++                write_virtual_ds2_host_input(scripted_merged_state);
++                if (virtual_ds2_trace->update_count % 120U == 1U || scripted_merged_state.cross || scripted_merged_state.start) {
++                    std::fprintf(stderr, "[INPUT-SCRIPT] poll %zu vb=%zu cross=%d\n", static_cast<std::size_t>(virtual_ds2_trace->update_count),
++                                 raised_vblank_starts, scripted_merged_state.cross ? 1 : 0);
++                }
++            }
+             if (parallel_gs_input_reader != nullptr) {
+                 parallel_gs_input_reader->poll();
+             }
+@@ -7865,6 +8166,8 @@
+                         effective_retail_input = *subframe_input_bridge->last_applied_state();
+                     } else {
+                         effective_retail_input = current_host_controller_state();
++                        // PROFILING HARNESS: scripted/nav input also reaches the game when a window exists.
++                        effective_retail_input = platform::merge_host_controller_states(effective_retail_input, scripted_merged_state);
+                     }
+                     std::optional<runtime::MenuMouseInput> mouse_input;
+                     if (menu_mouse_script.has_value()) {
+@@ -13771,6 +14074,10 @@
+ 
+ } // namespace
+ 
++// PROFILING HARNESS: vblank at which TAKEDOWN_NAV_SCRIPT finished (0 = not yet).
++std::size_t g_harness_nav_done_vblank = 0U;
++double g_harness_nav_done_seconds = -1.0;
++
+ int main(int argc, char** argv) {
+ try {
+     // RECOVERY: main.cpp is compiled with TAKEDOWN_DISTRIBUTION_BUILD=1, so only the release branch is

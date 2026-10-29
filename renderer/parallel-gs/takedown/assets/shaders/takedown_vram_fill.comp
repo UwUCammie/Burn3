@@ -1,0 +1,108 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+// Brings blocks of NativeScene's GPU copy of GS memory up to date
+// (takedown/native_vram.cpp), one workgroup per block, one invocation per word.
+// Only the job's byte lanes are written. Kinds:
+//   0: bytes from native memory (no draw wrote them), from `bytes`;
+//   1: a colour target's mirror (RGBA16F at `scale`; 255 = 1.0, alpha 128 = 1.0),
+//      each GS pixel the mean of its scale x scale samples;
+//   2: a Z buffer's native depth image (D32, depth = Z / z_range), the sample
+//      nearest the GS pixel's centre.
+layout(local_size_x = 64) in;
+
+layout(std430, set = 0, binding = 0) buffer Vram { uint vram[]; };
+// Per job: block, lanes, word offset into `bytes` (kind 0) or the block's first
+// pixel x | y << 16 in the source's layout (kinds 1, 2).
+layout(std430, set = 0, binding = 1) readonly buffer Jobs { uvec4 jobs[]; };
+layout(std430, set = 0, binding = 2) readonly buffer Bytes { uint bytes[]; };
+layout(set = 0, binding = 3) uniform sampler2D Source;
+
+layout(push_constant) uniform Constants
+{
+	uint kind;
+	uint base_block; // the source's layout
+	uint fbw;
+	uint psm;
+	uint scale;
+	uint height;     // GS pixels the source holds
+	uint z_max;
+	float z_range;
+} c;
+
+#define TEX_LOAD(w) vram[(w)]
+#define PALETTE(i) 0u
+#include "takedown_vram.h"
+
+uint lane_mask(uint lanes)
+{
+	uint m = 0u;
+	for (uint i = 0u; i < 4u; i++)
+		if ((lanes & (1u << i)) != 0u)
+			m |= 0xffu << (8u * i);
+	return m;
+}
+
+uint colour_at(ivec2 g)
+{
+	vec4 sum = vec4(0.0);
+	int s = int(c.scale);
+	for (int j = 0; j < s; j++)
+		for (int i = 0; i < s; i++)
+			sum += texelFetch(Source, g * s + ivec2(i, j), 0);
+	sum /= float(s * s);
+	uvec4 v = uvec4(clamp(round(sum * vec4(255.0, 255.0, 255.0, 128.0)), vec4(0.0), vec4(255.0)));
+	return v.r | (v.g << 8u) | (v.b << 16u) | (v.a << 24u);
+}
+
+uint depth_at(ivec2 g)
+{
+	int s = int(c.scale);
+	float d = texelFetch(Source, g * s + ivec2(s / 2), 0).r;
+	// Exact in float: z_range is a power of two.
+	float z = round(clamp(d, 0.0, 1.0) * c.z_range);
+	return z >= float(c.z_max) ? c.z_max : uint(z);
+}
+
+void main()
+{
+	uvec4 job = jobs[gl_WorkGroupID.x];
+	uint block = job.x;
+	uint word = block * 64u + gl_LocalInvocationID.x;
+	uint mask = lane_mask(job.y);
+	if (c.kind == 0u)
+	{
+		uint value = bytes[job.z + gl_LocalInvocationID.x];
+		vram[word] = (vram[word] & ~mask) | (value & mask);
+		return;
+	}
+
+	// The block's pixels in the source's layout, one per invocation (32-bit
+	// formats: a block's 64 pixels are its 64 words) or two (16-bit: two pixels
+	// per word, written with atomics).
+	bool half_word = c.psm == PSMZ16 || c.psm == PSMZ16S || c.psm == PSMCT16 || c.psm == PSMCT16S;
+	ivec2 origin = ivec2(int(job.z & 0xffffu), int(job.z >> 16u));
+	uint i = gl_LocalInvocationID.x;
+	if (!half_word)
+	{
+		ivec2 g = origin + ivec2(int(i & 7u), int(i >> 3u));
+		if (g.y >= int(c.height))
+			return;
+		uint w = swizzle_PS2(uint(g.x), uint(g.y), c.base_block, c.fbw, c.psm, VRAM_MASK);
+		uint v = c.kind == 1u ? colour_at(g) : depth_at(g);
+		vram[w] = (vram[w] & ~mask) | (v & mask);
+		return;
+	}
+	for (uint k = 0u; k < 2u; k++)
+	{
+		uint pixel = i + 64u * k;
+		ivec2 g = origin + ivec2(int(pixel & 15u), int(pixel >> 4u));
+		if (g.y >= int(c.height))
+			continue;
+		uint e = swizzle_PS2(uint(g.x), uint(g.y), c.base_block, c.fbw, c.psm, VRAM_MASK);
+		uint shift = (e & 1u) * 16u;
+		uint m = mask & (0xffffu << shift);
+		uint v = ((c.kind == 1u ? colour_at(g) : depth_at(g)) & 0xffffu) << shift;
+		atomicAnd(vram[e >> 1u], ~m);
+		atomicOr(vram[e >> 1u], v & m);
+	}
+}

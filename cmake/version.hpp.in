@@ -1,0 +1,16 @@
+#pragma once
+#include <cstdint>
+#include <string_view>
+
+namespace takedown {
+struct GameVersion {
+    std::uint16_t major, minor, patch;
+    constexpr bool operator==(const GameVersion& other) const noexcept {
+        return major == other.major && minor == other.minor && patch == other.patch;
+    }
+    constexpr bool operator!=(const GameVersion& other) const noexcept { return !(*this == other); }
+};
+inline constexpr GameVersion kGameVersion{@TAKEDOWN_GAME_VERSION_MAJOR@, @TAKEDOWN_GAME_VERSION_MINOR@, @TAKEDOWN_GAME_VERSION_PATCH@};
+inline constexpr std::string_view kGameVersionText = "v@TAKEDOWN_GAME_VERSION@";
+inline constexpr std::string_view kGameTitle = "Takedown Recomp v@TAKEDOWN_GAME_VERSION@";
+}

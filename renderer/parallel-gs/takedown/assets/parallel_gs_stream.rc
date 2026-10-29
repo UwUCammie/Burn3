@@ -1,0 +1,4 @@
+// The game window's icon (Burnout 3 PC - Recomp B3 logo). SDL uses resource 1
+// for the window and taskbar (SDL_HINT_WINDOWS_INTRESOURCE_ICON in
+// gs_stream_replayer.cpp); Explorer shows the first icon.
+1 ICON "b3.ico"

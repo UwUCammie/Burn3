@@ -1,0 +1,259 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+// One GS sprite executed on NativeScene's GPU copy of GS memory, with the GS's
+// fixed-point rules: the port of gs/takedown_exact_reference.cpp (checked
+// against paraLLEl-GS by TAKEDOWN_DEV_EXACT_CHECK). Keep the two in step.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(std430, set = 0, binding = 0) buffer Vram { uint vram[]; };
+// Texels: memory as it was before the draw (a copy when the sprite reads pages it writes).
+layout(std430, set = 0, binding = 1) readonly buffer Source { uint source[]; };
+layout(std140, set = 0, binding = 2) uniform Prim
+{
+	ivec4 rect;     // pixels x0, y0, x1, y1 (inclusive)
+	ivec4 pos;      // xa, ya (provoking vertex), xb, yb: 1/16 pixels
+	ivec4 uv;       // ua, va, ub, vb: 1/16 texels
+	vec4 st;        // sa, ta, sb, tb
+	vec4 qf;        // q, fog
+	uvec4 colour;   // rgba, z, fogcol, dimx low
+	uvec4 frame;    // FBP block, FBW, FBMSK, dimx high
+	uvec4 zbuf;     // ZBP block, Z psm, Z max
+	uvec4 tex;      // TBP0, TBW, PSM, TW | TH << 8
+	uvec4 clampr;   // WMS | WMT << 2, MINU | MAXU << 16, MINV | MAXV << 16, AEM | TA0 << 8 | TA1 << 16
+	uvec4 flags;    // bits (see native_vram.cpp), ATST | AREF << 8 | AFAIL << 16, ZTST, A | B << 2 | C << 4 | D << 6 | FIX << 8
+	uvec4 flags2;   // TFX | TCC << 2
+} p;
+layout(std140, set = 0, binding = 3) uniform Palette { uvec4 palette[64]; };
+
+#define TEX_LOAD(w) source[(w)]
+#define PALETTE(i) palette[(i) >> 2u][(i) & 3u]
+#include "takedown_vram.h"
+
+const uint F_TME = 1u, F_FST = 2u, F_LINEAR = 4u, F_FGE = 8u, F_ABE = 16u, F_PABE = 32u, F_COLCLAMP = 64u,
+           F_DTHE = 128u, F_FBA = 256u, F_ATE = 512u, F_DATE = 1024u, F_DATM = 2048u, F_ZTE = 4096u, F_ZMSK = 8192u,
+           F_FB24 = 16384u;
+
+int64_t floor_div(int64_t a, int64_t b)
+{
+	int64_t q = a / b;
+	if ((a % b != 0l) && ((a < 0l) != (b < 0l)))
+		q--;
+	return q;
+}
+
+int wrap_coord(int c, uint mode, int size, int minv, int maxv)
+{
+	if (mode == 0u)
+		return c & (size - 1);
+	if (mode == 1u)
+		return clamp(c, 0, size - 1);
+	if (mode == 2u)
+		return clamp(c, minv, maxv);
+	return (c & minv) | maxv;
+}
+
+ivec4 unpack_rgba(uint c)
+{
+	return ivec4(int(c & 255u), int((c >> 8u) & 255u), int((c >> 16u) & 255u), int(c >> 24u));
+}
+
+ivec4 texel(int tu, int tv, int tw, int th)
+{
+	uint wms = p.clampr.x & 3u, wmt = (p.clampr.x >> 2u) & 3u;
+	int wu = wrap_coord(tu, wms, tw, int(p.clampr.y & 0xffffu), int(p.clampr.y >> 16u));
+	int wv = wrap_coord(tv, wmt, th, int(p.clampr.z & 0xffffu), int(p.clampr.z >> 16u));
+	bool aem = (p.clampr.w & 1u) != 0u;
+	return unpack_rgba(fetch_texel(uint(wu), uint(wv), p.tex.x, p.tex.y, p.tex.z, aem, (p.clampr.w >> 8u) & 0xffu,
+	                               (p.clampr.w >> 16u) & 0xffu));
+}
+
+int mix_bilinear(int a00, int a10, int a01, int a11, int fu, int fv)
+{
+	int top = a00 * (16 - fu) + a10 * fu, bottom = a01 * (16 - fu) + a11 * fu;
+	int sum = top * (16 - fv) + bottom * fv;
+	return (sum + 127 + ((sum >> 8) & 1)) >> 8;
+}
+
+uint load_z(uint zword, uint zpsm)
+{
+	if (zpsm == PSMZ16 || zpsm == PSMZ16S)
+	{
+		uint byte_address = (zword * 2u) & VRAM_MASK;
+		return (vram[byte_address >> 2u] >> ((byte_address & 2u) * 8u)) & 0xffffu;
+	}
+	return vram[zword & (VRAM_MASK >> 2u)];
+}
+
+void main()
+{
+	int x = p.rect.x + int(gl_GlobalInvocationID.x), y = p.rect.y + int(gl_GlobalInvocationID.y);
+	if (x > p.rect.z || y > p.rect.w)
+		return;
+	uint flags = p.flags.x;
+	int xa = p.pos.x, ya = p.pos.y, xb = p.pos.z, yb = p.pos.w;
+	ivec4 cf = unpack_rgba(p.colour.x);
+	ivec4 c = cf;
+
+	if ((flags & F_TME) != 0u)
+	{
+		int tw = 1 << int(p.tex.w & 0xffu), th = 1 << int(p.tex.w >> 8u);
+		int64_t u16, v16;
+		if ((flags & F_FST) != 0u)
+		{
+			int ua = p.uv.x, va = p.uv.y, ub = p.uv.z, vb = p.uv.w;
+			u16 = xb == xa ? int64_t(ua) : int64_t(ua) + floor_div(int64_t(ub - ua) * int64_t(x * 16 - xa), int64_t(xb - xa));
+			v16 = yb == ya ? int64_t(va) : int64_t(va) + floor_div(int64_t(vb - va) * int64_t(y * 16 - ya), int64_t(yb - ya));
+		}
+		else
+		{
+			float q = p.qf.x;
+			float fs = xb == xa ? p.st.x : p.st.x + (p.st.z - p.st.x) * float(x * 16 - xa) / float(xb - xa);
+			float ft = yb == ya ? p.st.y : p.st.y + (p.st.w - p.st.y) * float(y * 16 - ya) / float(yb - ya);
+			u16 = int64_t(floor(fs / q * float(tw) * 16.0));
+			v16 = int64_t(floor(ft / q * float(th) * 16.0));
+		}
+		ivec4 t;
+		if ((flags & F_LINEAR) == 0u)
+			t = texel(int(u16 >> 4), int(v16 >> 4), tw, th);
+		else
+		{
+			int64_t lu = u16 - 8l, lv = v16 - 8l;
+			int fu = int(lu & 15l), fv = int(lv & 15l);
+			int iu = int(lu >> 4), iv = int(lv >> 4);
+			ivec4 t00 = texel(iu, iv, tw, th), t10 = texel(iu + 1, iv, tw, th);
+			ivec4 t01 = texel(iu, iv + 1, tw, th), t11 = texel(iu + 1, iv + 1, tw, th);
+			for (int i = 0; i < 4; i++)
+				t[i] = mix_bilinear(t00[i], t10[i], t01[i], t11[i], fu, fv);
+		}
+		uint tfx = p.flags2.x & 3u;
+		bool tcc = ((p.flags2.x >> 2u) & 1u) != 0u;
+		ivec4 m = min((cf * t) >> 7, ivec4(255));
+		if (tfx == 0u)
+			c = ivec4(m.rgb, tcc ? m.a : cf.a);
+		else if (tfx == 1u)
+			c = ivec4(t.rgb, tcc ? t.a : cf.a);
+		else if (tfx == 2u)
+			c = ivec4(min(m.rgb + cf.a, ivec3(255)), tcc ? min(t.a + cf.a, 255) : cf.a);
+		else
+			c = ivec4(min(m.rgb + cf.a, ivec3(255)), tcc ? t.a : cf.a);
+	}
+	if ((flags & F_FGE) != 0u)
+	{
+		int f = int(round(p.qf.y));
+		ivec3 fc = ivec3(int(p.colour.z & 255u), int((p.colour.z >> 8u) & 255u), int((p.colour.z >> 16u) & 255u));
+		c.rgb = ivec3(floor(vec3(fc) + vec3((c.rgb - fc) * f) / 256.0 + 0.5));
+	}
+
+	bool write_fb = true, write_zb = true, write_alpha = true;
+	bool fb24 = (flags & F_FB24) != 0u;
+	uint zpsm = p.zbuf.y;
+	uint z = p.colour.y;
+	uint zword = swizzle_PS2(uint(x), uint(y), p.zbuf.x, p.frame.y, zpsm, VRAM_MASK);
+	if ((flags & F_ZTE) != 0u)
+	{
+		uint zold = load_z(zword, zpsm) & p.zbuf.z;
+		uint ztst = p.flags.z;
+		bool pass = ztst == 1u || (ztst == 2u && z >= zold) || (ztst == 3u && z > zold);
+		if (!pass)
+			return;
+	}
+	else
+		write_zb = false;
+	if ((flags & F_ZMSK) != 0u)
+		write_zb = false;
+
+	uint fword = swizzle_PS2(uint(x), uint(y), p.frame.x, p.frame.y, PSMCT32, VRAM_MASK);
+	uint old = vram[fword];
+	ivec4 d = unpack_rgba(old);
+
+	if ((flags & F_ATE) != 0u)
+	{
+		uint atst = p.flags.y & 7u;
+		int aref = int((p.flags.y >> 8u) & 0xffu);
+		uint afail = (p.flags.y >> 16u) & 3u;
+		bool pass = atst == 1u || (atst == 2u && c.a < aref) || (atst == 3u && c.a <= aref) ||
+		            (atst == 4u && c.a == aref) || (atst == 5u && c.a >= aref) || (atst == 6u && c.a > aref) ||
+		            (atst == 7u && c.a != aref);
+		if (!pass)
+		{
+			if (afail == 0u)
+				return;
+			if (afail == 1u)
+				write_zb = false;
+			else if (afail == 2u)
+			{
+				write_fb = false;
+				write_alpha = false;
+			}
+			else
+			{
+				write_alpha = fb24 ? write_alpha : false;
+				write_zb = false;
+			}
+		}
+	}
+	if (!fb24 && (flags & F_DATE) != 0u)
+	{
+		uint bit = d.a >= 128 ? 1u : 0u;
+		uint datm = (flags & F_DATM) != 0u ? 1u : 0u;
+		if (datm != bit)
+			return;
+	}
+
+	bool blending = (flags & F_ABE) != 0u;
+	if ((flags & F_PABE) != 0u && c.a < 128)
+		blending = false;
+	ivec3 rgb = c.rgb;
+	if (blending)
+	{
+		uint ba = p.flags.w & 3u, bb = (p.flags.w >> 2u) & 3u, bc = (p.flags.w >> 4u) & 3u, bd = (p.flags.w >> 6u) & 3u;
+		int fix = int((p.flags.w >> 8u) & 0xffu);
+		ivec3 va = ba == 0u ? c.rgb : ba == 1u ? d.rgb : ivec3(0);
+		ivec3 vb = bb == 0u ? c.rgb : bb == 1u ? d.rgb : ivec3(0);
+		ivec3 vd = bd == 0u ? c.rgb : bd == 1u ? d.rgb : ivec3(0);
+		int cc = bc == 0u ? c.a : bc == 1u ? (fb24 ? 128 : d.a) : fix;
+		rgb = (((va - vb) * cc) >> 7) + vd;
+	}
+	if ((flags & F_DTHE) != 0u)
+	{
+		uint shift = uint((((y & 3) * 4 + (x & 3)) * 4) & 63);
+		uint bits = shift < 32u ? (p.colour.w >> shift) : (p.frame.w >> (shift - 32u));
+		int v = int(bits & 7u);
+		if ((v & 4) != 0)
+			v -= 8;
+		rgb += ivec3(v);
+	}
+	int out_a = c.a;
+	if (fb24)
+		write_alpha = false;
+	if (!write_alpha)
+		out_a = d.a;
+	if (!write_fb)
+		rgb = d.rgb;
+	ivec4 result = ivec4(rgb, out_a);
+	result = (flags & F_COLCLAMP) != 0u ? clamp(result, ivec4(0), ivec4(255)) : (result & ivec4(255));
+	uint packed = uint(result.r) | (uint(result.g) << 8u) | (uint(result.b) << 16u) | (uint(result.a) << 24u);
+	if ((flags & F_FBA) != 0u && write_alpha)
+		packed |= 0x80000000u;
+	uint fbmsk = p.frame.z;
+	if (fbmsk != ~0u && (write_fb || write_alpha))
+	{
+		uint keep = fbmsk | (fb24 ? 0xff000000u : 0u);
+		vram[fword] = (packed & ~keep) | (old & keep);
+	}
+	if (write_zb)
+	{
+		if (zpsm == PSMZ16 || zpsm == PSMZ16S)
+		{
+			uint byte_address = (zword * 2u) & VRAM_MASK;
+			uint shift = (byte_address & 2u) * 8u;
+			atomicAnd(vram[byte_address >> 2u], ~(0xffffu << shift));
+			atomicOr(vram[byte_address >> 2u], (z & 0xffffu) << shift);
+		}
+		else if (zpsm == PSMZ24)
+			vram[zword] = (vram[zword] & 0xff000000u) | (z & 0xffffffu);
+		else
+			vram[zword] = z;
+	}
+}

@@ -1,0 +1,42 @@
+# takedown-recomp settings
+version = 1
+
+# This schema will be consumed by both the main-menu and pause-menu adapters.
+
+[graphics]
+fps_counter = false
+resolution_width = 1920
+resolution_height = 1080
+# windowed, borderless (a window covering the screen) or fullscreen (exclusive).
+display_mode = windowed
+vsync = true
+# Frame-rate cap. With frame_rate = retail it limits host presentation only.
+presentation_fps_limit = unlimited
+# retail: the game's own fixed tick (60 per second in races, 30 in menus).
+# variable: one tick per displayed frame, each as long as the previous frame took,
+# so the game runs at any frame rate at unchanged speed.
+frame_rate = retail
+# Additional cap while the game shows its menus or plays a video.
+menu_fps_limit = 240
+# Not yet effective: the game's level-of-detail switches are not mapped yet.
+model_quality = original
+# 4:3 or 16:9. Widescreen widens the 3D camera; 2D overlays are stretched.
+aspect_ratio = 4:3
+# Internal world resolution as a multiple of 640x448 (1 to 4; Vulkan renderer).
+render_scale = 1
+# Independent spatial AA: off, spatial_low, spatial_medium, spatial_high, spatial_ultra.
+anti_aliasing = off
+# Not yet effective: original, far or maximum.
+render_distance = original
+# Original menu/HUD geometry at display resolution, independent of 3D scale.
+high_resolution_ui = false
+motion_blur = true
+bloom = true
+
+[audio]
+master_volume = 0.0
+music_volume = 1.0
+effects_volume = 1.0
+mute_when_unfocused = false
+# game_music_level and game_effects_level (0 to 100) are added by the game:
+# the last loaded profile's Music and SFX levels, applied at the next boot.

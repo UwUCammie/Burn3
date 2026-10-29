@@ -1,0 +1,33 @@
+#version 450
+// Temporal AA inputs from the native scene's displayed target (NativeScene::render):
+// - camera motion of every pixel from its depth: the point back through this frame's view-projection and through
+//   the frame before's (one matrix, previous * inverse(current), in clip space), in UV units (FSR 3.1: previous =
+//   current + motion). Moving objects are drawn over it afterwards (takedown_taa_motion.frag).
+// - the depth as FSR reads it (R32F, 1 near, 0 far: inverted, infinite).
+// Depth is z / w = A + B / w (TakedownNativeDraw): a cleared pixel (0, the sky) is taken at infinity, z / w = A.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D uDepth;
+layout(set = 0, binding = 1, rg16f) uniform writeonly image2D uMotion;
+layout(set = 0, binding = 2, r32f) uniform writeonly image2D uDepthOut;
+layout(push_constant, std430) uniform Push {
+    mat4 reproject;     // previous view-projection * inverse(current view-projection)
+    vec2 size;          // pixels
+    vec2 jitter;        // this frame's jitter, clip units
+    float infinity;     // z / w of a point at infinity (A)
+    uint valid;         // 0: no previous frame, zero motion
+} push;
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(vec2(p), push.size)))
+        return;
+    float d = texelFetch(uDepth, p, 0).r;
+    imageStore(uDepthOut, p, vec4(d));
+    vec2 motion = vec2(0.0);
+    if (push.valid != 0u) {
+        vec2 ndc = (vec2(p) + 0.5) / push.size * 2.0 - 1.0 - push.jitter;
+        vec4 previous = push.reproject * vec4(ndc, max(d, push.infinity), 1.0);
+        if (previous.w > 0.0)
+            motion = (previous.xy / previous.w - ndc) * 0.5;
+    }
+    imageStore(uMotion, p, vec4(motion, 0.0, 0.0));
+}

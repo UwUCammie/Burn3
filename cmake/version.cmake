@@ -1,0 +1,26 @@
+# Single source of truth for the recovered game version. The original project
+# kept this here so the game, generated version header, and Windows resource
+# all agreed with the VERSION file at the repository root.
+file(READ "${CMAKE_CURRENT_LIST_DIR}/../VERSION" TAKEDOWN_GAME_VERSION)
+string(STRIP "${TAKEDOWN_GAME_VERSION}" TAKEDOWN_GAME_VERSION)
+if(TAKEDOWN_GAME_VERSION STREQUAL "")
+    message(FATAL_ERROR "VERSION is empty")
+endif()
+
+string(REPLACE "." ";" TAKEDOWN_GAME_VERSION_PARTS "${TAKEDOWN_GAME_VERSION}")
+list(LENGTH TAKEDOWN_GAME_VERSION_PARTS TAKEDOWN_GAME_VERSION_PART_COUNT)
+if(NOT TAKEDOWN_GAME_VERSION_PART_COUNT EQUAL 3)
+    message(FATAL_ERROR "VERSION must have the form major.minor.patch: ${TAKEDOWN_GAME_VERSION}")
+endif()
+list(GET TAKEDOWN_GAME_VERSION_PARTS 0 TAKEDOWN_GAME_VERSION_MAJOR)
+list(GET TAKEDOWN_GAME_VERSION_PARTS 1 TAKEDOWN_GAME_VERSION_MINOR)
+list(GET TAKEDOWN_GAME_VERSION_PARTS 2 TAKEDOWN_GAME_VERSION_PATCH)
+foreach(TAKEDOWN_VERSION_PART
+        TAKEDOWN_GAME_VERSION_MAJOR
+        TAKEDOWN_GAME_VERSION_MINOR
+        TAKEDOWN_GAME_VERSION_PATCH)
+    if(NOT ${TAKEDOWN_VERSION_PART} MATCHES "^[0-9]+$")
+        message(FATAL_ERROR
+            "VERSION component ${TAKEDOWN_VERSION_PART}=${${TAKEDOWN_VERSION_PART}} is not numeric")
+    endif()
+endforeach()

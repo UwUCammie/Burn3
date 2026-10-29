@@ -1,0 +1,64 @@
+#version 450
+// FSR 3.1 inputs from the composed world picture (takedown/fsr_upscaler.cpp).
+//
+// colour: the picture times the scene gain, clamped to the 0..1 range FSR's
+// LDR path expects. The previous frame's colour is the other image of a pair.
+// reactive: how far each pixel may trust its history. The PS2 pipeline has no
+// motion vectors, so FSR is given zero motion; where the picture changes
+// between frames (anything moving on screen) the mask goes towards 1 and FSR
+// takes the current frame, which keeps moving parts from smearing. Still parts
+// of the picture (the car in a chase view, the sky, menus) accumulate.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D uSource;
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D uColour;
+layout(set = 0, binding = 2, rgba16f) uniform readonly image2D uPrevious;
+layout(set = 0, binding = 3, r8) uniform writeonly image2D uReactive;
+
+layout(push_constant) uniform Push
+{
+	vec4 gain;
+	uvec2 size;
+	float low;      // change (luma, 0..1) below which history is fully trusted
+	float high;     // change at which the current frame is taken
+	uint have_previous;
+} push;
+
+float luma(vec3 c)
+{
+	return dot(c, vec3(0.299, 0.587, 0.114));
+}
+
+vec3 fetch(ivec2 p)
+{
+	p = clamp(p, ivec2(0), ivec2(push.size) - 1);
+	return clamp(texelFetch(uSource, p, 0).rgb * push.gain.rgb, vec3(0.0), vec3(1.0));
+}
+
+void main()
+{
+	ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+	if (any(greaterThanEqual(uvec2(p), push.size)))
+		return;
+
+	vec3 c = fetch(p);
+	imageStore(uColour, p, vec4(c, 1.0));
+
+	float reactive = 1.0;
+	if (push.have_previous != 0u)
+	{
+		// The largest change in a 3x3 neighbourhood, so edges that move by a
+		// pixel are caught on both sides.
+		float change = 0.0;
+		for (int y = -1; y <= 1; y++)
+			for (int x = -1; x <= 1; x++)
+			{
+				ivec2 q = clamp(p + ivec2(x, y), ivec2(0), ivec2(push.size) - 1);
+				float now = luma(fetch(q));
+				float before = luma(imageLoad(uPrevious, q).rgb);
+				change = max(change, abs(now - before));
+			}
+		reactive = smoothstep(push.low, push.high, change);
+	}
+	imageStore(uReactive, p, vec4(reactive));
+}

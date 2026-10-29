@@ -1,0 +1,30 @@
+# Local scratch, builds and runs
+/tmp/
+/build*/
+/runtime/
+/backups/
+/saves/
+*.log
+
+# Game data and anything generated from it: never commit
+/local-analysis/
+*.iso
+*.elf
+SLUS_*
+*.gsraw
+*.nsc
+
+# Tool and editor state
+.crush/
+.claude/
+.vscode/
+.idea/
+__pycache__/
+*.pyc
+*.rej
+*.orig
+mods/.catalog.json
+
+# Release credential (docs/RELEASING.md): never commit
+release.key
+*.key

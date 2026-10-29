@@ -1,0 +1,31 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+// A PSMCT32 target's mirror (RGBA16F at `scale`; 255 = 1.0, alpha 128 = 1.0)
+// made from NativeScene's GPU copy of GS memory: every sample of a GS pixel
+// gets that pixel's word (takedown/native_vram.cpp).
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer Vram { uint vram[]; };
+layout(rgba16f, set = 0, binding = 1) writeonly uniform image2D Mirror;
+
+layout(push_constant) uniform Constants
+{
+	uint base_block, fbw, height, scale, width_px, height_px;
+} c;
+
+#define TEX_LOAD(w) vram[(w)]
+#define PALETTE(i) 0u
+#include "takedown_vram.h"
+
+void main()
+{
+	uvec2 p = gl_GlobalInvocationID.xy;
+	if (p.x >= c.width_px || p.y >= c.height_px)
+		return;
+	uvec2 g = p / c.scale;
+	if (g.y >= c.height)
+		return;
+	uint w = vram[swizzle_PS2(g.x, g.y, c.base_block, c.fbw, PSMCT32, VRAM_MASK)];
+	vec4 v = vec4(float(w & 255u), float((w >> 8u) & 255u), float((w >> 16u) & 255u), float(w >> 24u));
+	imageStore(Mirror, ivec2(p), v / vec4(255.0, 255.0, 255.0, 128.0));
+}

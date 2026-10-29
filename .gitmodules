@@ -1,0 +1,3 @@
+[submodule "renderer/parallel-gs/Granite"]
+	path = renderer/parallel-gs/Granite
+	url = https://github.com/Themaister/Granite

@@ -1,0 +1,20 @@
+# Menu navigation by what is on screen (TAKEDOWN_NAV_SCRIPT; see the PROFILING HARNESS block in main_harness.patch).
+# Skip the intro movies with Start, new profile without saving and with autosave off,
+# Single Event > Race > first car (skipping the race-training movie), then hold accelerate.
+wait 8
+skip on
+list 2 1 cross
+footer cross
+list 2 1 cross
+list 2 0 cross
+list 5 1 cross
+list 4 0 cross
+# SELECT OPTIONS: step REGION and TRACK off Random so every run loads the same race.
+list 3 0 right
+list 3 1 right
+list 3 0 cross
+footer cross
+wait 2
+nomovie
+hold cross
+# skip stays on but only taps while a movie is playing: it skips the race-training movie.

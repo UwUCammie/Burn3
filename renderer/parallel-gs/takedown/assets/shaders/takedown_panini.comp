@@ -1,0 +1,172 @@
+#version 450
+// Takedown Panini warp of the GS frame, applied in place on paraLLEl-GS VRAM at
+// the full super-sampled resolution (see GSRenderer::takedown_panini_warp).
+//
+// The frame's PSMCT32 pixels live in VRAM as: slice 0, the single-sampled
+// pixel; slice 1, a validity word (all ones: the super samples of the pixel
+// are current); slices 2.., one word per sample (ordered grid, the index
+// interleaves y and x bits). A pixel without valid samples is its slice 0.
+//
+// PASS 0 gathers the frame into a linear high-resolution image (one texel per
+// sample), PASS 1 resamples that image through the inverse Panini projection
+// and writes samples, the resolved pixel and the validity word back.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) buffer VRAM { uint data[]; } vram;
+layout(set = 0, binding = 1) buffer Scratch { uint data[]; } scratch;
+
+layout(push_constant) uniform Parameters
+{
+    uint fbp_blocks;     // FBP * blocks per page
+    uint fbw;            // frame width in pages
+    uint x0, y0;         // picture rectangle in frame pixels
+    uint width, height;
+    uint vram_words;     // size of one VRAM slice in 32-bit words
+    uint sample_log2;    // log2 of samples per axis; 0 is single sampled
+    uint has_reference;  // the validity slice exists
+    uint write_samples;  // the sample slices exist and are written
+    float tangent;
+    float strength;
+    float half_width;
+    float aspect;
+} p;
+
+#ifndef PASS
+#define PASS 0
+#endif
+
+// PSMCT32 address of a pixel, in words (page 64x32 pixels, block 8x8, column 8x2).
+uint pixel_word(uint x, uint y)
+{
+    uint page_index = (y >> 5) * p.fbw + (x >> 6);
+    uint block_x = (x & 63u) >> 3;
+    uint block_y = (y & 31u) >> 3;
+    uint column = (y & 7u) >> 1;
+    uint px = x & 7u;
+    uint py = y & 1u;
+    uint block_index = (block_x & 1u) | ((block_y & 1u) << 1) | ((block_x & 2u) << 1) |
+                       ((block_y & 2u) << 2) | ((block_x & 4u) << 2);
+    block_index += p.fbp_blocks;
+    uint pixel = (px & 1u) | (py << 1) | ((px & 2u) << 1) | ((px & 4u) << 1);
+    uint bytes = page_index * 8192u + block_index * 256u + column * 64u + pixel * 4u;
+    return (bytes & (p.vram_words * 4u - 1u)) >> 2;
+}
+
+uvec2 sample_offset(uint index)
+{
+    uvec2 o = uvec2(0u);
+    for (uint k = 0u; k < p.sample_log2; k++)
+    {
+        o.y |= ((index >> (2u * k)) & 1u) << k;
+        o.x |= ((index >> (2u * k + 1u)) & 1u) << k;
+    }
+    return o;
+}
+
+#if PASS == 0
+
+void main()
+{
+    uvec2 pixel = gl_GlobalInvocationID.xy;
+    if (pixel.x >= p.width || pixel.y >= p.height)
+        return;
+
+    uint word = pixel_word(p.x0 + pixel.x, p.y0 + pixel.y);
+    uint single_sampled = vram.data[word];
+    uint n = 1u << p.sample_log2;
+    uint samples = n * n;
+    uint row = p.width * n;
+
+    bool valid = p.sample_log2 != 0u && p.has_reference != 0u && vram.data[word + p.vram_words] == ~0u;
+    for (uint i = 0u; i < samples; i++)
+    {
+        uvec2 at = pixel * n + sample_offset(i);
+        scratch.data[at.y * row + at.x] = valid ? vram.data[word + (i + 2u) * p.vram_words] : single_sampled;
+    }
+}
+
+#else
+
+// Sharpless' inverse of the Panini projection: the rectilinear tangent-plane
+// point that the picture point (px, py) shows. Same math as
+// presentation::panini_source and GSInterface's former mesh warp.
+vec2 panini_view_point(float px, float py, float d)
+{
+    float k = px * px / ((d + 1.0) * (d + 1.0));
+    float clon = (sqrt(max(k * k * d * d - (k + 1.0) * (d * k * d - 1.0), 0.0)) - d * k) / (k + 1.0);
+    float s = (d + 1.0) / (d + clon);
+    float x_angle = atan(px, clon * s);
+    float y_angle = atan(py, s);
+    return vec2(tan(x_angle), tan(y_angle) / cos(x_angle));
+}
+
+vec4 fetch(ivec2 at, ivec2 size)
+{
+    at = clamp(at, ivec2(0), size - 1);
+    return unpackUnorm4x8(scratch.data[at.y * size.x + at.x]);
+}
+
+vec4 bilinear(vec2 position, ivec2 size)
+{
+    vec2 base = floor(position - 0.5);
+    vec2 f = position - 0.5 - base;
+    ivec2 i = ivec2(base);
+    return mix(mix(fetch(i, size), fetch(i + ivec2(1, 0), size), f.x),
+               mix(fetch(i + ivec2(0, 1), size), fetch(i + ivec2(1, 1), size), f.x), f.y);
+}
+
+vec4 catmull_rom(vec2 position, ivec2 size)
+{
+    vec2 base = floor(position - 0.5);
+    vec2 f = position - 0.5 - base;
+    ivec2 i = ivec2(base);
+    vec2 f2 = f * f;
+    vec2 f3 = f2 * f;
+    vec2 w0 = -0.5 * f3 + f2 - 0.5 * f;
+    vec2 w1 = 1.5 * f3 - 2.5 * f2 + 1.0;
+    vec2 w2 = -1.5 * f3 + 2.0 * f2 + 0.5 * f;
+    vec2 w3 = 0.5 * f3 - 0.5 * f2;
+    float wx[4] = float[](w0.x, w1.x, w2.x, w3.x);
+    float wy[4] = float[](w0.y, w1.y, w2.y, w3.y);
+    vec4 sum = vec4(0.0);
+    for (int y = 0; y < 4; y++)
+        for (int x = 0; x < 4; x++)
+            sum += wx[x] * wy[y] * fetch(i + ivec2(x - 1, y - 1), size);
+    return clamp(sum, 0.0, 1.0);
+}
+
+void main()
+{
+    uvec2 pixel = gl_GlobalInvocationID.xy;
+    if (pixel.x >= p.width || pixel.y >= p.height)
+        return;
+
+    uint n = 1u << p.sample_log2;
+    uint samples = n * n;
+    ivec2 size = ivec2(p.width * n, p.height * n);
+    uint word = pixel_word(p.x0 + pixel.x, p.y0 + pixel.y);
+
+    vec4 sum = vec4(0.0);
+    for (uint i = 0u; i < samples; i++)
+    {
+        uvec2 at = pixel * n + sample_offset(i);
+        // Output position in the Panini picture, in [-1, 1] across the frame.
+        vec2 uv = (vec2(at) + 0.5) / vec2(size) * 2.0 - 1.0;
+        vec2 view = panini_view_point(uv.x * p.half_width, uv.y * p.half_width / p.aspect, p.strength);
+        // The rectilinear picture spans +-tangent across and +-tangent / aspect down.
+        vec2 source = clamp(vec2(view.x / p.tangent, view.y * p.aspect / p.tangent) * 0.5 + 0.5, 0.0, 1.0);
+        vec2 position = source * vec2(size);
+
+        vec4 color = samples == 1u ? catmull_rom(position, size) : bilinear(position, size);
+        if (p.write_samples != 0u)
+            vram.data[word + (i + 2u) * p.vram_words] = packUnorm4x8(color);
+        sum += color;
+    }
+
+    vram.data[word] = packUnorm4x8(sum / float(samples));
+    if (p.has_reference != 0u)
+        vram.data[word + p.vram_words] = p.write_samples != 0u ? ~0u : 0u;
+}
+
+#endif
