@@ -343,6 +343,8 @@ public:
 	void invalidate_super_sampling_state(uint32_t sampling_rate_x_log2, uint32_t sampling_rate_y_log2);
 
 	SuperSampling get_max_supported_super_sampling() const;
+	// Takedown: false when the texture analysis (sampler feedback) pass is unavailable.
+	bool supports_sampler_feedback() const { return sampler_feedback_supported; }
 
 	void set_field_aware_super_sampling(bool enable);
 
@@ -592,6 +594,7 @@ private:
 
 	// Slangmosh
 	Shaders<> shaders;
+	bool sampler_feedback_supported = true;
 	Vulkan::Program *blit_quad = nullptr;
 	Vulkan::Program *sample_quad[2] = {};
 	Vulkan::Program *weave_quad = nullptr;

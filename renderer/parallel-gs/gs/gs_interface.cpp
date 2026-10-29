@@ -60,6 +60,8 @@ bool GSInterface::init(Vulkan::Device *device, const GSOptions &options)
 
 	if (!renderer.init(device, options))
 		return false;
+	if (!renderer.supports_sampler_feedback())
+		debug_mode.disable_sampler_feedback = true;
 
 	set_super_sampling_rate(options.super_sampling,
 	                        options.ordered_super_sampling,
@@ -4656,6 +4658,8 @@ const GIFPath &GSInterface::get_gif_path(uint32_t path) const
 void GSInterface::set_debug_mode(const DebugMode &mode)
 {
 	debug_mode = mode;
+	if (!renderer.supports_sampler_feedback())
+		debug_mode.disable_sampler_feedback = true;
 	renderer.set_enable_timestamps(mode.timestamps);
 }
 

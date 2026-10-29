@@ -30952,6 +30952,12 @@ static const uint8_t reflection_bank[] =
 	0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 };
 
+// Takedown (hand edit): a resolver with a false .sampler_feedback leaves that
+// program out (AMD's GCN driver crashes compiling it in vkCreateShaderModule).
+inline bool slangmosh_wants_sampler_feedback(int) { return true; }
+template <typename R>
+inline auto slangmosh_wants_sampler_feedback(const R &r) -> decltype(bool(r.sampler_feedback)) { return r.sampler_feedback; }
+
 template <typename Program, typename Shader>
 template <typename Device, typename Layout, typename Resolver>
 Shaders<Program, Shader>::Shaders(Device &device, Layout &layout, const Resolver &resolver)
@@ -31004,7 +31010,8 @@ Shaders<Program, Shader>::Shaders(Device &device, Layout &layout, const Resolver
 	layout.unserialize(reflection_bank + 7308, 348);
 	this->qword_clear = device.request_program(spirv_bank + 148555, 1248, &layout);
 	layout.unserialize(reflection_bank + 7656, 348);
-	this->sampler_feedback = device.request_program(spirv_bank + 148867, 20348, &layout);
+	if (slangmosh_wants_sampler_feedback(resolver))
+		this->sampler_feedback = device.request_program(spirv_bank + 148867, 20348, &layout);
 	layout.unserialize(reflection_bank + 8004, 348);
 	this->ui_vert = device.request_shader(spirv_bank + 153954, 1088, &layout);
 	layout.unserialize(reflection_bank + 8352, 348);

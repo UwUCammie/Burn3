@@ -855,9 +855,34 @@ bool GSRenderer::init(Vulkan::Device *device_, const GSOptions &options)
 	drain_compilation_tasks();
 
 	// Takedown: step lines (as in the release renderer) to locate startup failures.
+	// Takedown: AMD's own driver crashes on GCN cards (Polaris/Vega, e.g. RX 580)
+	// while compiling the sampler feedback shader, so that pass is left out
+	// there (GSInterface then runs with disable_sampler_feedback, an upstream
+	// mode). GCN only runs wave64: a fixed 64-wide subgroup on an AMD driver.
+	// PGS_SAMPLER_FEEDBACK=0/1 overrides, as in the release renderer.
+	{
+		const auto &features = device_->get_device_features();
+		const bool amd_driver = features.driver_id == VK_DRIVER_ID_AMD_PROPRIETARY ||
+		                        features.driver_id == VK_DRIVER_ID_AMD_OPEN_SOURCE;
+		const bool wave64_only = features.vk13_props.minSubgroupSize == 64 &&
+		                         features.vk13_props.maxSubgroupSize == 64;
+		sampler_feedback_supported = !(amd_driver && wave64_only);
+		if (!sampler_feedback_supported)
+			LOGI("Sampler feedback disabled for AMD GCN on the AMD driver.\n");
+		if (const char *env = getenv("PGS_SAMPLER_FEEDBACK"))
+		{
+			sampler_feedback_supported = strtol(env, nullptr, 0) != 0;
+			LOGI("Sampler feedback %s by PGS_SAMPLER_FEEDBACK.\n", sampler_feedback_supported ? "enabled" : "disabled");
+		}
+	}
+	struct ShaderResolver
+	{
+		bool sampler_feedback;
+	} resolver = { sampler_feedback_supported };
+
 	LOGI("GS init: creating shader programs.\n");
 	Vulkan::ResourceLayout layout;
-	shaders = Shaders<>(*device_, layout, 0);
+	shaders = Shaders<>(*device_, layout, resolver);
 	blit_quad = device_->request_program(shaders.quad, shaders.blit_circuit);
 	sample_quad[0] = device_->request_program(shaders.quad, shaders.sample_circuit[0]);
 	sample_quad[1] = device_->request_program(shaders.quad, shaders.sample_circuit[1]);
@@ -1542,7 +1567,7 @@ void GSRenderer::commit_cached_texture(uint32_t tex_info_index, bool sampler_fee
 	// Assert that there were no stray flushes between create_cached_texture() and commit_cached_texture().
 	assert(!texture_uploads.empty());
 
-	if (sampler_feedback)
+	if (sampler_feedback && sampler_feedback_supported)
 	{
 		texture_analysis.resize(std::max<size_t>(texture_analysis.size(), tex_info_index + 1));
 		allocate_upload_indirection(texture_analysis[tex_info_index], texture_uploads.back());
