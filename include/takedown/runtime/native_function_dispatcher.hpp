@@ -214,6 +214,15 @@ class NativeFunctionDispatcher {
     dispatch(const NativeFunctionPreparation& preparation,
              guest::R5900State& cpu, guest::EeMemory& memory) const;
 
+    // dispatch(preparation) for a caller that calls it directly after the
+    // prepare() it passes in, with nothing in between that can change what a
+    // resolver reads (the scalar burst's native call): the resolver is not run
+    // a second time. Everything else, including the cost checks on the
+    // handler's result, is as in dispatch(preparation).
+    [[nodiscard]] NativeFunctionDispatchResult
+    dispatch_prepared(const NativeFunctionPreparation& preparation,
+                      guest::R5900State& cpu, guest::EeMemory& memory) const;
+
     [[nodiscard]] std::vector<NativeFunctionMetadata> registered_functions() const;
     [[nodiscard]] std::size_t size() const noexcept;
     [[nodiscard]] bool empty() const noexcept;
@@ -255,6 +264,9 @@ class NativeFunctionDispatcher {
         return slot.entry;
     }
     void invalidate_lookup_cache_slot(guest::GuestAddress address) noexcept;
+    [[nodiscard]] NativeFunctionDispatchResult
+    dispatch_impl(const NativeFunctionPreparation& preparation, guest::R5900State& cpu,
+                  guest::EeMemory& memory, bool resolve_again) const;
 
     [[nodiscard]] NativeFunctionRegistrationResult
     register_function_impl(guest::GuestAddress address, std::string name,

@@ -409,6 +409,59 @@ bool Spu2Voice::mix_block(const std::uint16_t* const ram, const std::size_t coun
                 i += n;
                 continue;
             }
+            // Decode events that only move the ring write position and NAX (including the block-final one when
+            // the block carries no LOOP_END, which would loop, stop or raise ENDX) are batched: the d-th decode (0-based) happens at
+            // the first sample j >= d whose consumed entry count floor((sp + j * step) / 4096) reaches
+            // fill - 12 + 4 * d. Consecutive targets are at least one sample apart (step <= 0x3fff), so the last
+            // decode of a batch of m sits at max(m - 1, ceil(((fill - 12 + 4 * (m - 1)) * 4096 - sp) / step)).
+            const std::uint32_t offset = next_a & 7U;
+            if (offset != 0U) {
+                const std::size_t remaining = count - i;
+                const auto last_decode_sample = [&](const std::uint32_t m) noexcept -> std::uint64_t {
+                    const std::int64_t num = static_cast<std::int64_t>(fill - 12 + 4 * static_cast<std::int32_t>(m - 1)) * 4096 -
+                                             static_cast<std::int64_t>(sp);
+                    std::uint64_t at = m - 1;
+                    if (num > 0) {
+                        if (step == 0) {
+                            return ~std::uint64_t{0};
+                        }
+                        at = std::max<std::uint64_t>(at, (static_cast<std::uint32_t>(num) + static_cast<std::uint32_t>(step) - 1U) /
+                                                             static_cast<std::uint32_t>(step));
+                    }
+                    return at;
+                };
+                // The block-final decode (offset 7) joins the batch unless the block ends a loop.
+                const bool through_boundary = (loop_flags & kSpu2XaFlagLoopEnd) == 0;
+                std::uint32_t m = (through_boundary ? 8U : 7U) - offset;
+                while (m >= 2U && last_decode_sample(m) >= remaining) {
+                    --m;
+                }
+                if (m >= 2U) {
+                    const std::uint64_t used = last_decode_sample(m) + 1U;
+                    if (sweep) {
+                        for (std::uint64_t k = 0; k < used; ++k) {
+                            volume_left.update();
+                            volume_right.update();
+                        }
+                    }
+                    dec_pos_write += 4U * m;
+                    if (through_boundary && offset + m == 8U) {
+                        // Past the block's last word and over the next block's header word.
+                        next_a = (next_a + m + 1U) & kSpu2AddressMask;
+                        sbuffer_valid_ = false;
+                    } else {
+                        next_a += m;
+                    }
+                    const std::uint64_t total = sp + used * step;
+                    dec_pos_read += static_cast<std::uint32_t>(total >> 12);
+                    sp = static_cast<std::uint32_t>(total & 0xfff);
+                    if (out_x_out != nullptr) {
+                        std::fill(out_x_out + i, out_x_out + i + used, out_x);
+                    }
+                    i += static_cast<std::size_t>(used);
+                    continue;
+                }
+            }
             if (sweep) {
                 volume_left.update();
                 volume_right.update();
@@ -427,6 +480,104 @@ bool Spu2Voice::mix_block(const std::uint16_t* const ram, const std::size_t coun
 
     // The header only needs re-reading after NAX moved (a decode step).
     bool header_stale = true;
+
+    // Steady run (unmodulated, noise-free, sweep-free, active voice): after a sample that left the header fresh, the
+    // following samples are a pure function of the sample index until the decoder needs data again (the ring stays
+    // above 12 entries) or the envelope next steps its level or phase (the pitch accumulator and the envelope counter
+    // are linear, the level is constant in between, the Gaussian phase and ring position follow from sp + j * pitch).
+    // A pending header re-read (NAX moved) is done first. Returns the number of samples [from, from + n) it produced; the state afterwards is exactly what n calls of the
+    // per-sample path leave.
+    const auto steady_run = [&](const std::size_t from) noexcept -> std::size_t {
+        std::size_t n = count - from;
+        const std::int32_t fill = static_cast<std::int32_t>(dec_pos_write - dec_pos_read);
+        if (fill <= 12) {
+            return 0;
+        }
+        const std::uint32_t p = std::min<std::uint32_t>(pitch, 0x3fffU);
+        if (p != 0) {
+            const std::uint64_t need = static_cast<std::uint64_t>(fill - 12) * 4096U - sp;
+            n = std::min<std::uint64_t>(n, (need + p - 1) / p);
+        }
+        const Spu2Adsr::PhaseParams& ap = adsr.params();
+        if (adsr.phase == Spu2Adsr::kPhaseSustain) {
+            if (adsr.value == 0) {
+                return 0;
+            }
+        } else if ((!ap.decr && adsr.value >= ap.target) || (ap.decr && adsr.value <= ap.target)) {
+            return 0;
+        }
+        std::uint32_t counter_inc = 0x8000U >> std::max(0, static_cast<int>(ap.shift) - 11);
+        if (ap.exp && !ap.decr && adsr.value > 0x6000) {
+            counter_inc >>= 2;
+        }
+        counter_inc = std::max(counter_inc, 1U);
+        if (adsr.counter >= 0x8000U) {
+            return 0;
+        }
+        std::uint32_t advance = 0;
+        const std::size_t until_step = (0x7fffU - adsr.counter) / counter_inc;
+        if (until_step != 0) {
+            n = std::min(n, until_step);
+            advance = static_cast<std::uint32_t>(n) * counter_inc;
+        } else {
+            // The envelope steps every sample. If a step leaves value, counter and phase as they are (a saturated
+            // level, e.g. sustain increasing at 0x7fff, which retail libsd programs on most voices) that sample is a
+            // fixed point and the whole run repeats it.
+            Spu2Adsr probe = adsr;
+            if (!probe.calculate() || probe.value != adsr.value || probe.counter != adsr.counter ||
+                probe.phase != adsr.phase) {
+                return 0;
+            }
+        }
+        if (n == 0) {
+            return 0;
+        }
+        if (header_stale) {
+            // The per-sample path re-reads the header at the top of the first of these samples.
+            update_block_header(ram);
+            header_stale = false;
+        }
+
+        const std::array<std::int16_t, 4>* const table = spu2_gaussian_table().phase.data();
+        const std::int32_t level = adsr.value;
+        const std::int32_t vol_l = volume_left.value;
+        const std::int32_t vol_r = volume_right.value;
+        const std::uint32_t read0 = dec_pos_read;
+        const std::int16_t* const fifo = decode_fifo.data();
+        std::int32_t* const dl = gate_dry_left ? bus.dry_left + from : nullptr;
+        std::int32_t* const dr = gate_dry_right ? bus.dry_right + from : nullptr;
+        std::int32_t* const wl = gate_wet_left ? bus.wet_left + from : nullptr;
+        std::int32_t* const wr = gate_wet_right ? bus.wet_right + from : nullptr;
+        std::int32_t last = 0;
+        for (std::size_t j = 0; j < n; ++j) {
+            const std::uint32_t t = sp + static_cast<std::uint32_t>(j) * p;
+            const std::uint32_t rd = read0 + (t >> 12);
+            const auto& taps = table[(t >> 4) & 0xff];
+            std::int32_t out = (taps[0] * fifo[(rd + 0) & 31]) >> 15;
+            out += (taps[1] * fifo[(rd + 1) & 31]) >> 15;
+            out += (taps[2] * fifo[(rd + 2) & 31]) >> 15;
+            out += (taps[3] * fifo[(rd + 3) & 31]) >> 15;
+            const std::int32_t v = (level * out) >> 15;
+            last = v;
+            if (out_x_out != nullptr) {
+                out_x_out[from + j] = v;
+            }
+            const int scaled_left = static_cast<int>((static_cast<std::int64_t>(v) * vol_l) >> 15);
+            const int scaled_right = static_cast<int>((static_cast<std::int64_t>(v) * vol_r) >> 15);
+            if (dl != nullptr) dl[j] += scaled_left;
+            if (dr != nullptr) dr[j] += scaled_right;
+            if (wl != nullptr) wl[j] += scaled_left;
+            if (wr != nullptr) wr[j] += scaled_right;
+        }
+        const std::uint32_t total = sp + static_cast<std::uint32_t>(n) * p;
+        dec_pos_read = read0 + (total >> 12);
+        sp = total & 0xfffU;
+        adsr.counter += advance;
+        out_x = last;
+        hit_loop_end = false;
+        return n;
+    };
+
     for (std::size_t i = 0; i < count; ++i) {
         if (!modulated && adsr.stopped()) {
             run_stopped(i);
@@ -487,6 +638,10 @@ bool Spu2Voice::mix_block(const std::uint16_t* const ram, const std::size_t coun
             if (gate_wet_right) {
                 bus.wet_right[i] += scaled_right;
             }
+        }
+        if (!modulated && !noise && active() && !volume_left.sweep_enabled() &&
+            !volume_right.sweep_enabled()) {
+            i += steady_run(i + 1);
         }
     }
     return loop_end_any;

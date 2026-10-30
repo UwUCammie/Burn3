@@ -1,6 +1,6 @@
 // ns2_hybrid.hpp -- hybrid replay of an NS-1 native scene recording (.nsc) on the replay rig.
 //
-// The recording (native_scene_format.h) says, for every draw of the game's frames, which GS
+// The recording (tmp/ns1-capture/FORMAT.md) says, for every draw of the game's frames, which GS
 // drawing kicks of the capture-wide kick sequence it replaced (gs_kick_first / gs_kick_count), its
 // mesh, matrices and GS state. This plan hands those draws to GSInterface as TakedownHybridPlan
 // ranges: the front end drops the kicks, and the capture thread appends one native batch per draw
@@ -692,7 +692,7 @@ private:
 	}
 
 	// A car part's vertices for this draw: the car program's damage deformation, lighting and environment map coordinates
-	// (the maths of Slus21050CarProgram::run, plain float).
+	// (the maths of Slus21050CarProgram::run, plain float; tmp/ns2-cars/car_vertex_stage.cpp).
 	// Positions stay in part space: the part matrix is the draw's model matrix.
 	std::shared_ptr<const GS::TakedownNativeMesh> car_mesh(const NscDraw &d, const MeshEntry &me, bool environment, const NscView &scene_view)
 	{

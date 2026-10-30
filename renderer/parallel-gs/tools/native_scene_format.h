@@ -1,6 +1,6 @@
 /* native_scene_format.h -- NS-1 native scene recording (.nsc), format version 1.
  *
- * This header is the format's definition (the script that generated it is not part of this repository).
+ * Generated from tmp/ns1-capture/tools/nscfmt.py (the single source of truth); see FORMAT.md for the full description.
  * All integers little endian. Structs are `packed` (no padding) and every chunk payload is padded to 16 bytes.
  * Conventions: world space is the game's (y up, units ~ metres). `world_to_clip` maps [x y z 1] (column vector) to clip space
  * with ndc_x right = +, ndc_y UP = +, depth01 = z_gs / 16777215 REVERSED (1 = near, 0 = far; GS depth test GREATER_EQUAL).

@@ -127,6 +127,8 @@
 #include "takedown/runtime/slus_21050_native_cars.hpp"
 #include "takedown/runtime/slus_21050_native_functions.hpp"
 #include "takedown/runtime/slus_21050_native_pc_options.hpp"
+#include "takedown/runtime/slus_21050_online_count.hpp"
+#include "takedown/runtime/slus_21050_settings_page.hpp"
 #include "takedown/runtime/slus_21050_object_packet_capture.hpp"
 #include "takedown/runtime/slus_21050_object_submission_adapter.hpp"
 #include "takedown/runtime/slus_21050_online.hpp"
@@ -146,7 +148,7 @@
 #include "takedown/save/profile_slots.hpp"
 #include "takedown/save/save_card_device.hpp"
 #include "takedown/save/save_data.hpp"
-#include "takedown/ui/controls_session.hpp"
+#include "takedown/ui/controls_editor.hpp"
 #include "takedown/ui/developer_unlock.hpp"
 #include "takedown/ui/host_prompt.hpp"
 #include "takedown/ui/mod_sync_session.hpp"
@@ -4715,17 +4717,21 @@ int run_boot_entry(int argc, char** argv) {
         .environment = {.supersampling_available = parallel_gs_live_fifo_path.has_value(),
                         .variable_frame_timing_active = variable_frame_rate.has_value(),
                         .frame_timing_set_by_launcher = frame_rate_option.has_value()},
-        .enabled = window_requested &&
-                   (!guest_input_timeline_enabled || []() {
+        // TAKEDOWN_PC_OPTIONS=force adds the pages to scripted and windowless
+        // (test) runs too.
+        .enabled = [&]() {
             const char* const value = std::getenv("TAKEDOWN_PC_OPTIONS");
-            return value != nullptr && std::string_view(value) == "force";
-        }())});
+            const bool forced = value != nullptr && std::string_view(value) == "force";
+            return forced || (window_requested && !guest_input_timeline_enabled);
+        }()});
     Slus21050GraphicsOptions game_graphics_options;
     if (native_function_revision_matched &&
         !game_graphics_options.register_native_effects(native_function_dispatcher, memory)) {
         std::cerr << "PC options: native post-processing revision admission failed\n";
     }
     Slus21050NativePcOptions native_pc_options;
+    Slus21050SettingsPage settings_page;
+    Slus21050OnlineCount online_count;
     Slus21050MenuMouse menu_mouse;
     std::optional<Slus21050BootVolume> boot_volume;
     if ((guest_input_replay == nullptr && guest_input_recorder == nullptr) || []() {
@@ -4749,7 +4755,7 @@ int run_boot_entry(int argc, char** argv) {
                 "TAKEDOWN_MENU_MOUSE_SCRIPT: expected poll:x,y,buttons[,wheel];...");
         }
     }
-    ui::ControlsSession controls_session{
+    ui::ControlsEditor controls_session{
         platform::input_bindings_path_for(config::default_settings_path()),
         platform::gamepad_mappings_path_for(config::default_settings_path())};
     Slus21050CameraFov camera_fov;
@@ -5723,6 +5729,32 @@ int run_boot_entry(int argc, char** argv) {
         }
         return host_controller_input();
     };
+    const auto escape_key_held = [&host_window, &parallel_gs_input_reader]() {
+        constexpr std::size_t kEscapeScancode = 41U; // SDL_SCANCODE_ESCAPE
+        if (parallel_gs_input_reader != nullptr && parallel_gs_input_reader->has_raw_input() &&
+            parallel_gs_input_reader->raw_input().keys.test(kEscapeScancode)) {
+            return true;
+        }
+        return host_window != nullptr && host_window->raw_input_state().keys.test(kEscapeScancode);
+    };
+    // The imported menu fonts and artwork (cache/ui of the install).
+    // The install: the folder above the game's game/SLUS_210.50.
+    const std::filesystem::path install_directory = std::filesystem::path(argv[2]).parent_path().parent_path();
+    const auto settings_ui_directory = [&mods_manager, &install_directory]() -> const std::string& {
+        static const std::string directory = [&mods_manager, &install_directory]() {
+            std::vector<std::filesystem::path> candidates{install_directory / "cache" / "ui",
+                                                          mods_manager.directory().parent_path() / "cache" / "ui",
+                                                          config::default_settings_path().parent_path() / "cache" / "ui"};
+            for (const auto& candidate : candidates) {
+                std::error_code error;
+                if (std::filesystem::is_regular_file(candidate / "GlobalFont.tdfont", error)) {
+                    return std::filesystem::absolute(candidate, error).string();
+                }
+            }
+            return std::filesystem::absolute(candidates.front()).string();
+        }();
+        return directory;
+    };
     bool guest_work_measurement_start_input_pending = false;
     std::uint64_t guest_work_measurement_start_edges_observed = 0U;
     std::size_t next_host_window_step = 0U;
@@ -5769,6 +5801,44 @@ int run_boot_entry(int argc, char** argv) {
         }
     };
     apply_pc_options();
+    // One retail poll of the SETTINGS page: while it is the game's page it
+    // takes the input (controller state and the mouse) and the game page sees
+    // none (returns true). Runs at most once per poll.
+    std::uint64_t settings_page_last_poll = ~std::uint64_t{0};
+    const auto settings_page_poll = [&](const std::uint64_t poll, const platform::HostControllerState& pad,
+                                        const std::optional<runtime::MenuMouseInput>& mouse) -> bool {
+        if (!pc_options.enabled() || !native_pc_options.installed()) {
+            return false;
+        }
+        if (poll == settings_page_last_poll) {
+            return settings_page.active();
+        }
+        settings_page_last_poll = poll;
+        SettingsPageInput page_input{.pad = pad};
+        if (mouse.has_value()) {
+            if (mouse->inside) {
+                page_input.pointer = std::array<float, 2>{mouse->x, mouse->y};
+            }
+            page_input.mouse_buttons = mouse->buttons;
+            page_input.wheel = mouse->wheel;
+        }
+        const SettingsPageControls page_controls{controls_session.rows(), controls_session.capturing(),
+                                                 controls_session.capture_prompt(), controls_session.notice()};
+        config::GraphicsSettings edited = pc_options.graphics();
+        const auto page_result = settings_page.update(memory, native_pc_options, edited, page_controls, page_input);
+        if (page_result.graphics_changed) {
+            const auto update = pc_options.apply_graphics(edited);
+            if (update.save_error.has_value()) {
+                std::cerr << "Settings: " << *update.save_error << '\n';
+            }
+            apply_pc_options();
+        }
+        if (page_result.controls_action.has_value()) {
+            controls_session.activate(page_result.controls_action->first, page_result.controls_action->second,
+                                      host_window != nullptr ? host_window->raw_input_state() : platform::RawInputState{});
+        }
+        return page_result.active;
+    };
     const auto variable_frame_limit_cycles = [&variable_frame_rate, &host_movie_player, &pc_options,
                                               &variable_frame_floor_cycles]() -> std::uint64_t {
         const auto limit = presentation::effective_frame_rate_limit(
@@ -7197,12 +7267,14 @@ int run_boot_entry(int argc, char** argv) {
         return memory.ee_memory_write_observer() == nullptr;
     };
     // SCALAR-BURST-START-PREDICATE-END
-    const auto ee_aot_burst_step = [&](EeStepResult& result, const std::uint64_t budget, const takedown::guest::GuestAddress declined_entry) -> std::uint64_t {
+    const auto ee_aot_burst_step = [&](EeStepResult& result, const std::uint64_t budget, const takedown::guest::GuestAddress declined_entry,
+                                       std::uint8_t& outcome) -> std::uint64_t {
         const auto run = takedown::guest::run_ee_aot(state, memory, budget, committed_steps, declined_entry);
+        outcome = run.outcome;
         if (run.executed == 0U) {
             return 0U;
         }
-        const std::uint64_t skipped = run.executed - 1U;
+        const std::uint64_t skipped = run.outcome == takedown::guest::kEeAotRunAccounted ? 0U : run.executed - 1U;
         if (skipped != 0U) {
             committed_steps += skipped;
             executed_instructions += skipped;
@@ -7221,6 +7293,14 @@ int run_boot_entry(int argc, char** argv) {
         result = run.last;
         return run.executed;
     };
+    const bool burst_native_fast = [] {
+        const auto* value = std::getenv("TAKEDOWN_BURST_NATIVE_FAST");
+        return value == nullptr || std::string_view{value} != "0";
+    }();
+    const bool burst_dispatch_trust = [] {
+        const auto* value = std::getenv("TAKEDOWN_BURST_DISPATCH_TRUST");
+        return value == nullptr || std::string_view{value} != "0";
+    }();
     const auto scalar_burst_horizon = [&](const std::size_t execution_step_limit) -> std::uint64_t {
         using takedown::runtime::scalar_burst_boundaries_before;
         const auto first_step = static_cast<std::uint64_t>(committed_steps) + 1U;
@@ -7889,6 +7969,12 @@ int run_boot_entry(int argc, char** argv) {
                     } else {
                         effective_retail_input = current_host_controller_state();
                     }
+                    // Escape is Back (Triangle) in menus and pauses everywhere else; it never quits.
+                    if (guest_input_replay == nullptr && escape_key_held() &&
+                        memory.read_u32_le(0x01e90424U) != 5U) {
+                        effective_retail_input.triangle = false;
+                        effective_retail_input.start = true;
+                    }
                     std::optional<runtime::MenuMouseInput> mouse_input;
                     if (menu_mouse_script.has_value()) {
                         mouse_input = menu_mouse_script->at(virtual_ds2_trace->update_count);
@@ -7898,6 +7984,14 @@ int run_boot_entry(int argc, char** argv) {
                         mouse_input = runtime::MenuMouseInput{
                             pointer.x, pointer.y, pointer.inside, parallel_gs_input_reader->raw_input().mouse_buttons,
                             parallel_gs_input_reader->consume_wheel()};
+                    }
+                    // The SETTINGS page takes the input itself while it is open; the
+                    // game page then sees none.
+                    const bool settings_page_input =
+                        settings_page_poll(virtual_ds2_trace->update_count, effective_retail_input, mouse_input);
+                    if (settings_page_input) {
+                        mouse_input.reset();
+                        effective_retail_input = {};
                     }
                     if (mouse_input.has_value()) {
                         const bool title_screen = is_menu_title_screen(memory, memory.read_u32_le(0x01e90424U),
@@ -8623,6 +8717,18 @@ int run_boot_entry(int argc, char** argv) {
                 }
             }
 
+            // The SETTINGS page's UI, else the online player count on the main
+            // menu, else the MODS page's.
+            online_count.update(memory);
+            const auto page_host_ui = [&]() -> platform::ParallelGsHostUi {
+                if (settings_page.active()) {
+                    return settings_page.host_ui(settings_ui_directory());
+                }
+                if (online_count.visible()) {
+                    return online_count.host_ui(settings_ui_directory());
+                }
+                return native_mods_ui;
+            };
             if (added_cars.registered()) {
                 if (added_cars_dirty) {
                     configure_added_cars();
@@ -8642,8 +8748,12 @@ int run_boot_entry(int argc, char** argv) {
                         native_car_select.next_skin(memory);
                     }
                     auto ui = native_car_select.host_ui(memory);
+                    // Car select's UI, else the SETTINGS page's or the MODS page's.
+                    if (ui.items.empty()) {
+                        ui = page_host_ui();
+                    }
                     memory.run_in_graphics_order(
-                        [writer = parallel_gs_stream_writer.get(), host_ui = ui.items.empty() ? native_mods_ui : ui]() {
+                        [writer = parallel_gs_stream_writer.get(), host_ui = std::move(ui)]() {
                         writer->set_host_ui(host_ui);
                     });
                     car_select_skin_held = pad.right_shoulder;
@@ -8652,7 +8762,10 @@ int run_boot_entry(int argc, char** argv) {
             }
             if (!native_car_select_active && parallel_gs_stream_writer != nullptr) {
                 memory.run_in_graphics_order(
-                    [writer = parallel_gs_stream_writer.get(), host_ui = native_mods_ui]() { writer->set_host_ui(host_ui); });
+                    [writer = parallel_gs_stream_writer.get(),
+                     host_ui = page_host_ui()]() {
+                        writer->set_host_ui(host_ui);
+                    });
             }
             if (native_pc_options.unavailable_reason().has_value()) {
                 if (!native_pc_options_reported) {
@@ -9787,7 +9900,7 @@ int run_boot_entry(int argc, char** argv) {
                                     ui_draw_session_feed.learned_caller_return());
                             }
                             const auto burst_prepare_native = [&](const takedown::guest::GuestAddress pc, const std::size_t pending,
-                                                                  bool& outer_loop_declines)
+                                                                  bool& outer_loop_declines, const bool count_preflight = true)
                                 -> takedown::runtime::NativeFunctionPreparation {
                                 outer_loop_declines = false;
                                 const auto* const candidate = native_function_dispatcher.lookup(pc);
@@ -9829,7 +9942,7 @@ int run_boot_entry(int argc, char** argv) {
                                         !(candidate->has_dynamic_cost_resolver &&
                                           takedown::runtime::native_function_preflight_allows_exact_cost_probe(
                                               preflight, candidate->traits, burst_preflight_state));
-                                    if (outer_loop_declines) {
+                                    if (outer_loop_declines && count_preflight) {
                                         ++native_function_preflight_counts[static_cast<std::size_t>(preflight)];
                                     }
                                     return {};
@@ -9838,6 +9951,142 @@ int run_boot_entry(int argc, char** argv) {
                                 outer_loop_declines = !preparation.prepared();
                                 return preparation;
                             };
+                            // The burst loop below, for the case the compiled run stops at a native entry
+                            // (see takedown::guest::EeAotNativeHook): the post-instruction checks, the native
+                            // call and the loop's bookkeeping around it, done without leaving the run, then
+                            // on in compiled code. Anything not plainly the ordinary path is handed back
+                            // unchanged for the loop itself to decide.
+                            const auto burst_native_hook = [&](const std::uint64_t executed,
+                                                               const takedown::guest::GuestAddress last_pc)
+                                -> takedown::guest::EeAotNativeHookResult {
+                                using Kind = takedown::guest::EeAotNativeHookResult::Kind;
+                                if (state.is_executing_delay_slot() || burst_budget <= executed) {
+                                    return {};
+                                }
+                                if (!scalar_burst_native_entries.contains(state.pc())) {
+                                    return {};
+                                }
+                                // The progress of the instructions before the last one (ee_aot_burst_step's).
+                                if (const std::uint64_t skipped = executed - 1U; skipped != 0U) {
+                                    committed_steps += skipped;
+                                    executed_instructions += skipped;
+                                    emulated_ee_cycles += skipped;
+                                    takedown::runtime::service_graphics_dmacs_until(
+                                        emulated_ee_cycles, vif1_dmac_serviced_ee_cycles, gif_dmac_serviced_ee_cycles,
+                                        advance_idle_vif1, advance_idle_gif);
+                                    if (host_window != nullptr) {
+                                        host_window_loop_iterations += skipped;
+                                    }
+                                    kernel.set_ee_cycle_count(emulated_ee_cycles);
+                                    memory.set_current_guest_step(committed_steps);
+                                }
+                                memory.set_current_ee_pc(last_pc);
+                                bool pending = true;
+                                std::uint64_t counted = executed; // not yet in the burst's counters
+                                bool called = false;
+                                for (;;) {
+                                    const auto hand_back = [&]() -> takedown::guest::EeAotNativeHookResult {
+                                        return {called ? Kind::HandOffNativeDone : Kind::HandOffAccounted, 0U, 0U};
+                                    };
+                                    // What the loop checks after an instruction or a native call.
+                                    if (memory.hardware_activity_epoch() != burst_hardware_activity ||
+                                        burst_ram_watch.fires()) {
+                                        return hand_back();
+                                    }
+                                    if (state.read_cop0(kCop0Status) != burst_cop0_status) {
+                                        if (!scalar_burst_may_start()) {
+                                            return hand_back();
+                                        }
+                                        burst_cop0_status = state.read_cop0(kCop0Status);
+                                    }
+                                    if (!pending && !scalar_burst_may_start()) {
+                                        return hand_back();
+                                    }
+                                    const auto next_pc = state.pc();
+                                    takedown::runtime::NativeFunctionPreparation prepared{};
+                                    if (scalar_burst_hooks.marked(next_pc)) {
+                                        if (!scalar_burst_native_entries.contains(next_pc) ||
+                                            burst_budget - counted == 0U) {
+                                            return hand_back();
+                                        }
+                                        bool declines = false;
+                                        prepared = burst_prepare_native(next_pc, pending ? 1U : 0U, declines, false);
+                                        if (!prepared.prepared()) {
+                                            return hand_back();
+                                        }
+                                    } else if (burst_budget - counted == 0U) {
+                                        return hand_back();
+                                    }
+                                    // The loop's next iteration.
+                                    if (counted != 0U) {
+                                        scalar_observer_bypass_steps += counted;
+                                        scalar_burst.instructions += counted;
+                                        burst_budget -= counted;
+                                        counted = 0U;
+                                    }
+                                    if (pending) {
+                                        ++committed_steps;
+                                        ++executed_instructions;
+                                        ++emulated_ee_cycles;
+                                    }
+                                    takedown::runtime::service_graphics_dmacs_until(
+                                        emulated_ee_cycles, vif1_dmac_serviced_ee_cycles, gif_dmac_serviced_ee_cycles,
+                                        advance_idle_vif1, advance_idle_gif);
+                                    if (host_window != nullptr) {
+                                        ++host_window_loop_iterations;
+                                    }
+                                    kernel.set_ee_cycle_count(emulated_ee_cycles);
+                                    memory.set_current_ee_pc(next_pc);
+                                    memory.set_current_guest_step(committed_steps);
+                                    if (!prepared.prepared()) {
+                                        return {Kind::Continue, burst_budget, committed_steps};
+                                    }
+                                    const auto native_call = burst_dispatch_trust
+                                                                 ? native_function_dispatcher.dispatch_prepared(prepared, state, memory)
+                                                                 : native_function_dispatcher.dispatch(prepared, state, memory);
+                                    pending = false;
+                                    called = true;
+                                    if (!native_call.handled()) {
+                                        if (host_window != nullptr) {
+                                            --host_window_loop_iterations;
+                                        }
+                                        return {Kind::HandOffUnhandled, 0U, 0U};
+                                    }
+                                    const auto retired = native_call.execution.retired_instructions;
+                                    const auto cycles = native_call.execution.ee_cycles;
+                                    observe_profiled_ee_span(committed_steps, next_pc, retired,
+                                                             takedown::runtime::EePcSampleKind::NativeFunction);
+                                    committed_steps += retired;
+                                    executed_instructions += retired;
+                                    emulated_ee_cycles += cycles;
+                                    ++native_function_calls;
+                                    native_function_retired_instructions += retired;
+                                    ++native_function_hits[native_call.function->address];
+                                    ++scalar_burst.native_calls;
+                                    if (native_call.function->traits.defers_dmac_completions && retired > 1U) {
+                                        memory.advance_dmac_completion_delays(retired - 1U);
+                                    }
+                                    const std::uint64_t native_cost = std::max(retired, cycles);
+                                    burst_budget = burst_budget > native_cost ? burst_budget - native_cost : 0U;
+                                }
+                            };
+                            struct BurstNativeHookScope {
+                                bool installed{};
+                                ~BurstNativeHookScope() {
+                                    if (installed) {
+                                        takedown::guest::ee_aot_set_native_hook(nullptr, nullptr);
+                                    }
+                                }
+                            } burst_native_hook_scope;
+                            if (burst_ee_aot && burst_native_fast && burst_native_calls && !burst_ui_session &&
+                                !scalar_burst_audit) {
+                                takedown::guest::ee_aot_set_native_hook(
+                                    [](void* const user, const std::uint64_t executed, const takedown::guest::GuestAddress last_pc) {
+                                        return (*static_cast<decltype(burst_native_hook)*>(user))(executed, last_pc);
+                                    },
+                                    const_cast<void*>(static_cast<const void*>(&burst_native_hook)));
+                                burst_native_hook_scope.installed = true;
+                            }
                             bool burst_pending = true;
                             takedown::runtime::NativeFunctionPreparation burst_native{};
                             auto burst_declined_entry = takedown::guest::kEeAotNoDeclinedEntry;
@@ -9857,7 +10106,9 @@ int run_boot_entry(int argc, char** argv) {
                                 memory.set_current_ee_pc(burst_pc);
                                 memory.set_current_guest_step(committed_steps);
                                 if (burst_native.prepared()) {
-                                    const auto native_call = native_function_dispatcher.dispatch(burst_native, state, memory);
+                                    const auto native_call = burst_dispatch_trust
+                                                                 ? native_function_dispatcher.dispatch_prepared(burst_native, state, memory)
+                                                                 : native_function_dispatcher.dispatch(burst_native, state, memory);
                                     burst_native = {};
                                     burst_pending = false;
                                     if (!native_call.handled()) {
@@ -9884,10 +10135,18 @@ int run_boot_entry(int argc, char** argv) {
                                     const std::uint64_t native_cost = std::max(retired, cycles);
                                     burst_budget = burst_budget > native_cost ? burst_budget - native_cost : 0U;
                                 } else {
+                                    std::uint8_t aot_outcome = takedown::guest::kEeAotRunOrdinary;
                                     if (const auto compiled = burst_ee_aot
-                                                                  ? ee_aot_burst_step(result, burst_budget, burst_declined_entry)
+                                                                  ? ee_aot_burst_step(result, burst_budget, burst_declined_entry, aot_outcome)
                                                                   : 0U;
-                                    compiled != 0U) {
+                                    aot_outcome == takedown::guest::kEeAotRunNativeDone) {
+                                        // The run made native calls and ended with none of its own instructions pending.
+                                        burst_pending = false;
+                                    } else if (aot_outcome == takedown::guest::kEeAotRunNativeUnhandled) {
+                                        burst_pending = false;
+                                        burst_stop = takedown::runtime::ScalarBurstStop::Hook;
+                                        break;
+                                    } else if (compiled != 0U) {
                                         burst_pending = true;
                                         scalar_observer_bypass_steps += compiled;
                                         scalar_burst.instructions += compiled;
@@ -9966,6 +10225,17 @@ int run_boot_entry(int argc, char** argv) {
                                 }
                             }
                             scalar_burst.note_stop(burst_stop);
+                            {
+                                static const bool report_hook = std::getenv("TAKEDOWN_AOTNATIVE_STATS") != nullptr;
+                                if (report_hook && scalar_burst.bursts % 20000U == 0U) {
+                                    const auto& stats = takedown::guest::ee_aot_statistics();
+                                    std::fprintf(stderr, "[AOTNATIVE] bursts=%llu native_calls=%llu hook_taken=%llu hook_continued=%llu retired=%llu steps=%llu cycles=%llu\n",
+                                                 static_cast<unsigned long long>(scalar_burst.bursts), static_cast<unsigned long long>(scalar_burst.native_calls),
+                                                 static_cast<unsigned long long>(stats.native_hook_taken), static_cast<unsigned long long>(stats.native_hook_continued),
+                                                 static_cast<unsigned long long>(native_function_retired_instructions),
+                                                 static_cast<unsigned long long>(committed_steps), static_cast<unsigned long long>(emulated_ee_cycles));
+                                }
+                            }
                             if (!burst_pending) {
                                 continue;
                             }
@@ -11425,7 +11695,8 @@ int run_boot_entry(int argc, char** argv) {
               << ",excluded:" << aot.stop_excluded << ",untranslated:" << aot.stop_untranslated
               << ",memory:" << aot.stop_memory << ",device:" << aot.stop_device << ",fault:" << aot.stop_fault
               << "} register-loads=" << aot.register_loads << " register-stores=" << aot.register_stores
-              << " identity-checks=" << aot.identity_checks << " identity-failures=" << aot.identity_failures << '\n';
+              << " identity-checks=" << aot.identity_checks << " identity-failures=" << aot.identity_failures
+              << " native-hook={taken:" << aot.native_hook_taken << ",continued:" << aot.native_hook_continued << "}\n";
     std::cout << "  EE AOT budget refusals: at-entry=" << aot.stop_budget_at_entry << " remaining={";
     for (std::size_t bucket = 0U; bucket < aot.stop_budget_remaining.size(); ++bucket) {
         std::cout << (bucket == 0U ? "" : ",") << aot.stop_budget_remaining[bucket];

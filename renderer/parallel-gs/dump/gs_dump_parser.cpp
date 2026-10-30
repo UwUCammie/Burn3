@@ -1,5 +1,8 @@
 #include "gs_dump_parser.hpp"
 #include "gs_interface.hpp"
+#if defined(_WIN32)
+#include "../takedown/gs_shm_ring.h"
+#endif
 #include <algorithm>
 #include <stdexcept>
 #include <utility>
@@ -17,6 +20,26 @@ constexpr uint32_t kHostUiLimit = 512U * 1024U;
 constexpr uint32_t kPaniniWarpPayload = 6U;
 constexpr uint32_t kNativeCmdRecordLimit = 8U * 1024U * 1024U;
 }
+
+#if defined(_WIN32)
+void GSDumpParser::RingDeleter::operator()(GsShm *ring)
+{
+	if (ring)
+	{
+		gs_shm_consumer_close(ring);
+		gs_shm_close(ring);
+		delete ring;
+	}
+}
+
+void GSDumpParser::attach_ring(GsShm *ring_)
+{
+	ring.reset(ring_);
+}
+#else
+void GSDumpParser::RingDeleter::operator()(GsShm *) {}
+void GSDumpParser::attach_ring(GsShm *) {}
+#endif
 
 bool GSDumpParser::restart()
 {
@@ -401,7 +424,7 @@ ScanoutResult GSDumpParser::consume_vsync_result()
 uint8_t GSDumpParser::read_u8()
 {
 	uint8_t v = 0;
-	if (fread(&v, sizeof(v), 1, file.get()) != 1)
+	if (!read_bytes(&v, sizeof(v)))
 		eof = true;
 	return v;
 }
@@ -409,7 +432,7 @@ uint8_t GSDumpParser::read_u8()
 uint16_t GSDumpParser::read_u16()
 {
 	uint16_t v = 0;
-	if (fread(&v, sizeof(v), 1, file.get()) != 1)
+	if (!read_bytes(&v, sizeof(v)))
 		eof = true;
 	return v;
 }
@@ -417,7 +440,7 @@ uint16_t GSDumpParser::read_u16()
 uint32_t GSDumpParser::read_u32()
 {
 	uint32_t v = 0;
-	if (fread(&v, sizeof(v), 1, file.get()) != 1)
+	if (!read_bytes(&v, sizeof(v)))
 		eof = true;
 	return v;
 }
@@ -425,7 +448,7 @@ uint32_t GSDumpParser::read_u32()
 float GSDumpParser::read_f32()
 {
 	float v = 0;
-	if (fread(&v, sizeof(v), 1, file.get()) != 1)
+	if (!read_bytes(&v, sizeof(v)))
 		eof = true;
 	return v;
 }
@@ -433,7 +456,7 @@ float GSDumpParser::read_f32()
 uint64_t GSDumpParser::read_u64()
 {
 	uint64_t v = 0;
-	if (fread(&v, sizeof(v), 1, file.get()) != 1)
+	if (!read_bytes(&v, sizeof(v)))
 		eof = true;
 	return v;
 }
@@ -444,14 +467,37 @@ void GSDumpParser::read_reg(T &reg)
 	reg.bits = read_u64();
 }
 
+bool GSDumpParser::read_bytes(void *data, size_t size)
+{
+#if defined(_WIN32)
+	if (ring)
+		return gs_shm_read(ring.get(), data, size) == size;
+#endif
+	return fread(data, 1, size, file.get()) == size;
+}
+
 void GSDumpParser::read_skip(size_t size)
 {
+#if defined(_WIN32)
+	if (ring)
+	{
+		uint8_t scratch[256];
+		while (size != 0 && !eof)
+		{
+			const size_t step = size < sizeof(scratch) ? size : sizeof(scratch);
+			if (!read_bytes(scratch, step))
+				eof = true;
+			size -= step;
+		}
+		return;
+	}
+#endif
 	fseek(file.get(), long(size), SEEK_CUR);
 }
 
 void GSDumpParser::read_data(void *data, size_t size)
 {
-	if (fread(data, 1, size, file.get()) != size)
+	if (!read_bytes(data, size))
 		eof = true;
 }
 

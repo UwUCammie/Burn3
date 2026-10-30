@@ -24,6 +24,9 @@
 namespace takedown::guest {
 namespace {
 EeAotStatistics g_statistics{};
+// The caller's native hook (ee_aot_set_native_hook).
+EeAotNativeHook g_native_hook{};
+void* g_native_hook_user{};
 // TAKEDOWN_EE_AOT_MISSES: the addresses at which runs stopped for a compiled
 // block the caller keeps to itself.
 bool g_record_excluded{};
@@ -534,9 +537,16 @@ void ee_aot_update_session_stops(const bool active, const GuestAddress extra_a, 
     }
 }
 
-EeAotRun run_ee_aot(R5900State& state, EeMemory& memory, const std::uint64_t budget,
-                    const std::uint64_t first_step, const GuestAddress declined_native_entry) {
+void ee_aot_set_native_hook(const EeAotNativeHook hook, void* const user) noexcept {
+    g_native_hook = hook;
+    g_native_hook_user = user;
+}
+
+EeAotRun run_ee_aot(R5900State& state, EeMemory& memory, const std::uint64_t entry_budget,
+                    const std::uint64_t entry_first_step, const GuestAddress declined_native_entry) {
     auto& rt = runtime();
+    // What the run may still execute; a native call the hook makes spends part of it.
+    std::uint64_t budget = entry_budget;
     ++g_statistics.calls;
     if (!rt.enabled || state.is_executing_delay_slot()) {
         return {};
@@ -595,60 +605,100 @@ EeAotRun run_ee_aot(R5900State& state, EeMemory& memory, const std::uint64_t bud
     if (entry == nullptr) {
         return {};
     }
-    EeAotContext c{};
     EeStepResult callout;
-    c.callout = &callout;
-    c.state = &state;
-    c.memory = &memory;
-    c.view = &memory.ee_aot_memory_view();
-    c.gpr = state.gpr_data();
-    c.hi = state.hi_data();
-    c.lo = state.lo_data();
-    c.ram = memory.ee_aot_main_ram();
-    c.scratchpad = memory.ee_aot_scratchpad();
-    c.budget = budget;
-    c.first_step = first_step;
-    c.hardware_epoch = memory.hardware_activity_epoch();
-    c.code_epoch = memory.ee_aot_code_write_epoch();
-    c.watch_epoch = memory.ee_aot_watch_epoch();
-    c.stores_plain = memory.ee_aot_stores_plain();
-    c.block_ok = rt.block_ok.data();
-    c.verified_epoch = rt.verified_epoch.data();
-    c.code_begin = kEeAotCodeBegin;
-    c.code_bytes = kEeAotCodeEnd - kEeAotCodeBegin;
-    c.entry_by_word = rt.entry_by_word.data();
-    c.entries = kEeAotEntries;
-    c.functions = kEeAotFunctions;
+    EeAotContext c{};
+    const auto init_context = [&](const std::uint64_t first_step) {
+        c = EeAotContext{};
+        callout = EeStepResult{};
+        c.callout = &callout;
+        c.state = &state;
+        c.memory = &memory;
+        c.view = &memory.ee_aot_memory_view();
+        c.gpr = state.gpr_data();
+        c.hi = state.hi_data();
+        c.lo = state.lo_data();
+        c.ram = memory.ee_aot_main_ram();
+        c.scratchpad = memory.ee_aot_scratchpad();
+        c.budget = budget;
+        c.first_step = first_step;
+        c.hardware_epoch = memory.hardware_activity_epoch();
+        c.code_epoch = memory.ee_aot_code_write_epoch();
+        c.watch_epoch = memory.ee_aot_watch_epoch();
+        c.stores_plain = memory.ee_aot_stores_plain();
+        c.block_ok = rt.block_ok.data();
+        c.verified_epoch = rt.verified_epoch.data();
+        c.code_begin = kEeAotCodeBegin;
+        c.code_bytes = kEeAotCodeEnd - kEeAotCodeBegin;
+        c.entry_by_word = rt.entry_by_word.data();
+        c.entries = kEeAotEntries;
+        c.functions = kEeAotFunctions;
+    };
+    init_context(entry_first_step);
+    // The run ends with `executed` instructions run; false when nothing was.
+    const auto finish = [&](const std::uint8_t outcome) -> EeAotRun {
+        ++g_statistics.runs;
+        g_statistics.instructions += c.executed;
+        EeAotRun run{.executed = c.executed, .last = {}, .last_pc = c.last_pc, .outcome = outcome};
+        if (c.callout_last) {
+            run.last = std::move(callout);
+        } else {
+            std::uint32_t word{};
+            std::memcpy(&word, c.ram + (c.last_pc & 0x1fffffffU), sizeof(word));
+            // Only the address and word: nothing the caller does with an Executed
+            // result reads more, and decoding is a fixed cost of every run.
+            run.last = {.status = EeStepStatus::Executed, .instruction = {.pc = c.last_pc, .word = word}};
+        }
+        return run;
+    };
+    bool natives_done = false;
 
     for (;;) {
-        if (!kEeAotFunctions[entry->function].function(c, entry->entry)) {
-            break;
-        }
-        pc = c.next_pc;
-        entry = admit(pc, c.executed);
-        if (entry == nullptr) {
+        const bool ran = kEeAotFunctions[entry->function].function(c, entry->entry);
+        if (ran) {
+            pc = c.next_pc;
+            entry = admit(pc, c.executed);
+            if (entry != nullptr) {
+                continue;
+            }
             if (c.executed != 0U) {
                 state.set_pc(pc);
             }
+        }
+        // The run stops here, at state.pc() (registers are written back).
+        if (g_native_hook == nullptr || c.executed == 0U || c.callout_last) {
             break;
+        }
+        const auto hooked = g_native_hook(g_native_hook_user, c.executed, c.last_pc);
+        using Kind = EeAotNativeHookResult::Kind;
+        if (hooked.kind == Kind::None) {
+            break;
+        }
+        ++g_statistics.native_hook_taken;
+        if (hooked.kind == Kind::HandOffAccounted) {
+            return finish(kEeAotRunAccounted);
+        }
+        if (hooked.kind == Kind::HandOffNativeDone) {
+            return {.outcome = kEeAotRunNativeDone};
+        }
+        if (hooked.kind == Kind::HandOffUnhandled) {
+            return {.outcome = kEeAotRunNativeUnhandled};
+        }
+        // Continue: the hook made native calls; go on in compiled code.
+        ++g_statistics.native_hook_continued;
+        natives_done = true;
+        budget = hooked.budget;
+        declined = kEeAotNoDeclinedEntry;
+        init_context(hooked.first_step);
+        pc = state.pc();
+        entry = admit(pc, 0U);
+        if (entry == nullptr) {
+            return {.outcome = kEeAotRunNativeDone};
         }
     }
     if (c.executed == 0U) {
-        return {};
+        return natives_done ? EeAotRun{.outcome = kEeAotRunNativeDone} : EeAotRun{};
     }
-    ++g_statistics.runs;
-    g_statistics.instructions += c.executed;
-    EeAotRun run{.executed = c.executed, .last = {}, .last_pc = c.last_pc};
-    if (c.callout_last) {
-        run.last = std::move(callout);
-    } else {
-        std::uint32_t word{};
-        std::memcpy(&word, c.ram + (c.last_pc & 0x1fffffffU), sizeof(word));
-        // Only the address and word: nothing the caller does with an Executed
-        // result reads more, and decoding is a fixed cost of every run.
-        run.last = {.status = EeStepStatus::Executed, .instruction = {.pc = c.last_pc, .word = word}};
-    }
-    return run;
+    return finish(kEeAotRunOrdinary);
 }
 
 const EeAotStatistics& ee_aot_statistics() noexcept { return g_statistics; }

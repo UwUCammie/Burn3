@@ -33,7 +33,8 @@ public:
 	                 const std::vector<UiPlacement> &placements);
 
 	// Draws items that need the native UI shaders (ImageQuad, Burnout-font
-	// text) directly with `cmd`, after flat has been flushed, using
+	// text, and rectangles and images, so they stay in order with the text and
+	// above the game's UI layer) directly with `cmd`, after flat has been flushed, using
 	// builtin://shaders/takedown_native_ui.{vert,frag}.
 	void render_native(Vulkan::Device &device, Vulkan::CommandBuffer &cmd, const PictureRect &picture,
 	                   const std::vector<UiPlacement> &placements);
@@ -61,6 +62,9 @@ private:
 	std::unordered_map<std::string, BurnoutFont> burnout_fonts_;
 	std::string default_font_directory_;
 	const Vulkan::ImageView *image(Vulkan::Device &device, const std::string &path);
+	// A 1x1 white image: rectangles are drawn as textured quads with it.
+	Vulkan::ImageHandle white_;
+	const Vulkan::ImageView *white(Vulkan::Device &device);
 	// The font a Burnout text item draws with in `directory` (the most recent
 	// FontDirectory item), or nullptr when it is not available; the caller then
 	// falls back to the Granite font in render_flat.

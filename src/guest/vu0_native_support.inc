@@ -102,6 +102,61 @@ template <vu0_detail::Vu0Fmac Operation, std::uint32_t Mask>
     }
 }
 
+// vu0_native_fmac with operands the generator proved canonical on every lane
+// the write mask selects (tools/vu0_aot_generator.py, "Canonical-lane facts"):
+// a clamp3 fixed point (finite normal or signed zero) is unchanged by clamp3,
+// so Canon's bit 0 (left), bit 1 (right) and bit 2 (the MADD/MSUB accumulator)
+// drop that operand's clamp. Lanes outside the mask are discarded by the
+// select and the lane-masked judgments, so what their clamp would have done
+// to them cannot be observed. Every other step is the shared kernel's.
+template <vu0_detail::Vu0Fmac Operation, std::uint32_t Mask, std::uint32_t Canon>
+[[gnu::always_inline]] inline Vu0NativeFmac vu0_native_fmac_c(const __m128i left,
+                                                              const __m128i right,
+                                                              const __m128i accumulator,
+                                                              const __m128i base) noexcept {
+#if defined(TAKEDOWN_VU0_NATIVE_AVX2)
+    constexpr bool kLeft = (Canon & 1U) != 0U;
+    constexpr bool kRight = (Canon & 2U) != 0U;
+    constexpr bool kAccumulator = (Canon & 4U) != 0U;
+    const auto a = _mm256_cvtps_pd(kLeft ? _mm_castsi128_ps(left)
+                                         : vu0_detail::simd_clamp3_avx2(left));
+    const auto b = _mm256_cvtps_pd(kRight ? _mm_castsi128_ps(right)
+                                          : vu0_detail::simd_clamp3_avx2(right));
+    vu0_detail::SimdLanes lanes;
+    if constexpr (Operation == vu0_detail::Vu0Fmac::Add) {
+        lanes = vu0_detail::simd_chop_avx2<false>(_mm256_add_pd(a, b));
+    } else if constexpr (Operation == vu0_detail::Vu0Fmac::Subtract) {
+        lanes = vu0_detail::simd_chop_avx2<false>(_mm256_sub_pd(a, b));
+    } else {
+        const auto product = vu0_detail::simd_chop_avx2<true>(_mm256_mul_pd(a, b));
+        if constexpr (Operation == vu0_detail::Vu0Fmac::Multiply) {
+            lanes = product;
+        } else {
+            const auto p = _mm256_cvtps_pd(_mm_castsi128_ps(product.bits));
+            const auto c = _mm256_cvtps_pd(kAccumulator ? _mm_castsi128_ps(accumulator)
+                                                        : vu0_detail::simd_clamp3_avx2(accumulator));
+            lanes = vu0_detail::simd_chop_avx2<false>(
+                Operation == vu0_detail::Vu0Fmac::MultiplyAdd ? _mm256_add_pd(c, p)
+                                                               : _mm256_sub_pd(c, p));
+        }
+    }
+    if constexpr (Mask == 0x0fU) {
+        return {lanes.bits, lanes.underflow, lanes.overflow};
+    } else {
+        const auto lane_mask = vu0_detail::simd_lane_mask(Mask);
+        return {vu0_native_select<Mask>(lanes.bits, base), _mm_and_si128(lanes.underflow, lane_mask),
+                _mm_and_si128(lanes.overflow, lane_mask)};
+    }
+#else
+    if constexpr ((Canon & 4U) != 0U && (Operation == vu0_detail::Vu0Fmac::MultiplyAdd ||
+                                          Operation == vu0_detail::Vu0Fmac::MultiplySubtract)) {
+        return vu0_native_fmac_canonical_acc<Operation, Mask>(left, right, accumulator, base);
+    } else {
+        return vu0_native_fmac<Operation, Mask>(left, right, accumulator, base);
+    }
+#endif
+}
+
 // The 16-bit MAC value run_upper_form reports. Active lanes come directly
 // from native FMAC: chop has flushed/saturated them to signed zero or finite
 // normals. Only the explicit arithmetic judgments can contribute U/O flags.

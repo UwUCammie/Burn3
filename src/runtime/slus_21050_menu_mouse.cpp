@@ -180,7 +180,6 @@ platform::HostControllerState Slus21050MenuMouse::press(const Action action) {
 platform::HostControllerState Slus21050MenuMouse::poll(const MenuMouseScreen& screen, const MenuMouseInput& input,
                                                        const bool title_screen) {
     const bool left_click = (input.buttons & 1U) != 0U && (previous_buttons_ & 1U) == 0U && input.inside;
-    const bool right_click = (input.buttons & 4U) != 0U && (previous_buttons_ & 4U) == 0U && input.inside;
     const bool moved = input.inside && (input.x != previous_x_ || input.y != previous_y_);
     previous_buttons_ = input.buttons;
     previous_x_ = input.x;
@@ -221,8 +220,6 @@ platform::HostControllerState Slus21050MenuMouse::poll(const MenuMouseScreen& sc
             const Action after = !list.values ? Action::Cross : x >= list.value_x - 4.0F ? Action::Right : Action::None;
             aim(hovered->first, hovered->second, after);
         }
-    } else if (right_click && menu) {
-        immediate = Action::Triangle;
     } else if (moved && hovered) {
         const auto& list = screen.lists[hovered->first];
         if (list.highlighted != hovered->second && (!target_ || after_target_ == Action::None))

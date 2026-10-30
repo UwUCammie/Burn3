@@ -13,6 +13,7 @@
 
 #include "takedown/render/native_model_protocol.hpp"
 #include "takedown/platform/windows_gs_pipe.hpp"
+#include "gs_shm_ring.h"
 
 #include <algorithm>
 #include <atomic>
@@ -60,6 +61,7 @@ class ParallelGsOutputSink final : public GsStreamSink {
           live_capture_path_(std::move(live_capture_path)) {}
 
     ~ParallelGsOutputSink() override {
+        close_shm();
         if (digest_log_ != nullptr) {
             std::fclose(digest_log_);
         }
@@ -73,6 +75,20 @@ class ParallelGsOutputSink final : public GsStreamSink {
 
     void consume(const GsStreamSegment& segment) override;
     void finish() override;
+
+    // Shared-memory carrier (TAKEDOWN_GS_STREAM_SHM=1 and a renderer that announced support). The pipe stays
+    // open as the handshake channel and for end-of-stream; the stream bytes go through the ring instead.
+    void adopt_shm(GsShm ring) {
+        shm_ = ring;
+        use_shm_ = true;
+    }
+    void close_shm() {
+        if (use_shm_) {
+            gs_shm_producer_close(&shm_);
+            gs_shm_close(&shm_);
+            use_shm_ = false;
+        }
+    }
 
     // Folds one piece's bytes into the running stream digest: 8-byte words
     // first, then the tail bytes.
@@ -117,6 +133,17 @@ class ParallelGsOutputSink final : public GsStreamSink {
     }
 
     void write_output(const std::uint8_t* const data, const std::size_t size) {
+        if (use_shm_) {
+            const auto begin = std::chrono::steady_clock::now();
+            counters_.output_write_operations.fetch_add(1, std::memory_order_relaxed);
+            const int result = gs_shm_write(&shm_, data, size);
+            counters_.output_write_nanoseconds.fetch_add(nanoseconds_since(begin), std::memory_order_relaxed);
+            if (result != 0) {
+                throw std::runtime_error("could not write paraLLEl-GS stream (shared-memory reader is gone)");
+            }
+            counters_.output_bytes_written.fetch_add(size, std::memory_order_relaxed);
+            return;
+        }
         if (live_fifo_) {
             constexpr std::size_t kMaximumWriteBytes = 262144;
             const unsigned char* cursor = data;
@@ -187,6 +214,8 @@ class ParallelGsOutputSink final : public GsStreamSink {
         std::atomic<std::uint64_t> fifo_backpressure_nanoseconds{};
     };
 
+    GsShm shm_{};
+    bool use_shm_ = false;
     FILE* output_{};
     std::filesystem::path output_path_{};
     bool live_fifo_{};
@@ -302,6 +331,7 @@ void ParallelGsOutputSink::finish() {
                                   "could not close paraLLEl-GS live capture " + live_capture_path_->string())));
         }
     }
+    close_shm();
     if (output_ != nullptr) {
         FILE* output = output_;
         output_ = nullptr;
@@ -936,12 +966,70 @@ ParallelGsRawStreamWriter::ParallelGsRawStreamWriter(const std::filesystem::path
     }
     track_pieces_ = mirror != nullptr;
 
+    // Optional shared-memory carrier: only when the renderer announced support (see gs_shm_ring.h). Any
+    // failure here silently keeps the pipe, which the renderer reads as before.
+    GsShm shm_ring{};
+    bool shm_attached = false;
+    if (live_fifo) {
+        const char* want = std::getenv("TAKEDOWN_GS_STREAM_SHM");
+        // On by default since 0.1.7 (about +40% uncapped in races: the Wine named pipe was the limit);
+        // TAKEDOWN_GS_STREAM_SHM=0 keeps the pipe.
+        if (want == nullptr || std::string_view(want) != "0") {
+            char base[40];
+            gs_shm_cap_name(output_path.c_str(), base, sizeof base);
+            HANDLE pipe = reinterpret_cast<HANDLE>(_get_osfhandle(_fileno(output)));
+            if (gs_shm_cap_present(base)) {
+                std::uint32_t ring_bytes = 1U << 20;
+                if (const char* kb = std::getenv("TAKEDOWN_GS_STREAM_SHM_KB"); kb != nullptr && *kb != '\0') {
+                    const unsigned long parsed = std::strtoul(kb, nullptr, 10);
+                    if (parsed >= 64UL && parsed <= 65536UL && (parsed & (parsed - 1UL)) == 0UL) {
+                        ring_bytes = static_cast<std::uint32_t>(parsed) << 10;
+                    }
+                }
+                std::uint32_t spin_us = 0;
+                if (const char* spin = std::getenv("TAKEDOWN_GS_STREAM_SHM_SPIN_US"); spin != nullptr && *spin != '\0') {
+                    spin_us = static_cast<std::uint32_t>(std::strtoul(spin, nullptr, 10));
+                }
+                ULONG client_pid = 0;
+                HANDLE peer = nullptr;
+                if (GetNamedPipeClientProcessId(pipe, &client_pid) && client_pid != 0) {
+                    peer = OpenProcess(SYNCHRONIZE, FALSE, client_pid);
+                }
+                if (peer != nullptr && gs_shm_producer_create(&shm_ring, base, ring_bytes, spin_us, peer) == 0) {
+                    std::uint8_t hello[GS_SHM_HELLO_BYTES];
+                    gs_shm_hello_encode(hello, ring_bytes);
+                    DWORD written = 0;
+                    if (WriteFile(pipe, hello, sizeof hello, &written, nullptr) == 0 || written != sizeof hello) {
+                        const auto failure = windows_gs_pipe::error("could not write paraLLEl-GS shared-memory hello");
+                        gs_shm_close(&shm_ring);
+                        discard_mirror();
+                        std::fclose(output);
+                        throw failure;
+                    }
+                    shm_attached = true;
+                } else if (peer != nullptr) {
+                    CloseHandle(peer);
+                }
+            }
+        }
+    }
+
     auto sink = std::make_unique<ParallelGsOutputSink>(output, output_path, live_fifo, mirror, std::move(live_capture_path));
     sink_ = sink.get();
+    if (shm_attached) {
+        sink->adopt_shm(shm_ring);
+    }
 
     GsStreamTransportConfig transport_config{};
     transport_config.segment_bytes = 262144U;
     transport_config.segment_count = 32U;
+    // opt3x: TAKEDOWN_GS_STREAM_SEGMENTS=<8..1024> sizes the 256 KB segment pool (default 32 = ~1.7 race frames).
+    if (const char* segments = std::getenv("TAKEDOWN_GS_STREAM_SEGMENTS"); segments != nullptr && *segments != '\0') {
+        const unsigned long parsed = std::strtoul(segments, nullptr, 10);
+        if (parsed >= 8UL && parsed <= 1024UL) {
+            transport_config.segment_count = static_cast<std::uint32_t>(parsed);
+        }
+    }
     transport_config.max_frames_in_flight = 3U;
     if (const char* budget = std::getenv("TAKEDOWN_GS_FRAMES_IN_FLIGHT"); budget != nullptr && *budget != '\0') {
         char* end = nullptr;

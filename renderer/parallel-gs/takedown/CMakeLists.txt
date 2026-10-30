@@ -12,8 +12,9 @@ add_library(takedown-io STATIC
 set(TAKEDOWN_DISCORD_APPLICATION_ID "1559539576513495140" CACHE STRING "Discord application ID for Rich Presence (empty: off)")
 target_compile_definitions(takedown-io PRIVATE TAKEDOWN_DISCORD_APPLICATION_ID="${TAKEDOWN_DISCORD_APPLICATION_ID}")
 target_include_directories(takedown-io PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${TAKEDOWN_REPO_INCLUDE})
-# stream_pipe.cpp (Windows) announces the native command capability with names from native_cmd_protocol.hpp,
-# found through TAKEDOWN_REPO_INCLUDE.
+# stream_pipe.cpp (Windows) announces the native command capability with names from native_cmd_protocol.hpp; the tree keeps a
+# copy of the header next to the consumer (tools/takedown/platform).
+target_include_directories(takedown-io PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../tools)
 target_compile_features(takedown-io PUBLIC cxx_std_20)
 
 # takedown-renderer: drawing on top of the game picture (host UI layer,
@@ -44,6 +45,7 @@ target_link_libraries(takedown-fidelityfx PUBLIC granite-volk-headers)
 
 add_library(takedown-renderer STATIC
     fsr_upscaler.cpp
+    smaa_filter.cpp
     host_ui_renderer.cpp
     native_scene.cpp
     native_ui_layer.cpp
@@ -77,7 +79,7 @@ target_include_directories(takedown-ui-layout-tests PRIVATE ${CMAKE_CURRENT_SOUR
 target_compile_features(takedown-ui-layout-tests PRIVATE cxx_std_17)
 
 # Stream parser test (dump/gs_dump_parser): replays a synthetic raw stream
-# with a headless Vulkan device.
+# with a headless Vulkan device. Owned by the parser work.
 add_granite_offline_tool(takedown-parser-tests tests/test_parser.cpp)
 target_link_libraries(takedown-parser-tests PRIVATE parallel-gs parallel-gs-dump takedown-io)
 target_compile_features(takedown-parser-tests PRIVATE cxx_std_17)

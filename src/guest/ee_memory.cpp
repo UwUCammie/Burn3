@@ -9,7 +9,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include "../runtime/opt3x_trace.inc"
 #include <cstring>
+#include <deque>
 #include <emmintrin.h>
 #include <mutex>
 
@@ -210,6 +212,25 @@ void EeMemory::gfx_sync_slow(const GfxFence reason) const noexcept {
     const_cast<EeMemory*>(this)->gfx_close_window(reason, current_ee_pc_);
 }
 
+namespace {
+// opt3x: TAKEDOWN_OPT_FIFO_ASYNC=1 queues decoupled GIF_MODE / VIF1 FIFO stores (experimental, default off).
+bool opt_fifo_async() noexcept {
+    static const bool enabled = [] {
+        const char* v = std::getenv("TAKEDOWN_OPT_FIFO_ASYNC");
+        return v != nullptr && v[0] == '1';
+    }();
+    return enabled;
+}
+// GIF registers, VIF1 registers, VIF1 FIFO, GIF FIFO (not VIF0 / VU0: the EE drives those synchronously).
+// Emulation-side images of VIF1_STAT / GIF_STAT (non-busy bits) answered while the worker owns the device.
+std::uint32_t g_opt_vif1_stat_idle = 0U;
+std::uint32_t g_opt_gif_stat_idle = 0U;
+// Only the stores seen after a frame kick in races are queued: GIF_MODE and the VIF1 FIFO (a full set breaks boot).
+constexpr bool opt_graphics_register(const std::uint32_t phys) noexcept {
+    return phys - 0x10003010U <= 3U || phys - 0x10005000U <= 0xfffU;
+}
+} // namespace
+
 // RECOVERY: rebuilt from the GIMPLE; block layout or operand order differs from the original, so this is not byte-identical.
 void EeMemory::gfx_observe_bus(const GuestAddress address, const bool write) const noexcept {
     if (takedown::runtime::on_graphics_async_worker_thread()) {
@@ -225,7 +246,9 @@ void EeMemory::gfx_observe_bus(const GuestAddress address, const bool write) con
         if (in_range(address, 0x10003000U, 0xfffU)) {
             reason = GfxFence::BusWriteGifVif;
         } else if (in_range(address, 0x10004000U, 0x3fffU)) {
-            reason = GfxFence::BusWriteFifo;
+            if (!(gfx_decoupled_ && opt_fifo_async() && in_range(address, 0x10005000U, 0xfffU))) {
+                reason = GfxFence::BusWriteFifo;
+            }
         } else if ((in_range(address, 0x10008000U, 0x6fffU) | in_range(address, 0x1000f520U, 0x7fU)) &&
                    !gfx_decoupled_) {
             reason = GfxFence::BusWriteDmac;
@@ -286,6 +309,9 @@ void EeMemory::gfx_close_window(const GfxFence reason, const GuestAddress addres
     std::uint64_t job_ns = impl.window_job_ns;
     if (real) {
         std::uint64_t waited = 0U;
+        takedown::opt3x::trace(3U, static_cast<std::uint32_t>(reason));
+        struct TraceEnd { ~TraceEnd() { takedown::opt3x::trace(4U, 0U); } };
+        std::optional<TraceEnd> trace_end{std::in_place};
         if (std::exception_ptr error = impl.worker->wait_idle_nothrow(waited); error) {
             ++stats.worker_exceptions;
             if (gfx_deferred_error_ == nullptr) {
@@ -499,6 +525,7 @@ std::uint64_t EeMemory::run_graphics_ahead(const std::uint64_t maximum_cycles) {
     gfx_window_real_ = true;
     gfx_window_ = true;
     impl.window_open_ns = steady_clock_nanoseconds();
+    takedown::opt3x::trace(5U, 0U);
     impl.worker->post([this, maximum_cycles] {
         static_cast<void>(run_graphics_ahead_sync(maximum_cycles));
     });
@@ -530,6 +557,31 @@ bool EeMemory::gfx_decoupled_eligible() const noexcept {
 
 // RECOVERY: rebuilt from the GIMPLE; block layout or operand order differs from the original, so this is not byte-identical.
 void EeMemory::gfx_decoupled_hand_over(std::function<void()> install) {
+    // opt3x: TAKEDOWN_OPT_EAGER_WINDOW=1 opens an asynchronous window at the kick itself, so the worker starts the
+    // transfer at once instead of when the scheduler next runs the graphics device ahead.
+    static const bool eager = [] {
+        const char* v = std::getenv("TAKEDOWN_OPT_EAGER_WINDOW");
+        return v != nullptr && v[0] == '1';
+    }();
+    if (!gfx_window_real_ && eager && gfx_async_ && gfx_async_->worker && gfx_deferred_error_ == nullptr &&
+        gfx_mode_ == takedown::runtime::GraphicsAsyncMode::Decoupled &&
+        !takedown::runtime::on_graphics_async_worker_thread()) {
+        gfx_close_window(GfxFence::Explicit, 0U);
+        auto& impl = *gfx_async_;
+        ++impl.stats.windows;
+        gfx_window_dmac_status_ = dmac_status_;
+        gfx_window_queued_completions_ = completed_dmac_channels_.size();
+        gfx_age_vif1_ = 0U;
+        gfx_age_gif_ = 0U;
+        impl.service_log.clear();
+        impl.service_log_overflow = false;
+        impl.window_job_ns = 0U;
+        impl.window_busy_base = impl.worker->busy_nanoseconds();
+        gfx_window_real_ = true;
+        gfx_window_ = true;
+        impl.window_open_ns = steady_clock_nanoseconds();
+        takedown::opt3x::trace(5U, 1U);
+    }
     if (!gfx_window_real_) {
         gfx_close_window(GfxFence::Explicit, 0U);
         install();
@@ -599,6 +651,7 @@ void EeMemory::gfx_start_queued_gif() {
 
 // RECOVERY: rebuilt from the GIMPLE; block layout or operand order differs from the original, so this is not byte-identical.
 bool EeMemory::gfx_decoupled_kick_vif1(const std::uint32_t value) {
+    takedown::opt3x::trace(6U, 1U);
     if ((value & 12U) != 4U) {
         return false;
     }
@@ -639,6 +692,7 @@ bool EeMemory::gfx_decoupled_kick_vif1(const std::uint32_t value) {
 
 // RECOVERY: rebuilt from the GIMPLE; block layout or operand order differs from the original, so this is not byte-identical.
 bool EeMemory::gfx_decoupled_kick_gif(const std::uint32_t value) {
+    takedown::opt3x::trace(6U, 2U);
     PendingGifDmacTransfer pending{value, (value & 12U) == 0U};
     {
         std::lock_guard<std::mutex> lock{gfx_async_->spare_mutex};
@@ -1695,6 +1749,22 @@ std::uint32_t EeMemory::read_stored_vif1_register(const GuestAddress address) co
     return value;
 }
 
+namespace {
+// opt3x: in the decoupled graphics model a guest poll of VIF1_STAT / GIF_STAT while the worker still owns the device
+// answers "device drained" instead of fencing (the MTVU model: the DMA already completed for the guest at its kick, the
+// worker renders behind). The non-busy bits come from the last synchronous read. TAKEDOWN_OPT_STATUS_NOFENCE=1 enables it
+// (default off: experimental).
+bool opt_status_nofence() noexcept {
+    static const bool enabled = [] {
+        const char* v = std::getenv("TAKEDOWN_OPT_STATUS_NOFENCE");
+        return v != nullptr && v[0] == '1';
+    }();
+    return enabled;
+}
+constexpr std::uint32_t kOptVif1StatBusy = 0x1f00000fU;   // FQC, VGW, VEW, VPS
+constexpr std::uint32_t kOptGifStatBusy = 0x1f000fe0U;    // FQC, APATH, OPH, P1Q-P3Q, IP3
+} // namespace
+
 [[gnu::noinline]] std::uint32_t EeMemory::read_u32_le_slow(const GuestAddress address) const {
     if (is_native_heap_range(address, 4U)) {
         std::uint32_t value;
@@ -1720,11 +1790,36 @@ std::uint32_t EeMemory::read_stored_vif1_register(const GuestAddress address) co
                (static_cast<std::uint32_t>(std::to_integer<std::uint8_t>(data_[*offset + 2U])) << 16U) |
                (static_cast<std::uint32_t>(std::to_integer<std::uint8_t>(data_[*offset + 3U])) << 24U);
     }
+    if (gfx_window_real_ && gfx_decoupled_ && opt_status_nofence() &&
+        !takedown::runtime::on_graphics_async_worker_thread()) [[unlikely]] {
+        const GuestAddress phys = address & 0x1fffffffU;
+        if (phys == 0x10003c00U) {
+            return g_opt_vif1_stat_idle;
+        }
+        if (phys == 0x10003020U) {
+            return g_opt_gif_stat_idle;
+        }
+    }
     if (gfx_window_) [[unlikely]] {
         gfx_observe_bus(address, false);
     }
     if ((address & 0x1fffffffU) == 0x1000e010U) {
         return gfx_dmac_status_for_reader();
+    }
+    if (const GuestAddress phys = address & 0x1fffffffU; (phys == 0x10003c00U || phys == 0x10003020U) &&
+        !gfx_window_real_ && !takedown::runtime::on_graphics_async_worker_thread()) [[unlikely]] {
+        const std::uint32_t value = static_cast<std::uint32_t>(read_guest_mmio_byte(phys)) |
+                                    (static_cast<std::uint32_t>(read_guest_mmio_byte(phys + 1U)) << 8U) |
+                                    (static_cast<std::uint32_t>(read_guest_mmio_byte(phys + 2U)) << 16U) |
+                                    (static_cast<std::uint32_t>(read_guest_mmio_byte(phys + 3U)) << 24U);
+        if (phys == 0x10003c00U) {
+            g_opt_vif1_stat_idle = value & ~kOptVif1StatBusy;
+            return value;
+        }
+        if (!gfx_gif_start_unobserved_) {
+            g_opt_gif_stat_idle = value & ~kOptGifStatBusy;
+            return value;
+        }
     }
     if ((address & 0x1fffffffU) == 0x10003020U && gfx_gif_start_unobserved_) {
         gfx_gif_start_unobserved_ = false;
@@ -1838,6 +1933,20 @@ void EeMemory::write_u8_impl(const GuestAddress address, const std::uint8_t valu
     } else if (const auto offset = main_ram_offset(address, 1U); offset) {
         data_[*offset] = static_cast<std::byte>(value);
         record_main_ram_writer(*offset, 1U);
+        return;
+    }
+    if (gfx_window_real_ && gfx_decoupled_ && opt_fifo_async() && gfx_async_ && gfx_async_->worker &&
+        opt_graphics_register(physical_address(address)) &&
+        !takedown::runtime::on_graphics_async_worker_thread()) [[unlikely]] {
+        if (physical_address(address) == 0x10003010U) {
+            g_opt_gif_stat_idle = (g_opt_gif_stat_idle & 0xfffffffaU) | (value & 5U);
+        }
+        ++gfx_async_->stats.ordered_tasks;
+        gfx_async_->worker->post([this, address, value] {
+            while (run_graphics_ahead_sync(314572800U) != 0U) {
+            }
+            write_u8_impl(address, value);
+        });
         return;
     }
     if (gfx_window_) [[unlikely]] {
@@ -2016,6 +2125,22 @@ void EeMemory::write_u32_le_impl(const GuestAddress address, const std::uint32_t
         data_[*offset + 2U] = static_cast<std::byte>(value >> 16U);
         data_[*offset + 3U] = static_cast<std::byte>(value >> 24U);
         record_main_ram_writer(*offset, 4U);
+        return;
+    }
+    if (gfx_window_real_ && gfx_decoupled_ && opt_fifo_async() && gfx_async_ && gfx_async_->worker &&
+        opt_graphics_register(physical_address(address)) &&
+        !takedown::runtime::on_graphics_async_worker_thread()) [[unlikely]] {
+        // opt3x: decoupled GIF/VIF register and FIFO stores run on the worker after the device work queued before them.
+        if (physical_address(address) == 0x10003010U) {
+            // GIF_STAT.M3R / IMT mirror GIF_MODE bits 0 / 2 (write_gif_mode).
+            g_opt_gif_stat_idle = (g_opt_gif_stat_idle & 0xfffffffaU) | (value & 5U);
+        }
+        ++gfx_async_->stats.ordered_tasks;
+        gfx_async_->worker->post([this, address, value] {
+            while (run_graphics_ahead_sync(314572800U) != 0U) {
+            }
+            write_u32_le_impl(address, value);
+        });
         return;
     }
     if (gfx_window_) [[unlikely]] {
@@ -3166,8 +3291,50 @@ std::uint64_t EeMemory::vu1_path1_packet_ready_cycle() const noexcept {
     return ready_cycle;
 }
 
+namespace {
+
+// PATH1 packets held behind PATH2 data (see the replaced-launch branch of execute_vu1). Each entry may enter the PATH1 FIFO once
+// the PATH2 pop count reaches its barrier; packets that arrive while any are held queue behind them, so PATH1 keeps its order.
+struct HeldPath1Packet {
+    std::vector<GsQuadword> quadwords;
+    std::uint64_t path2_pops_needed = 0U;
+};
+std::deque<HeldPath1Packet> g_held_path1{};
+std::uint64_t g_path2_pops = 0U;
+bool g_releasing_held_path1 = false;
+unsigned long long g_held_path1_count = 0U;
+
+bool path1_after_path2_enabled() noexcept {
+    static const bool enabled = [] {
+        const char* value = std::getenv("TAKEDOWN_OPT_PATH1_AFTER_PATH2");
+        return value == nullptr || *value != '0';
+    }();
+    return enabled;
+}
+
+bool held_path1_log_enabled() noexcept {
+    static const bool enabled = std::getenv("TAKEDOWN_OPT_LOG_PATH1_HOLD") != nullptr;
+    return enabled;
+}
+
+void hold_path1_behind_path2(std::vector<GsQuadword> packet, std::size_t path2_queued) {
+    const std::uint64_t needed = g_path2_pops + path2_queued;
+    ++g_held_path1_count;
+    if (held_path1_log_enabled() && (g_held_path1_count <= 20U || (g_held_path1_count % 5000U) == 0U)) {
+        std::fprintf(stderr, "[PATH1HOLD] native packet #%llu (%zu qw) waits for %zu PATH2 qw, %zu held before it\n", g_held_path1_count,
+                     packet.size(), path2_queued, g_held_path1.size());
+    }
+    g_held_path1.push_back(HeldPath1Packet{std::move(packet), needed});
+}
+
+} // namespace
+
 void EeMemory::enqueue_vu1_path1_packet(std::vector<GsQuadword> packet) {
     if (packet.empty()) {
+        return;
+    }
+    if (!g_held_path1.empty() && !g_releasing_held_path1) {
+        g_held_path1.push_back(HeldPath1Packet{std::move(packet), g_held_path1.back().path2_pops_needed});
         return;
     }
     invalidate_graphics_service_deadline_cache();
@@ -3185,6 +3352,10 @@ void EeMemory::enqueue_vu1_path1_packet(std::vector<GsQuadword> packet) {
 }
 
 void EeMemory::enqueue_vu1_path1_quadword(const GsQuadword& word) {
+    if (!g_held_path1.empty() && !g_releasing_held_path1) {
+        g_held_path1.back().quadwords.push_back(word);
+        return;
+    }
     invalidate_graphics_service_deadline_cache();
     const auto ready_cycle = vu1_path1_packet_ready_cycle();
 
@@ -3658,6 +3829,14 @@ void EeMemory::write_gif_mode(const std::uint32_t value) {
 }
 
 void EeMemory::write_vif1_fifo_word(const GuestAddress address, const std::uint32_t value) {
+    // opt3x: in the decoupled model a direct VIF1 FIFO store becomes an ordered worker task (after the device work
+    // already queued) instead of draining the worker on the emulation thread. TAKEDOWN_OPT_FIFO_ASYNC=0 restores the drain.
+    if (gfx_decoupled_ && opt_fifo_async() && gfx_window_real_ && gfx_async_ && gfx_async_->worker &&
+        !takedown::runtime::on_graphics_async_worker_thread()) [[unlikely]] {
+        ++gfx_async_->stats.ordered_tasks;
+        gfx_async_->worker->post([this, address, value] { write_vif1_fifo_word(address, value); });
+        return;
+    }
     if (gfx_decoupled_) [[unlikely]] {
         gfx_decoupled_drain();
     }
@@ -4147,6 +4326,19 @@ void EeMemory::pump_gif_arbiter(const bool timing_advance) {
         return;
     }
     pumping_gif_arbiter_ = true;
+    // Moves held PATH1 packets whose PATH2 data has gone (all of them once PATH2 is empty) into the PATH1 queues.
+    const auto release_held_path1 = [this](const bool all) {
+        g_releasing_held_path1 = true;
+        while (!g_held_path1.empty() && (all || g_held_path1.front().path2_pops_needed <= g_path2_pops)) {
+            std::vector<GsQuadword> packet = std::move(g_held_path1.front().quadwords);
+            g_held_path1.pop_front();
+            enqueue_vu1_path1_packet(std::move(packet));
+        }
+        g_releasing_held_path1 = false;
+    };
+    if (!g_held_path1.empty() && queued_gif_path2_.empty()) {
+        release_held_path1(true);
+    }
 
     bool publish_owned_deadline_at_exit = false;
     std::uint32_t last_arbiter_status_key = 0xffffffffU;
@@ -4323,6 +4515,10 @@ void EeMemory::pump_gif_arbiter(const bool timing_advance) {
             path2_quadword = std::move(queued_gif_path2_.front());
             quadword = path2_quadword->value;
             queued_gif_path2_.pop_front();
+            ++g_path2_pops;
+            if (!g_held_path1.empty()) {
+                release_held_path1(queued_gif_path2_.empty());
+            }
             progress = advance_gif_packet(tracker_after, quadword);
         }
 
@@ -4588,6 +4784,7 @@ void EeMemory::reset_gif_arbiter() noexcept {
     }
 
     queued_gif_path2_.clear();
+    g_held_path1.clear();
     gif_packet_trackers_ = {};
     for (std::size_t index = 0U; index < gif_packet_trackers_.size(); ++index) {
         const auto& tracker = gif_packet_trackers_[index];
@@ -6716,6 +6913,17 @@ void EeMemory::capture_graphics_dmac_payload(const GuestAddress channel_address,
         // straight from the source (scratchpad addresses wrap inside SPR).
         const std::uint32_t qwc = read_u32_le(channel_address + 32U) & 0xFFFFU;
         std::uint32_t source = read_u32_le(channel_address + 16U);
+        if (deferred_payload != nullptr && qwc != 0U && (source & 0x80000000U) == 0U) {
+            // The whole transfer lies in directly addressed main RAM: one copy
+            // (the loop below would gather the same bytes quadword by quadword).
+            const std::uint32_t first = source & 0x7ffffff0U;
+            if (first < 0x20000000U &&
+                std::uint64_t{first} + std::uint64_t{qwc} * 16U <= data_.size()) {
+                const auto* const bytes = reinterpret_cast<const GsQuadword*>(data_.data() + first);
+                deferred_payload->insert(deferred_payload->end(), bytes, bytes + qwc);
+                return;
+            }
+        }
         std::vector<GsQuadword> payload;
         payload.reserve(qwc);
         for (std::size_t index = 0U; index < qwc; ++index) {
@@ -6807,12 +7015,9 @@ void EeMemory::capture_graphics_dmac_payload(const GuestAddress channel_address,
                 return false;
             }
             auto& destination = *deferred_payload;
-            const std::size_t first_index = destination.size();
-            destination.resize(first_index + count);
-            for (std::size_t index = 0U; index < count; ++index) {
-                std::memcpy(&destination[first_index + index],
-                            self->data_.data() + *offset + index * 16U, 16U);
-            }
+            const auto* const source =
+                reinterpret_cast<const GsQuadword*>(self->data_.data() + *offset);
+            destination.insert(destination.end(), source, source + count);
             return true;
         }
 
@@ -7440,6 +7645,45 @@ void EeMemory::submit_vif1_word(const std::uint32_t word) {
             }
         }
 
+        // vifglue: V3 formats with a plain one-to-one cycle layout (WL == CL, unmasked, no add/offset mode) are the
+        // common case of the per-lane loop below; this is that loop with the constants folded.
+        if (flag && wl == cl && stream.unpack_type >= 8U && stream.unpack_type <= 10U &&
+            stream.unpack_source_vector_count >= stream.unpack_vector_count &&
+            lanes.size() >= static_cast<unsigned long long>(stream.unpack_vector_count) * 4U) {
+            const unsigned int count = stream.unpack_vector_count;
+            const unsigned int alignment = stream.unpack_start_alignment;
+            const unsigned int type = stream.unpack_type;
+            unsigned int destination_vector = stream.unpack_destination;
+            const unsigned int* source = lanes.data();
+            for (unsigned int current = 0U; current != count; ++current, source += 4) {
+                unsigned int w = source[3];
+                if (current + 1U < count) {
+                    if (type == 8U) {
+                        if ((((alignment ^ current) & 1U) ^ 1U) == 0U) {
+                            w = 0U;
+                        }
+                    } else if (type == 9U) {
+                        const unsigned int boundary = (((current + 1U) >> 2U) - alignment + 5U) & 3U;
+                        if (!((((current + 1U) & 1U) != 0U) || boundary != 0U)) {
+                            w = 0U;
+                        }
+                    } else if (current + 1U != alignment) {
+                        w = 0U;
+                    }
+                }
+                const unsigned int vector[4] = {source[0], source[1], source[2], w};
+                std::memcpy(vu1_data_.data() + static_cast<std::size_t>(destination_vector) * 16U, vector, 16U);
+                destination_vector = (destination_vector + 1U) & 1023U;
+            }
+            ++vu1_activity_.vif1_unpack_commands;
+            vu1_activity_.vif1_unpack_vectors_written += count;
+            vu1_activity_.vif1_vumem_words_written += static_cast<unsigned long long>(count) * 4U;
+            stream.unpack_rx.clear();
+            stream.unpack_pending_bytes = 0U;
+            stream.phase = Vif1StreamPhase::Command;
+            return;
+        }
+
         std::uint64_t written_words = 0U;
         uint32_t source_vector = 0U;
         uint32_t output = 0U;
@@ -7612,7 +7856,16 @@ void EeMemory::submit_vif1_word(const std::uint32_t word) {
             ++vu1_micro_run_sequence_;
             begin_timed_vu1_execution();
             if (!replacement->packet.empty()) {
-                enqueue_vu1_path1_packet(std::move(replacement->packet));
+                // VIF1 stalls on a DIRECT until its data has gone through PATH2, so the GS sees a DIRECT (render target and context
+                // registers set before a launch) before any packet of a later MSCAL/MSCNT. This model lets VIF1 run on with the DIRECT
+                // data queued (it can wait for a PATH3 packet to end); a real program's run time covers that, but a launch replaced
+                // natively kicks at once, and its packet would overtake the DIRECT (seen at the Time Attack start: a reflection-map
+                // face drawn into the picture before the switch to its target). So its packet is held until that PATH2 data is out.
+                if (!queued_gif_path2_.empty() && path1_after_path2_enabled()) {
+                    hold_path1_behind_path2(std::move(replacement->packet), queued_gif_path2_.size());
+                } else {
+                    enqueue_vu1_path1_packet(std::move(replacement->packet));
+                }
                 pump_gif_arbiter(false);
             }
             finish_timed_vu1_execution(0U);
@@ -8438,6 +8691,15 @@ bool EeMemory::start_timed_vif1_dmac(const std::uint32_t value,
         std::size_t chain_dump_slot;
 
         [[nodiscard]] std::optional<DmacQuadword> read_quadword(const DmacSourceAddress address) const {
+            // Main RAM below the first alias (the direct segment): same bytes
+            // read_dmac_source_quadword() would load, without the call.
+            const std::uint32_t masked = address.value & 0x7ffffff0U;
+            if ((address.value & 0x80000000U) == 0U && masked < 0x20000000U &&
+                std::uint64_t{masked} + 16U <= self->data_.size()) {
+                DmacQuadword quadword;
+                std::memcpy(quadword.data(), self->data_.data() + masked, sizeof(quadword));
+                return quadword;
+            }
             return self->read_dmac_source_quadword(address);
         }
 
@@ -8466,15 +8728,22 @@ bool EeMemory::start_timed_vif1_dmac(const std::uint32_t value,
             if (pre_snapshot != nullptr) {
                 return false;
             }
-            const auto offset = self->main_ram_offset(first.address(), std::size_t{count} * 16U);
-            if (!offset) {
-                return false;
+            const std::uint32_t masked = first.value & 0x7ffffff0U;
+            std::size_t offset;
+            if (masked < 0x20000000U && std::uint64_t{masked} + std::size_t{count} * 16U <=
+                                            self->data_.size()) {
+                offset = masked;
+            } else {
+                const auto slow = self->main_ram_offset(first.address(), std::size_t{count} * 16U);
+                if (!slow) {
+                    return false;
+                }
+                offset = *slow;
             }
             auto& pool = pending->payload_pool;
-            const std::size_t old_size = pool.size();
-            pool.resize(old_size + count);
-            std::memcpy(pool.data() + old_size, self->data_.data() + *offset,
-                        std::size_t{count} * 16U);
+            // insert() copies straight into the new tail (no zero fill first).
+            const auto* const source = reinterpret_cast<const GsQuadword*>(self->data_.data() + offset);
+            pool.insert(pool.end(), source, source + count);
             pending->tags.back().payload_count += count;
             return true;
         }
@@ -8791,6 +9060,88 @@ bool EeMemory::transfer_pending_vif1_dmac_tag() {
             pending.cycles_until_event = quads * 2U;
             return true;
         }
+    }
+
+    // vifglue: UNPACK data that starts or ends inside a quadword arrives word by word; take every full word of the
+    // current quadword up to (not including) the one that completes the command in one step. The completing word
+    // still goes through submit_vif1_word, which expands and writes the vectors.
+    if (pending.payload_lane != 0U && vif1_stream_.phase == Vif1StreamPhase::UnpackPayload &&
+        graphics_service_diagnostics_ == nullptr && pending.payload_lane <= 3U) {
+        auto& stream = vif1_stream_;
+        const std::uint32_t words_needed = (stream.unpack_pending_bytes + 3U) >> 2U;
+        const std::uint32_t lane_start = static_cast<std::uint32_t>(pending.payload_lane);
+        const std::uint32_t words = words_needed == 0U ? 0U : std::min(4U - lane_start, words_needed - 1U);
+        if (words != 0U) {
+            auto& received = stream.unpack_rx;
+            const std::size_t old_size = received.size();
+            received.resize(old_size + static_cast<std::size_t>(words) * 4U);
+            std::memcpy(received.data() + old_size, &payload[pending.payload_quadword_index][lane_start],
+                        static_cast<std::size_t>(words) * 4U);
+            stream.unpack_pending_bytes -= words * 4U;
+            stream.word_lane = static_cast<std::uint8_t>((stream.word_lane + words) & 3U);
+            pending.payload_lane += words;
+            vu1_activity_.vif1_chain_words_submitted += words;
+        }
+    }
+
+    // vifglue: microprogram upload (MPG) is the bulk of the non-GIF VIF1 traffic and has no side effect beyond
+    // VU1 micro memory, so whole quadword runs are written at once, like the UNPACK run above. The timeline is
+    // unchanged: `quads` quadwords still take quads * 2 cycles before the next event.
+    if (pending.payload_lane == 0U && vif1_stream_.phase == Vif1StreamPhase::MpgPayload &&
+        graphics_service_diagnostics_ == nullptr && vif1_stream_.remaining_words >= 4U) {
+        auto& stream = vif1_stream_;
+        const std::uint64_t quads = std::min<std::uint64_t>(
+            stream.remaining_words / 4U, payload.size() - pending.payload_quadword_index);
+        if (pending.wait != Vif1DmacWait::None) {
+            pending.wait = Vif1DmacWait::None;
+            invalidate_graphics_service_deadline_cache();
+            publish_join_pump_owned_deadline();
+        }
+        set_vif1_vgw(false);
+        vif1_dmac_direct_admitted_ = false;
+        const std::uint32_t* in = payload[pending.payload_quadword_index].data();
+        std::uint32_t word_index = stream.micro_word & 4095U;
+        const std::size_t words = static_cast<std::size_t>(quads) * 4U;
+        for (std::size_t i = 0U; i != words; ++i) {
+            std::byte* const dst = vu1_micro_.data() + static_cast<std::size_t>(word_index) * 4U;
+            std::uint32_t old;
+            std::memcpy(&old, dst, 4U);
+            if (old != in[i]) {
+                std::memcpy(dst, &in[i], 4U);
+                vu1_program_cache_.notify_micro_memory_write();
+            }
+            word_index = (word_index + 1U) & 4095U;
+        }
+        stream.micro_word = word_index;
+        vu1_activity_.vif1_micro_words_written += words;
+        stream.remaining_words -= static_cast<std::uint32_t>(words);
+        if (stream.remaining_words == 0U) {
+            stream.phase = Vif1StreamPhase::Command;
+        }
+        vu1_activity_.vif1_chain_words_submitted += words;
+        const auto consumed = static_cast<std::uint32_t>(quads) * 16U;
+        pending.payload_quadword_index += quads;
+        const std::uint32_t remaining =
+            pending.payload_quadword_index < tag.tag.qwc
+                ? tag.tag.qwc - static_cast<std::uint32_t>(pending.payload_quadword_index)
+                : 0U;
+        if (!pending.ee_published) {
+            store_mmio_u32(0x10009010U, advance_source(source, consumed));
+            store_mmio_u32(0x10009020U, remaining);
+        }
+        vif1_current_word_source_.reset();
+        vif1_current_chain_tadr_ = 0U;
+        vif1_current_chain_root_ = 0U;
+        vif1_current_tag_location_ = 0U;
+        vif1_current_tag_ordinal_ = 0U;
+        vif1_current_payload_word_ordinal_ = 0U;
+        vif1_current_chain_root_known_ = false;
+        vif1_current_tag_location_known_ = false;
+        vif1_current_source_occurrence_known_ = false;
+        pending.phase = pending.payload_quadword_index >= tag.payload_count ? Vif1DmacPhase::Retire
+                                                                           : Vif1DmacPhase::Payload;
+        pending.cycles_until_event = quads * 2U;
+        return true;
     }
 
     if (pending.payload_lane == 0U && vif1_stream_.phase == Vif1StreamPhase::DirectPayload &&

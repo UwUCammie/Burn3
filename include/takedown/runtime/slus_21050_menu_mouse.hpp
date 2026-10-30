@@ -17,7 +17,7 @@
 // and animations as for a pad. A left click on a row selects it and confirms
 // it (Cross); on a list with value boxes (0x00380250, the option pages) a click
 // on the row selects it and a click on its value box steps the value (Right).
-// A right click is Back (Triangle), the wheel moves the highlight, and the
+// The right button does nothing (Escape is Back), the wheel moves the highlight, and the
 // footer prompts are buttons: the left one Back, the right one Cross. Where
 // the game shows no rows and no footer (a race, a loading screen) the mouse
 // does nothing, except on the title screen, where a click presses Start.

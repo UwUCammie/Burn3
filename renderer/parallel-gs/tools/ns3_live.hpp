@@ -214,7 +214,8 @@ public:
 		c_.tokens++;
 		c_.dropped++;
 		frame_tokens_++;
-		if (getenv("NS3_LOG_DROPS") != nullptr)
+		static const bool log_drops = getenv("NS3_LOG_DROPS") != nullptr;
+		if (log_drops)
 		{
 			const auto f = draws_.find(t.seq24);
 			fprintf(stderr, "[NS3-DROP] frame %llu seq %u cat %d nverts %u\n", (unsigned long long)c_.frames, t.seq24, f == draws_.end() ? -1 : int(f->second.draw.category), t.nverts);

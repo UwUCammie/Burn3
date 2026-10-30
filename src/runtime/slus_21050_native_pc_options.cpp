@@ -11,6 +11,7 @@
 #include <iomanip>
 #include <iostream>
 #include <algorithm>
+#include <cstdio>
 #include <bit>
 #include <limits>
 #include <map>
@@ -481,7 +482,8 @@ namespace {
 // Every retail word the module acts at or beside, with its retail value. The
 // native call sequences only ever land on these, so one mismatch (another
 // game build, a patched executable) keeps the whole module off.
-constexpr std::array<Slus21050NativePcOptions::RetailWord, 59> kRetailWords{{
+constexpr std::array<Slus21050NativePcOptions::RetailWord, 60> kRetailWords{{
+    {native_pc_retail::kHubSelectSite, 0x24020004U},
     {0x0036B64CU, 0xAE080014U},
     {0x0036B660U, 0x14620008U},
     {0x0036B674U, 0x0C0DF094U},
@@ -770,6 +772,19 @@ bool Slus21050NativePcOptions::install(guest::EeMemory& memory) {
         memory.write_u32_le(native_pc_retail::kHubSelectionTableMods, 0U);
     }
 
+    // SETTINGS page object: no rows of its own (the host draws the tabs and
+    // rows), reached from the hub's first row through table entry 7.
+    memory.write_u32_le(native_pc_layout::kSettingsVtable, 0U);
+    memory.write_u32_le(native_pc_layout::kSettingsVtable + 4U, 0U);
+    memory.write_u32_le(native_pc_layout::kSettingsVtable + 8U, native_pc_layout::kSettingsUpdate);
+    memory.write_u32_le(native_pc_layout::kSettingsVtable + 12U, native_pc_retail::kNoopRoutine);
+    memory.write_u32_le(native_pc_layout::kSettingsPage, native_pc_layout::kSettingsVtable);
+    memory.write_u32_le(native_pc_layout::kSettingsPage + 4U, 0U);
+    memory.write_u32_le(native_pc_retail::kHubSelectionTableSettings, native_pc_retail::kSettingsDetail);
+    settings_sounds_.clear();
+    settings_apply_audio_ = false;
+    settings_back_ = false;
+
     // GAMEPLAY page object.
     memory.write_u32_le(native_pc_layout::kGameplayVtable, 0U);
     memory.write_u32_le(native_pc_layout::kGameplayVtable + 4U, 0U);
@@ -780,6 +795,7 @@ bool Slus21050NativePcOptions::install(guest::EeMemory& memory) {
 
     stage_ = Stage::Idle;
     hub_items_ = 0U;
+    hub_rows_ = 0U;
     published_valid_ = false;
     mods_signature_valid_ = false;
     published_mods_.clear();
@@ -887,6 +903,17 @@ void Slus21050NativePcOptions::publish_video_rows(guest::EeMemory& memory) {
     }
 }
 
+bool Slus21050NativePcOptions::settings_page_active(const guest::EeMemory& memory) const {
+    return installed_ && memory.read_u32_le(native_pc_retail::kCurrentPage) == native_pc_layout::kSettingsPage &&
+           memory.read_u32_le(0x01E90424U) == 5U; // the front-end phase of menus
+}
+
+void Slus21050NativePcOptions::settings_play_sound(const std::uint32_t sound) {
+    if (settings_sounds_.size() < 4U) {
+        settings_sounds_.push_back(sound);
+    }
+}
+
 guest::GuestAddress Slus21050NativePcOptions::page_address(const PageKind kind) const noexcept {
     switch (kind) {
     case PageKind::Mods:
@@ -897,6 +924,8 @@ guest::GuestAddress Slus21050NativePcOptions::page_address(const PageKind kind) 
         return native_pc_layout::kControlsPage;
     case PageKind::Gameplay:
         return native_pc_layout::kGameplayPage;
+    case PageKind::Settings:
+        return native_pc_layout::kSettingsPage;
     case PageKind::Pc:
         break;
     }
@@ -1184,7 +1213,9 @@ std::uint16_t pad_action(const guest::EeMemory& memory, const std::uint32_t slot
 } // namespace
 
 std::span<const guest::GuestAddress> Slus21050NativePcOptions::hook_addresses() noexcept {
-    static constexpr std::array<guest::GuestAddress, 29> kAddresses{
+    static constexpr std::array<guest::GuestAddress, 31> kAddresses{
+        native_pc_retail::kHubSelectSite,
+        native_pc_layout::kSettingsUpdate,
         native_pc_retail::kMainMenuCountSite,
         native_pc_retail::kMainMenuItemsArgument,
         native_pc_retail::kMainMenuDescriptionsArgument,
@@ -1970,6 +2001,12 @@ void Slus21050NativePcOptions::begin_page_init(guest::R5900State& state, const b
                                                const PageKind kind) {
     page_kind_ = kind;
     init_pause_context_ = pause_context;
+    if (kind == PageKind::Settings) {
+        settings_pause_ = pause_context;
+        settings_sounds_.clear();
+        settings_apply_audio_ = false;
+        settings_back_ = false;
+    }
     finish_pc_ = kPageInitFinish;
     finish_v0_ = 1U;
     queue_size_ = 0U;
@@ -1991,6 +2028,41 @@ void Slus21050NativePcOptions::begin_page_update(guest::R5900State& state,
     }
     if (memory.read_u32_le(kCurrentPhase) != 5U) {
         finish_sequence(state);
+        return;
+    }
+    if (kind == PageKind::Settings) {
+        // The page's list widget has no rows; its highlight (the list's two
+        // transform nodes) is scaled to nothing so only the host page shows.
+        for (const std::uint32_t slot : {0xD4U, 0xD8U}) {
+            const std::uint32_t node = memory.read_u32_le(kListObject + slot);
+            if (node != 0U && memory.contains(node, 16U)) {
+                write_f32(memory, node + 8U, 0.0F);
+                write_f32(memory, node + 12U, 0.0F);
+            }
+        }
+        // The host drives this page; carry out what it asked for.
+        const auto push = [this](const GuestCall& call) {
+            if (queue_size_ < queue_.size()) {
+                queue_[queue_size_++] = call;
+            }
+        };
+        // The retail option pages refresh the audio object before each tick
+        // (sound 75), and without it the game drops the tick: the refresh runs
+        // whenever a sound is played, as on those pages.
+        if (settings_apply_audio_ || !settings_sounds_.empty()) {
+            settings_apply_audio_ = false;
+            push(GuestCall{.target = kListObjectRefreshRoutine, .a0 = kListObjectRefresh, .a1 = 1U});
+        }
+        for (const std::uint32_t sound : settings_sounds_) {
+            push(GuestCall{.target = kPlaySoundRoutine, .a0 = kSoundObject, .a1 = sound});
+        }
+        settings_sounds_.clear();
+        if (settings_back_) {
+            settings_back_ = false;
+            push(GuestCall{.target = kPlaySoundRoutine, .a0 = kSoundObject, .a1 = 74U});
+            push(GuestCall{.target = kFrontendMessageRoutine, .a0 = kFrontendObject, .a1 = 3U});
+        }
+        run_queue(state, memory);
         return;
     }
     if (kind == PageKind::Controls) {
@@ -2277,8 +2349,10 @@ void Slus21050NativePcOptions::continue_sequence(guest::R5900State& state,
         const bool controls = page_kind_ == PageKind::Controls;
         const bool camera = page_kind_ == PageKind::Camera;
         const auto page = page_address(page_kind_);
+        const bool settings = page_kind_ == PageKind::Settings;
         const std::size_t rows =
-            gameplay ? 3U
+            settings ? 0U
+            : gameplay ? 3U
             : controls ? std::min<std::size_t>(9U, controls_rows_.size())
             : mods ? mods_rows_ + 1U
             : camera ? 3U
@@ -2317,7 +2391,8 @@ void Slus21050NativePcOptions::continue_sequence(guest::R5900State& state,
         }
         const bool pause = init_pause_context_;
         push(GuestCall{kTitleRoutine, kTitleObject,
-                       gameplay ? string_pack().gameplay_title_id
+                       settings ? native_pc_retail::kSettingsStringId
+                       : gameplay ? string_pack().gameplay_title_id
                        : controls ? string_pack().controls_title_id
                        : mods ? string_pack().mods_title_id
                        : camera ? string_pack().camera_title_id
@@ -2367,23 +2442,9 @@ std::uint32_t Slus21050NativePcOptions::pause_item_selected(const guest::EeMemor
         return 0U;
     }
     const auto item = memory.read_u32_le(native_pc_layout::kPauseItems + selected * 8U);
-    {
-        const auto& pack = string_pack();
-        if (item == native_pc_layout::kStrings +
-                        pack.offsets[pack.title_id - native_pc_retail::kStringCount]) {
-            return 2U;
-        }
-    }
-    const auto& pack = string_pack();
-    const auto gameplay_title =
-        native_pc_layout::kStrings + pack.offsets[pack.gameplay_title_id - native_pc_retail::kStringCount];
-    if (item == gameplay_title) {
-        return 8U;
-    }
-    const auto& camera_pack = string_pack();
-    return item == native_pc_layout::kStrings +
-                       camera_pack.offsets[camera_pack.camera_title_id - native_pc_retail::kStringCount]
-               ? 6U
+    const auto strings = memory.read_u32_le(memory.read_u32_le(native_pc_retail::kStringTablePointer) + 12U);
+    return item == memory.read_u32_le(strings + native_pc_retail::kSettingsStringId * 4U)
+               ? native_pc_retail::kSettingsDetail
                : 0U;
 }
 
@@ -2402,70 +2463,54 @@ Slus21050NativePcOptions::extend_pause_list(guest::R5900State& state, guest::EeM
         if (retail_count > 7U) {
             return HookResult::NotHooked;
         }
-        for (std::uint32_t row = 0U; row < retail_count; ++row) {
-            for (std::uint32_t byte = 0U; byte < 8U; ++byte) {
-                memory.write_u8(byte + item_of(row),
-                                memory.read_u8(retail_item_of(row) + byte + 8U));
-            }
-            memory.write_u32_le(native_pc_layout::kPauseActions + row * 4U,
-                                flag == 0U ? memory.read_u32_le(retail_action_of(row) + 68U) : 0U);
+        if (retail_count == 0U) {
+            return HookResult::NotHooked;
         }
+        // The retail rows, with AUDIO and CONTROLLERS replaced by one SETTINGS
+        // row where AUDIO was; the last row (quit) stays last.
+        const auto strings = memory.read_u32_le(memory.read_u32_le(native_pc_retail::kStringTablePointer) + 12U);
+        const auto retail_text = [&](const std::uint32_t id) { return memory.read_u32_le(strings + id * 4U); };
+        const std::uint32_t audio_text = retail_text(native_pc_retail::kAudioPauseStringId);
+        const std::uint32_t controllers_text = retail_text(native_pc_retail::kControllersStringId);
+        const std::uint32_t settings_text = retail_text(native_pc_retail::kSettingsStringId);
         std::uint32_t count = 0U;
-        std::uint32_t quit_action = 0U;
-        std::array<std::uint8_t, 8U> quit_item{};
-        if (retail_count - 1U <= 8U) {
-            count = retail_count - 1U;
-            for (auto byte = 0U; byte < 8U; ++byte) {
-                quit_item[byte] =
-                    memory.read_u8(byte + item_of(count));
+        bool settings_added = false;
+        const auto copy_row = [&](const std::uint32_t row) {
+            for (std::uint32_t byte = 0U; byte < 8U; ++byte) {
+                memory.write_u8(byte + item_of(count), memory.read_u8(retail_item_of(row) + byte + 8U));
             }
-            quit_action = memory.read_u32_le(native_pc_layout::kPauseActions + count * 4U);
-        }
-        for (const auto& [text, action] : {
-                 std::pair<std::uint32_t, std::uint32_t>{
-                     [] {
-                         const auto& pack = string_pack();
-                         return native_pc_layout::kStrings +
-                                pack.offsets[pack.title_id - native_pc_retail::kStringCount];
-                     }(),
-                     6U},
-                 std::pair<std::uint32_t, std::uint32_t>{
-                     [] {
-                         const auto& pack = string_pack();
-                         return native_pc_layout::kStrings +
-                                pack.offsets[pack.camera_title_id - native_pc_retail::kStringCount];
-                     }(),
-                     7U},
-                 std::pair<std::uint32_t, std::uint32_t>{
-                     native_pc_layout::kStrings +
-                         string_pack().offsets[string_pack().gameplay_title_id -
-                                               native_pc_retail::kStringCount],
-                     8U}}) {
-            if (count + (retail_count - 1U <= 8U ? 1U : 0U) > 9U) {
-                break;
-            }
+            memory.write_u32_le(native_pc_layout::kPauseActions + count * 4U,
+                                flag == 0U ? memory.read_u32_le(retail_action_of(row) + 68U) : 0U);
+            ++count;
+        };
+        const auto add_settings = [&] {
             const auto item = item_of(count);
-            memory.write_u32_le(item, text);
+            memory.write_u32_le(item, settings_text);
             memory.write_u8(item + 4U, 0U);
             memory.write_u8(item + 5U, 0U);
-            if (flag == 0U) {
-                memory.write_u32_le(native_pc_layout::kPauseActions + count * 4U, action);
-            }
+            write_u16(memory, item + 6U, 0U);
+            memory.write_u32_le(native_pc_layout::kPauseActions + count * 4U, flag == 0U ? 6U : 0U);
+            settings_added = true;
             ++count;
+        };
+        for (std::uint32_t row = 0U; row + 1U < retail_count; ++row) {
+            const auto text = memory.read_u32_le(retail_item_of(row) + 8U);
+            if (text == audio_text || text == controllers_text) {
+                if (!settings_added) {
+                    add_settings();
+                }
+                continue;
+            }
+            copy_row(row);
         }
-        if (retail_count - 1U <= 8U) {
-            for (std::uint32_t byte = 0U; byte < 8U; ++byte) {
-                memory.write_u8(byte + item_of(count), quit_item[byte]);
-            }
-            if (flag == 0U) {
-                memory.write_u32_le(native_pc_layout::kPauseActions + count * 4U, quit_action);
-            }
-            if (retail_count - 1U != count) {
-                pause_quit_from_ = retail_count - 1U;
-                pause_quit_to_ = count;
-            }
-            ++count;
+        if (!settings_added) {
+            add_settings();
         }
+        if (retail_count - 1U != count) {
+            pause_quit_from_ = retail_count - 1U;
+            pause_quit_to_ = count;
+        }
+        copy_row(retail_count - 1U);
         write_u16(memory, native_pc_retail::kPauseList + 6U, static_cast<std::uint16_t>(count));
     }
     state.write_gpr_u64(2U, 0x004F0000U);
@@ -2666,23 +2711,20 @@ Slus21050NativePcOptions::on_dispatch(guest::R5900State& state, guest::EeMemory&
         return HookResult::Replaced;
     }
     case native_pc_retail::kHubCountSite:
-        hub_items_ = mods_page_enabled_ ? 2U : 1U;
-        state.write_gpr_u64(2U, hub_items_ + 5U);
+        // SETTINGS, EA GAMES TRAX and (with mods) MODS.
+        hub_items_ = mods_page_enabled_ ? 3U : 2U;
+        state.write_gpr_u64(2U, hub_items_);
         state.set_pc(native_pc_retail::kHubCountSite + 4U);
         return HookResult::Replaced;
     case native_pc_retail::kHubItemsArgument: {
         const auto hub = state.read_gpr_u32(16U);
         const std::uint32_t items = hub_items_;
         hub_items_ = 0U;
+        hub_rows_ = 0U;
         if (items == 0U || hub != native_pc_retail::kHub || !memory.contains(native_pc_retail::kHub + 8U, 40U)) {
             return HookResult::NotHooked;
         }
-        for (std::uint32_t byte = 0U; byte < 40U; byte += 4U) {
-            memory.write_u32_le(native_pc_layout::kHubItems + byte,
-                                memory.read_u32_le(native_pc_retail::kHub + 8U + byte));
-        }
-        memory.write_u8(native_pc_layout::kHubItems + 36U, 0U);
-        memory.write_u8(native_pc_layout::kHubItems + 37U, 0U);
+        const auto strings = memory.read_u32_le(memory.read_u32_le(native_pc_retail::kStringTablePointer) + 12U);
         const auto append = [&memory](const std::uint32_t index, const std::uint32_t text) {
             const guest::GuestAddress item = native_pc_layout::kHubItems + index * 8U;
             memory.write_u32_le(item, text);
@@ -2690,22 +2732,40 @@ Slus21050NativePcOptions::on_dispatch(guest::R5900State& state, guest::EeMemory&
             memory.write_u8(item + 5U, 0U);
             write_u16(memory, item + 6U, 0U);
         };
-        const auto& camera_pack = string_pack();
-        append(5U, native_pc_layout::kStrings +
-                       camera_pack.offsets[camera_pack.camera_title_id - native_pc_retail::kStringCount]);
-        if (items != 1U) {
-            const auto& mods_pack = string_pack();
-            append(6U, native_pc_layout::kStrings +
-                           mods_pack.offsets[mods_pack.mods_title_id - native_pc_retail::kStringCount]);
+        append(0U, memory.read_u32_le(strings + native_pc_retail::kSettingsStringId * 4U));
+        // EA GAMES TRAX: the retail row as the hub built it.
+        for (std::uint32_t byte = 0U; byte < 8U; byte += 4U) {
+            memory.write_u32_le(native_pc_layout::kHubItems + 8U + byte,
+                                memory.read_u32_le(native_pc_retail::kHub + 8U + 4U * 8U + byte));
         }
+        if (items == 3U) {
+            const auto& pack = string_pack();
+            append(2U, native_pc_layout::kStrings + pack.offsets[pack.mods_title_id - native_pc_retail::kStringCount]);
+        }
+        hub_rows_ = items;
         state.write_gpr_u64(6U, native_pc_layout::kHubItems);
         state.set_pc(native_pc_retail::kHubWidgetInitCall);
+        return HookResult::Replaced;
+    }
+    case native_pc_retail::kHubSelectSite: {
+        // The selected row of the SETTINGS hub, as the retail row whose table
+        // entry opens it (EA GAMES TRAX keeps its own row 4).
+        const std::uint32_t row = state.read_gpr_u32(3U);
+        if (hub_rows_ == 0U || read_u16(memory, native_pc_retail::kHub + 6U) != hub_rows_ || row >= hub_rows_) {
+            return HookResult::NotHooked;
+        }
+        static constexpr std::array<std::uint32_t, 3> kRetailRow{7U, 4U, 6U};
+        state.write_gpr_u64(3U, kRetailRow[row]);
+        state.write_gpr_u64(2U, 4U);
+        state.set_pc(native_pc_retail::kHubSelectSite + 4U);
         return HookResult::Replaced;
     }
     case native_pc_retail::kDetailSwitchSite: {
         const auto detail = state.read_gpr_u32(8U);
         PageKind kind;
-        if (detail == 8U) {
+        if (detail == native_pc_retail::kSettingsDetail) {
+            kind = PageKind::Settings;
+        } else if (detail == 8U) {
             kind = PageKind::Gameplay;
         } else if (detail == 4U) {
             kind = PageKind::Pc;
@@ -2728,7 +2788,8 @@ Slus21050NativePcOptions::on_dispatch(guest::R5900State& state, guest::EeMemory&
     }
     case native_pc_retail::kPageHeaderLookup: {
         const auto page = memory.read_u32_le(native_pc_retail::kCurrentPage);
-        if (page != native_pc_layout::kGameplayPage && page != native_pc_layout::kControlsPage) {
+        if (page != native_pc_layout::kGameplayPage && page != native_pc_layout::kControlsPage &&
+            page != native_pc_layout::kSettingsPage) {
             if (page != native_pc_layout::kPage && page != native_pc_layout::kCameraPage) {
                 if (!mods_page_enabled_ || page != native_pc_layout::kModsPage) {
                     return HookResult::NotHooked;
@@ -2741,6 +2802,9 @@ Slus21050NativePcOptions::on_dispatch(guest::R5900State& state, guest::EeMemory&
     }
     case native_pc_layout::kUpdateEntry:
         begin_page_update(state, memory, PageKind::Pc);
+        return HookResult::Replaced;
+    case native_pc_layout::kSettingsUpdate:
+        begin_page_update(state, memory, PageKind::Settings);
         return HookResult::Replaced;
     case native_pc_layout::kCameraUpdateEntry:
         begin_page_update(state, memory, PageKind::Camera);

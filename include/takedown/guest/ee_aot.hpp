@@ -37,7 +37,58 @@ struct EeAotRun {
     EeStepResult last{};
     // PC of that instruction.
     GuestAddress last_pc{};
+    // How the caller continues (see EeAotNativeHook); kEeAotRunOrdinary unless
+    // the hook handled native calls during the run.
+    std::uint8_t outcome{};
 };
+
+// Outcomes of a run that called the native hook.
+// Ordinary: as documented above.
+inline constexpr std::uint8_t kEeAotRunOrdinary = 0U;
+// One or more native calls were made and completed, nothing else was executed
+// after them (`executed` is zero): the caller is in the state it would be in
+// after a native call of its own, with no pending instruction.
+inline constexpr std::uint8_t kEeAotRunNativeDone = 1U;
+// The caller must not account the `executed` instructions' progress (steps,
+// cycles, provenance) again; it has been done. Its own per-instruction burst
+// counters still apply to `executed`.
+inline constexpr std::uint8_t kEeAotRunAccounted = 2U;
+// A prepared native call was not handled; the caller ends its burst at a hook.
+inline constexpr std::uint8_t kEeAotRunNativeUnhandled = 3U;
+
+// A caller-installed handler for the moment a run stops at a native entry
+// (an excluded PC at which the caller dispatches a native replacement).
+// `executed` instructions (>= 1) were run since the run began or since the
+// previous hook call returned kContinue, the last of which was at `last_pc`;
+// the state is exactly as run_ee_aot would return it. The hook either does
+// nothing (kNone) or performs, for the caller, everything the caller's loop
+// would do from there: accounting, the native call(s), the post-instruction
+// checks. It must change nothing before it knows it can go on, except what the
+// outcomes below say it has done.
+struct EeAotNativeHookResult {
+    enum class Kind : std::uint8_t {
+        // Nothing was done; the run ends and returns as it would without a hook.
+        None,
+        // One or more native calls completed; the caller's loop would now run
+        // compiled code at state.pc() with `budget` left and `first_step` as
+        // the step number of its first instruction.
+        Continue,
+        // Progress of the `executed` instructions was accounted (kEeAotRunAccounted);
+        // no native call was made. The run ends.
+        HandOffAccounted,
+        // Native call(s) completed, but the caller must run its own checks
+        // (kEeAotRunNativeDone). The run ends.
+        HandOffNativeDone,
+        // A native call was prepared but not handled (kEeAotRunNativeUnhandled).
+        HandOffUnhandled,
+    };
+    Kind kind{Kind::None};
+    std::uint64_t budget{};
+    std::uint64_t first_step{};
+};
+using EeAotNativeHook = EeAotNativeHookResult (*)(void* user, std::uint64_t executed, GuestAddress last_pc);
+// Installs (or, with nullptr, removes) the hook for the following runs.
+void ee_aot_set_native_hook(EeAotNativeHook hook, void* user) noexcept;
 
 struct EeAotStatistics {
     std::uint64_t calls{};
@@ -79,6 +130,11 @@ struct EeAotStatistics {
     std::uint64_t stop_memory_other{};
     std::uint64_t identity_checks{};
     std::uint64_t identity_failures{};
+    // Native entries a run's hook was offered (native_hook_taken: it handled
+    // them, native_hook_continued: and the run went on in compiled code).
+    std::uint64_t native_hook_offered{};
+    std::uint64_t native_hook_taken{};
+    std::uint64_t native_hook_continued{};
 };
 
 [[nodiscard]] bool ee_aot_module_linked() noexcept;

@@ -8,6 +8,8 @@
 #include "gs_renderer.hpp"
 #include "image.hpp"
 
+struct GsShm; // takedown/platform/gs_shm_ring.h
+
 namespace ParallelGS
 {
 class GSInterface;
@@ -58,6 +60,10 @@ public:
 	bool open_raw(const char *path, uint32_t vram_size, GSInterface *iface);
 	// Takes ownership of an already-open raw stream (e.g. a pipe) and closes it.
 	bool open_raw_file(FILE *file, uint32_t vram_size, GSInterface *iface);
+	// Takedown: the game moved the stream into a shared-memory ring (stream_pipe.hpp). Call after
+	// open_raw_file(); the parser takes ownership of the ring and reads the stream from it instead of the
+	// FILE, which stays open only as the connection to the game.
+	void attach_ring(GsShm *ring);
 	bool iterate_until_vsync(bool high_res_scanout = false, bool conservative_crtc = false);
 	// Takedown: size of the high-resolution scanout (VSyncInfo::scanout_scale; 0 is 2x).
 	void set_scanout_scale(uint32_t scale) { scanout_scale = scale; }
@@ -91,6 +97,8 @@ public:
 
 private:
 	struct FileDeleter { void operator()(FILE *file) { if (file) fclose(file); } };
+	struct RingDeleter { void operator()(GsShm *ring); };
+	std::unique_ptr<GsShm, RingDeleter> ring;
 	GSInterface *iface = nullptr;
 	std::unique_ptr<FILE, FileDeleter> file;
 	std::vector<GIFTagBits> gif_tag_buffer;
@@ -117,6 +125,7 @@ private:
 	uint64_t read_u64();
 	template <typename T>
 	void read_reg(T &reg);
+	bool read_bytes(void *data, size_t size);
 	void read_data(void *data, size_t size);
 	void read_payload(std::vector<uint8_t> &payload, uint32_t size);
 	bool eof = false;

@@ -1,4 +1,4 @@
-// nsc_scene.hpp -- reader for the NS-1 native scene recording (.nsc, see native_scene_format.h).
+// nsc_scene.hpp -- reader for the NS-1 native scene recording (.nsc, tmp/ns1-capture/FORMAT.md).
 //
 // Header-only and independent of the renderer: the file is mapped read-only and every record is
 // a pointer into the mapping (no copies), indexed by id. Game-derived data: the recordings stay

@@ -31,6 +31,7 @@
 #include "ns2_rt.hpp"
 #include "native_ui_layer.hpp"
 #include "fsr_upscaler.hpp"
+#include "smaa_filter.hpp"
 #include "ns2_hybrid.hpp"
 #include "ns3_live.hpp"
 #include "global_managers.hpp"
@@ -221,8 +222,19 @@ struct InputBridge
 		// pixels. Scale between them so HiDPI windows map correctly.
 		const float sx = w > 0 ? surface_width / float(w) : 1.0f;
 		const float sy = h > 0 ? surface_height / float(h) : 1.0f;
-		const float px = (x * sx - picture.x) / (picture.width > 0.0f ? picture.width : 1.0f);
+		float px = (x * sx - picture.x) / (picture.width > 0.0f ? picture.width : 1.0f);
 		const float py = (y * sy - picture.y) / (picture.height > 0.0f ? picture.height : 1.0f);
+		// The game's UI is its 4:3 picture, narrowed about the centre on a
+		// wider picture (ui_layout.cpp). The pointer is reported over that 4:3
+		// block, so a menu row or button is where the game (and the host UI)
+		// puts it: 0 is the block's left edge and 1 its right, and the sides
+		// of a wide picture are below 0 and above 1.
+		if (picture.width > 0.0f && picture.height > 0.0f)
+		{
+			const float scale = (4.0f / 3.0f) / (picture.width / picture.height);
+			if (scale < 1.0f)
+				px = (px - (1.0f - scale) * 0.5f) / scale;
+		}
 		writer->pointer(px, py, true);
 	}
 
@@ -723,7 +735,8 @@ struct StreamApplication : Granite::Application, Granite::EventHandler
 		}
 
 		std::string error;
-		FILE *file = TakedownRenderer::open_graphics_stream(options.stream_path, error, native_scene_wanted() && !env_enabled("TAKEDOWN_NS3_OFF"));
+		GsShm *stream_ring = nullptr;
+		FILE *file = TakedownRenderer::open_graphics_stream(options.stream_path, error, native_scene_wanted() && !env_enabled("TAKEDOWN_NS3_OFF"), &stream_ring);
 		if (!file || !parser.open_raw_file(file, 4 * 1024 * 1024, iface.get()))
 		{
 			request_shutdown();
@@ -734,6 +747,9 @@ struct StreamApplication : Granite::Application, Granite::EventHandler
 
 		ns2h_setup();
 		ns3_setup();
+
+		if (stream_ring)
+			parser.attach_ring(stream_ring);
 
 		parser.set_panini_callback([this](const GSDumpParser::PaniniRecord &record) {
 			if (iface)
@@ -903,7 +919,17 @@ struct StreamApplication : Granite::Application, Granite::EventHandler
 		}
 		else if (!force)
 			return;
+		if (const char *e = getenv("RC_AA"))
+			next.spatial_aa = uint8_t(atoi(e));
 		apply_upscaling(next);
+		// SMAA x2 works on the samples of a render-scale picture: at least 200%.
+		if (upscaling.fsr_preset == 0 &&
+		    TakedownRenderer::spatial_aa_smaa_mode(next.spatial_aa) == TakedownRenderer::SmaaMode::X2 &&
+		    next.resolution_scale < 2)
+		{
+			next.resolution_scale = 2;
+			next.samples = std::max<uint8_t>(next.samples, 4);
+		}
 
 		if (const char *e = getenv("RC_SCALE"))
 		{
@@ -1564,6 +1590,9 @@ struct StreamApplication : Granite::Application, Granite::EventHandler
 		return native_scene_image ? native_ui_shown : iface->takedown_ui_displayed();
 	}
 
+	TakedownRenderer::SmaaFilter smaa;
+	const Vulkan::Image *smaa_output = nullptr;
+
 	void draw_world(CommandBuffer &cmd, const TakedownRenderer::PictureRect &rect)
 	{
 		// The GS has no picture while it is idle (the native scene draws).
@@ -1571,15 +1600,18 @@ struct StreamApplication : Granite::Application, Granite::EventHandler
 			return;
 		// The native scene, when it has a frame, in place of the GS picture; with
 		// FSR, its upscaled picture (gain already applied).
-		const Vulkan::Image &source =
-		    fsr_output ? *fsr_output : native_scene_image ? *native_scene_image : *vsync.image;
-		const vec4 source_gain = fsr_output ? vec4(1.0f) : native_scene_image ? native_scene_gain : vec4(1.0f);
+		// With SMAA, its picture (gain applied); with FSR, the upscaled picture.
+		const Vulkan::Image &source = smaa_output ? *smaa_output
+		                              : fsr_output ? *fsr_output
+		                              : native_scene_image ? *native_scene_image : *vsync.image;
+		const vec4 source_gain =
+		    smaa_output || fsr_output ? vec4(1.0f) : native_scene_image ? native_scene_gain : vec4(1.0f);
 
 		const uint32_t source_w = source.get_width();
 		const uint32_t source_h = source.get_height();
 		const uint32_t output_w = uint32_t(rect.width + 0.5f);
 		const uint32_t output_h = uint32_t(rect.height + 0.5f);
-		const uint32_t taps = presentation.spatial_aa;
+		const uint32_t taps = smaa_output ? presentation.spatial_aa : 0;
 		if (source_w != logged_source_w || source_h != logged_source_h || output_w != logged_output_w ||
 		    output_h != logged_output_h || taps != logged_taps)
 		{
@@ -1588,8 +1620,11 @@ struct StreamApplication : Granite::Application, Granite::EventHandler
 			logged_output_w = output_w;
 			logged_output_h = output_h;
 			logged_taps = taps;
-			LOGI("Native world: source %ux%u, output %ux%u, spatial AA %u taps.\n", source_w, source_h, output_w,
-			     output_h, taps);
+			LOGI("Native world: source %ux%u, output %ux%u, %s.\n", source_w, source_h, output_w, output_h,
+			     taps == 0 ? "no SMAA"
+			     : TakedownRenderer::spatial_aa_smaa_mode(uint8_t(taps)) == TakedownRenderer::SmaaMode::X2
+			         ? "SMAA x2 (on the samples)"
+			         : "SMAA x1");
 		}
 
 		VkViewport viewport = {};
@@ -1603,26 +1638,36 @@ struct StreamApplication : Granite::Application, Granite::EventHandler
 		cmd.set_viewport(viewport);
 		cmd.set_texture(0, 0, source.get_view(), StockSampler::LinearClamp);
 
-		if (taps != 0 && !native_scene_image && !fsr_output)
-		{
-			struct
-			{
-				float inverse_extent[2];
-				uint32_t taps;
-				uint32_t unused;
-			} push = { { 1.0f / float(source_w), 1.0f / float(source_h) }, taps, 0 };
-			cmd.push_constants(&push, 0, sizeof(push));
-			CommandBufferUtil::draw_fullscreen_quad(cmd, "builtin://shaders/quad.vert",
-			                                        "builtin://shaders/takedown_spatial_aa.frag");
-		}
-		else
-		{
-			const vec4 gain = vec4(source_gain.xyz(), 1.0f);
-			cmd.push_constants(&gain, 0, sizeof(gain));
-			CommandBufferUtil::draw_fullscreen_quad(cmd, "builtin://shaders/quad.vert",
-			                                        "builtin://shaders/takedown_world_blit.frag");
-		}
+		const vec4 gain = vec4(source_gain.xyz(), 1.0f);
+		cmd.push_constants(&gain, 0, sizeof(gain));
+		CommandBufferUtil::draw_fullscreen_quad(cmd, "builtin://shaders/quad.vert",
+		                                        "builtin://shaders/takedown_world_blit.frag");
 		cmd.set_viewport(saved);
+	}
+
+	// Before the frame's render passes: the SMAA picture for draw_world (not
+	// with FSR, which anti-aliases itself). x1 works at the window's size, or
+	// at the render size when that is smaller; x2 on the render-scale picture's
+	// samples before draw_world combines them.
+	void prepare_smaa(Device &device, CommandBuffer &cmd, const TakedownRenderer::PictureRect &picture)
+	{
+		smaa_output = nullptr;
+		const auto mode = TakedownRenderer::spatial_aa_smaa_mode(presentation.spatial_aa);
+		if (mode == TakedownRenderer::SmaaMode::Off || fsr_output || (!vsync.image && !native_scene_image) ||
+		    picture.width < 1.0f || picture.height < 1.0f)
+			return;
+		const Vulkan::Image &source = native_scene_image ? *native_scene_image : *vsync.image;
+		const vec4 gain = native_scene_image ? native_scene_gain : vec4(1.0f);
+		uint32_t width = source.get_width();
+		uint32_t height = source.get_height();
+		const uint32_t output_w = uint32_t(picture.width + 0.5f);
+		const uint32_t output_h = uint32_t(picture.height + 0.5f);
+		if (mode == TakedownRenderer::SmaaMode::X1 && (width > output_w || height > output_h))
+		{
+			width = output_w;
+			height = output_h;
+		}
+		smaa_output = smaa.run(device, cmd, source, gain, width, height);
 	}
 
 	// Draws the world and the game's UI layer into ui_target, at the picture's
@@ -2423,6 +2468,7 @@ struct StreamApplication : Granite::Application, Granite::EventHandler
 		QueryPoolHandle present_start;
 		if (gpu_timestamps)
 			present_start = cmd->write_timestamp(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
+		prepare_smaa(device, *cmd, picture);
 		// The game's UI and the host UI are placed together for the picture's shape.
 		const bool ui_layer_on = iface && iface->takedown_ui_is_enabled();
 		std::vector<TakedownRenderer::UiPlacement> ui_placements, host_placements;

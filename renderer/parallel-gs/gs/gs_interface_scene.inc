@@ -1,6 +1,8 @@
 // Takedown native scene: records the primitives of the game's 640-wide PSMCT32
 // targets for the host rasterizer (takedown/native_scene.cpp). Included at the
 // end of gs_interface.cpp.
+// getenv scans the environment: call sites on the per-draw path read it once.
+#define TD_ENV_SET(name) ([]() { static const bool set_ = getenv(name) != nullptr; return set_; }())
 //
 // Capture runs after drawing_kick_update_state, so the primitive's texture is
 // already resolved by the texture cache (render_pass.held_images); the GS draws
@@ -460,7 +462,7 @@ bool GSInterface::takedown_scene_cpu_draw(const VertexPosition *pos, const Verte
 			takedown_memory.write_pixel32(fbp, fbw, uint32_t(x), uint32_t(y), attr[0].rgba, keep);
 			takedown_memory.written(fbp, fbw, PSMCT32, uint32_t(x), uint32_t(y), 1, 1);
 			static std::map<uint64_t, uint64_t> hist;
-			if (getenv("NS2H_CPUDRAW_LOG"))
+			if (TD_ENV_SET("NS2H_CPUDRAW_LOG"))
 			{
 				const uint64_t key = uint64_t(fbp) << 32 | fbw << 16 | keep >> 16;
 				if (!hist.count(key))
@@ -520,7 +522,7 @@ bool GSInterface::takedown_scene_cpu_draw(const VertexPosition *pos, const Verte
 				c = (c & 0xffffffu) | (rgba & 0xff000000u);
 			takedown_memory.write_pixel32(fbp, fbw, uint32_t(px0) + x, uint32_t(py0) + y, c, keep);
 		}
-	if (getenv("NS2H_CPUDRAW_LOG"))
+	if (TD_ENV_SET("NS2H_CPUDRAW_LOG"))
 	{
 		static std::map<uint64_t, uint64_t> seen;
 		const uint64_t key = uint64_t(fbp) << 32 | uint32_t(tex0.PSM);
@@ -623,7 +625,7 @@ void GSInterface::takedown_gs_update_idle()
 	if (idle == takedown_gs_idle)
 		return;
 	takedown_gs_idle = idle;
-	if (getenv("NS3_LOG_DROPS") != nullptr)
+	if (TD_ENV_SET("NS3_LOG_DROPS"))
 		fprintf(stderr, "[NS3-IDLE] vsync %llu idle %d since_publish %u\n", (unsigned long long)takedown_dev_vsyncs, int(idle), takedown_vsyncs_since_publish);
 	renderer.takedown_set_idle(idle);
 	if (idle)
@@ -1054,6 +1056,7 @@ void GSInterface::takedown_scene_capture(const VertexPosition *pos, const Vertex
 			if (x1 >= x0 && y1 >= y0 && check.foreign)
 			{
 				auto list = std::make_shared<std::vector<TakedownExactPageRef>>();
+				list->reserve(check.pages.size());
 				for (uint32_t page : check.pages)
 					list->push_back(takedown_exact_page(page));
 				fresh.target_pages = std::move(list);
@@ -1392,12 +1395,14 @@ void GSInterface::takedown_exact_begin(const VertexPosition *pos, const VertexAt
 	e->pabe = takedown_in->registers.pabe.bits;
 	// Its destination and Z pages as they are before this draw marks them.
 	std::vector<uint32_t> pages;
+	pages.reserve(16);
 	const uint32_t w = uint32_t(bb.z - bb.x + 1), h = uint32_t(bb.w - bb.y + 1);
 	takedown_memory.pages_of_unique(uint32_t(frame.FBP) * PGS_BLOCKS_PER_PAGE, uint32_t(frame.FBW), PSMCT32,
 	                                uint32_t(bb.x), uint32_t(bb.y), w, h, pages);
 	if (ctx.test.desc.ZTE == TESTBits::ZTE_ENABLED)
 		takedown_memory.pages_of_unique(uint32_t(ctx.zbuf.desc.ZBP) * PGS_BLOCKS_PER_PAGE, uint32_t(frame.FBW),
 		                                uint32_t(ctx.zbuf.desc.PSM) | 0x30u, uint32_t(bb.x), uint32_t(bb.y), w, h, pages);
+	e->pages.reserve(pages.size() + 4);
 	for (uint32_t page : pages)
 		e->pages.push_back(takedown_exact_page(page));
 	e->bb = bb;
@@ -1563,6 +1568,7 @@ void GSInterface::takedown_exact_finish(TakedownSceneBatch &batch)
 		e->texture = batch.native_texture;
 		e->clut = batch.native_clut;
 		std::vector<uint32_t> pages;
+		pages.reserve(16);
 		const auto &r = e->texture.rect;
 		takedown_memory.pages_of_unique(uint32_t(e->texture.tex0.desc.TBP0), uint32_t(e->texture.tex0.desc.TBW),
 		                                uint32_t(e->texture.tex0.desc.PSM), r.x, r.y, std::max(r.width, 1u),
@@ -1573,6 +1579,7 @@ void GSInterface::takedown_exact_finish(TakedownSceneBatch &batch)
 		for (const auto &p : e->pages)
 			target_pages.push_back(p->page);
 		std::sort(target_pages.begin(), target_pages.end());
+		e->pages.reserve(e->pages.size() + pages.size());
 		for (uint32_t page : pages)
 		{
 			const bool known = std::binary_search(target_pages.begin(), target_pages.end(), page);
@@ -1596,15 +1603,7 @@ GSInterface::TakedownExactPageRef GSInterface::takedown_exact_page(uint32_t page
 	auto entry = std::make_shared<TakedownExactPage>();
 	entry->page = page;
 	entry->serial = serial;
-	bool undrawn = false;
-	for (uint32_t b = 0; b < 32; b++)
-	{
-		entry->owners[b] = takedown_memory.block_owners(page * 32u + b);
-		entry->serials[b] = takedown_memory.lane_write_serials(page * 32u + b);
-		entry->exact[b] = takedown_memory.block_exact(page * 32u + b);
-		for (uint32_t o : entry->owners[b])
-			undrawn |= o == TakedownNativeMemory::kNoOwner;
-	}
+	const bool undrawn = takedown_memory.page_state(page, entry->owners, entry->serials, entry->exact);
 	// Bytes no draw wrote come from native memory.
 	if (undrawn)
 	{
@@ -1837,16 +1836,16 @@ std::shared_ptr<const GSInterface::TakedownVramTexture> GSInterface::takedown_vr
 		TakedownNativeMemory::palette(tex0, desc.texa.desc, (clut ? *clut : no_clut).data(), t->palette.data());
 	}
 	std::vector<uint32_t> pages;
+	pages.reserve(16);
 	for (uint32_t l = 0; l < levels; l++)
 	{
 		const auto &level = t->level[l];
 		takedown_memory.pages_of_unique(level.base_block, level.buffer_width_64, psm, level.x, level.y, level.width,
 		                                level.height, pages);
 	}
+	t->pages.reserve(pages.size());
 	for (uint32_t page : pages)
-	{
 		t->pages.push_back(takedown_exact_page(page));
-	}
 	return t;
 }
 
@@ -2556,7 +2555,7 @@ void GSInterface::takedown_run_hybrid(uint32_t range, bool donor, bool live)
 			{
 				// The token's draw left no primitive (the GS would not have drawn it either, or it reads its own target).
 				live_stats.donor_misses++;
-				if (getenv("NS3_LOG_DROPS") != nullptr)
+				if (TD_ENV_SET("NS3_LOG_DROPS"))
 					fprintf(stderr, "[NS3-MISS] vsync %llu cat %d box %d,%d-%d,%d tex %d tbp %u psm %u\n", (unsigned long long)takedown_dev_vsyncs, int(d.live_category),
 					        d.box.x, d.box.y, d.box.z, d.box.w, int(b.textured), unsigned(b.tex_tbp0), unsigned(b.tex_psm));
 				continue;
@@ -2572,13 +2571,13 @@ void GSInterface::takedown_run_hybrid(uint32_t range, bool donor, bool live)
 			else
 			{
 				hybrid_stats.donor_misses++;
-				if (getenv("NS2H_DEBUG_MISS"))
+				if (TD_ENV_SET("NS2H_DEBUG_MISS"))
 				{
 					auto *nd = const_cast<TakedownNativeDraw *>(b.native.get());
 					nd->tint[0] = 3.0f; nd->tint[1] = 0.0f; nd->tint[2] = 3.0f;
 				}
 				static int logged = 0;
-				if (getenv("NS2H_DEBUG") && logged++ < 60)
+				if (TD_ENV_SET("NS2H_DEBUG") && logged++ < 60)
 					LOGI("NS2H donor miss: source %d batches %zu mark %zu box %d,%d-%d,%d tbp %u\n", source ? 1 : 0, n, hybrid_mark_batches, d.box.x, d.box.y, d.box.z, d.box.w, b.tex_tbp0);
 			}
 		}
@@ -2597,7 +2596,7 @@ void GSInterface::takedown_run_hybrid(uint32_t range, bool donor, bool live)
 			desc.tex1.desc.LCM = 0, desc.tex1.desc.MMAG = 0, desc.tex1.desc.MMIN = 0, desc.tex1.desc.MTBA = 0, desc.tex1.desc.L = 0, desc.tex1.desc.K = 0;
 			desc.rect = GSRenderer::compute_effective_texture_rect(desc);
 			takedown_resolve_texture_state(b, desc);
-			if (getenv("NS2H_TEX_OWNER") && (b.tex_psm == 19 || b.tex_psm == 20))
+			if (TD_ENV_SET("NS2H_TEX_OWNER") && (b.tex_psm == 19 || b.tex_psm == 20))
 			{
 				static std::map<std::pair<uint32_t, uint32_t>, uint64_t> owners;
 				const uint32_t owner = takedown_memory.drawn_by(b.tex_tbp0, b.tex_tbw, b.tex_psm, 0, 0, desc.rect.width, desc.rect.height, 0, true);
@@ -2606,13 +2605,13 @@ void GSInterface::takedown_run_hybrid(uint32_t range, bool donor, bool live)
 				owners[{ b.tex_tbp0, owner }]++;
 			}
 			static int logged = 0;
-			if (getenv("NS2H_DEBUG") && logged++ < 20)
+			if (TD_ENV_SET("NS2H_DEBUG") && logged++ < 20)
 				LOGI("NS2H env: tbp %u tbw %u psm %u source %08x image %d vram %d pages %ux%u rect %u,%u %ux%u\n", b.tex_tbp0, b.tex_tbw, b.tex_psm, b.native_source,
 				     b.native_image ? 1 : 0, b.vram_texture ? 1 : 0, b.native_pages_w, b.native_pages_h, desc.rect.x, desc.rect.y, desc.rect.width, desc.rect.height);
 		}
 		const uint64_t p2 = __builtin_ia32_rdtsc();
 		hybrid_profile_cycles[23] += p2 - p1;   // donor handling
-		if (d.palette_texture && getenv("NS2H_PAL_OWNER"))
+		if (d.palette_texture && TD_ENV_SET("NS2H_PAL_OWNER"))
 		{
 			static std::map<uint32_t, uint64_t> owners;
 			const uint32_t cbp = uint32_t((d.tex0 >> 37) & 0x3fff);

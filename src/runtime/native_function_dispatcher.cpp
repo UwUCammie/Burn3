@@ -143,6 +143,19 @@ NativeFunctionDispatchResult NativeFunctionDispatcher::dispatch(const guest::Gue
 NativeFunctionDispatchResult
 NativeFunctionDispatcher::dispatch(const NativeFunctionPreparation& preparation,
                                    guest::R5900State& cpu, guest::EeMemory& memory) const {
+    return dispatch_impl(preparation, cpu, memory, true);
+}
+
+NativeFunctionDispatchResult
+NativeFunctionDispatcher::dispatch_prepared(const NativeFunctionPreparation& preparation,
+                                            guest::R5900State& cpu, guest::EeMemory& memory) const {
+    return dispatch_impl(preparation, cpu, memory, false);
+}
+
+NativeFunctionDispatchResult
+NativeFunctionDispatcher::dispatch_impl(const NativeFunctionPreparation& preparation,
+                                        guest::R5900State& cpu, guest::EeMemory& memory,
+                                        const bool resolve_again) const {
     if (!preparation.prepared()) {
         return {};
     }
@@ -166,7 +179,7 @@ NativeFunctionDispatcher::dispatch(const NativeFunctionPreparation& preparation,
         throw std::logic_error(
             "prepared native guest function exceeds its absolute execution ceiling");
     }
-    if (entry->limit_resolver) {
+    if (resolve_again && entry->limit_resolver) {
         const NativeFunctionPrepareContext prepare_context{cpu, memory, entry->metadata.address};
         const auto live_limits = entry->limit_resolver(prepare_context);
         if (!live_limits || !(*live_limits == preparation.limits)) {

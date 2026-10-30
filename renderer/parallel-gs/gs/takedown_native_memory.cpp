@@ -269,7 +269,8 @@ void fast_upload(uint8_t *vram, const void *upload_data, uint32_t base_256, uint
 	{
 		uint32_t x, count, block_u, in_block, start;
 	};
-	std::vector<Piece> pieces;
+	static thread_local std::vector<Piece> pieces;
+	pieces.clear();
 	for (uint32_t x = x0; x < x1;)
 	{
 		const uint32_t ex = (x + dst_x) & 2047u;
@@ -342,7 +343,7 @@ void upload_range(uint8_t *vram, const void *payload, uint32_t base_256, uint32_
 } // namespace
 
 TakedownNativeMemory::TakedownNativeMemory(uint32_t vram_size)
-	: vram(vram_size, 0), rendered(vram_size / kBlockBytes, 0), owners(vram_size / kBlockBytes),
+	: vram(vram_size, 0), overlays(vram_size / kBlockBytes / 32u), pend_page_slot(vram_size / kBlockBytes / 32u, 0xffu), pend_page_mask(vram_size / kBlockBytes / 32u, 0), rendered(vram_size / kBlockBytes, 0), owners(vram_size / kBlockBytes),
 	  block_serial(vram_size / kBlockBytes, 0), exact_lanes(vram_size / kBlockBytes, 0),
 	  lane_serial(vram_size / kBlockBytes), page_serial(vram_size / kBlockBytes / 32u, 0),
 	  page_owner(vram_size / kBlockBytes / 32u, kNoOwner), page_run_start(vram_size / kBlockBytes / 32u, 0),
@@ -361,6 +362,9 @@ struct BlockMap
 	bool exact = false;
 	uint32_t pw_log2 = 0, ph_log2 = 0, bw_log2 = 0, bh_log2 = 0, stride_shift = 0, xor_bits = 0;
 	uint8_t table[32] = {};
+	// For a page-aligned base: the page's blocks (bit n: block n of the page) in block
+	// rows by0..by1 / block columns bx0..bx1 (a rectangle's blocks are their intersection).
+	uint32_t row_range[8][8] = {}, col_range[8][8] = {};
 };
 
 const BlockMap &block_map(uint32_t psm)
@@ -407,6 +411,22 @@ const BlockMap &block_map(uint32_t psm)
 		if (got != want)
 			map.exact = false;
 	}
+	if (map.exact && bx_count <= 8 && by_count <= 8)
+		for (uint32_t lo = 0; lo < 8; lo++)
+			for (uint32_t hi = lo; hi < 8; hi++)
+			{
+				uint32_t rows = 0, cols = 0;
+				for (uint32_t by = lo; by <= hi && by < by_count; by++)
+					for (uint32_t bx = 0; bx < bx_count; bx++)
+						rows |= 1u << (map.table[by * bx_count + bx] ^ map.xor_bits);
+				for (uint32_t bx = lo; bx <= hi && bx < bx_count; bx++)
+					for (uint32_t by = 0; by < by_count; by++)
+						cols |= 1u << (map.table[by * bx_count + bx] ^ map.xor_bits);
+				map.row_range[lo][hi] = rows;
+				map.col_range[lo][hi] = cols;
+			}
+	else
+		map.exact = map.exact && bx_count <= 8 && by_count <= 8;
 	return map;
 }
 } // namespace
@@ -456,41 +476,230 @@ void TakedownNativeMemory::for_each_block(uint32_t base_block, uint32_t buffer_w
 void TakedownNativeMemory::touch_draw(uint32_t base_block, uint32_t buffer_width_64, uint32_t psm, uint32_t x, uint32_t y,
                                  uint32_t width, uint32_t height, bool by_draw, uint32_t lanes, uint32_t owner)
 {
-	const uint32_t serial = ++write_counter;
+	// Draws are queued: per page, the set of blocks they wrote, grouped by effect
+	// (lanes, writing target, exact flag). Effects that share a page are applied in
+	// draw order (a queued draw of another effect on a page flushes first); within
+	// one effect the order does not matter, so a block drawn many times is updated
+	// once. Anything that reads or changes the bookkeeping applies the queue first.
+	const uint32_t effect_exact = by_draw && marking_exact ? 1u : 0u;
+	const uint32_t writer = by_draw ? owner : kNoOwner;
+	for (;;)
+	{
+		uint32_t idx = pend_slot_count;
+		for (uint32_t i = 0; i < pend_slot_count; i++)
+		{
+			const PendingSlot &slot = pend_slots[i];
+			if (slot.lanes == lanes && slot.writer == writer && slot.exact == effect_exact)
+			{
+				idx = i;
+				break;
+			}
+		}
+		if (idx == pend_slot_count)
+		{
+			if (idx == kMaxPendingSlots)
+			{
+				flush_pending();
+				idx = 0;
+			}
+			PendingSlot &slot = pend_slots[idx];
+			slot.lanes = lanes;
+			slot.writer = writer;
+			slot.exact = effect_exact;
+			slot.pages.clear();
+			pend_slot_count = idx + 1;
+		}
+		PendingSlot &slot = pend_slots[idx];
+		bool conflict = false;
+		uint8_t *page_slot = pend_page_slot.data();
+		uint32_t *page_mask = pend_page_mask.data();
+#ifdef RC_SELFTEST
+		static std::vector<uint32_t> dbg_cur;
+		dbg_cur.assign(512, 0);
+#endif
+		const auto add_page = [&](uint32_t page, uint32_t mask) {
+#ifdef RC_SELFTEST
+			dbg_cur[page] |= mask;
+#endif
+			const uint8_t owner_slot = page_slot[page];
+			if (owner_slot != idx)
+			{
+				if (owner_slot != 0xffu)
+				{
+					conflict = true;
+					return;
+				}
+				page_slot[page] = uint8_t(idx);
+				page_mask[page] = 0;
+				slot.pages.push_back(page);
+			}
+			page_mask[page] |= mask;
+		};
+		const auto add_block = [&](uint32_t block) { add_page(block >> 5, 1u << (block & 31u)); };
+		const BlockMap &map = block_map(psm);
+		if (width && height && map.exact && rendered.size() == 16384u && base_block % 32u == 0 && x + width <= 2048u &&
+		    y + height <= 2048u)
+		{
+			// A page-aligned base: each page of the rectangle holds exactly its own 32
+			// blocks, a covered page is all of them.
+			const uint32_t stride = buffer_width_64 >> map.stride_shift;
+			const uint32_t first_py = y >> map.ph_log2, last_py = (y + height - 1) >> map.ph_log2;
+			const uint32_t first_px = x >> map.pw_log2, last_px = (x + width - 1) >> map.pw_log2;
+			const uint32_t base_page = base_block / 32u;
+			for (uint32_t py = first_py; py <= last_py && !conflict; py++)
+			{
+				const uint32_t y0 = std::max(y, py << map.ph_log2), y1 = std::min(y + height, (py + 1) << map.ph_log2);
+				const uint32_t by0 = (y0 - (py << map.ph_log2)) >> map.bh_log2,
+				               by1 = (y1 - 1 - (py << map.ph_log2)) >> map.bh_log2;
+				const uint32_t rows = map.row_range[by0][by1];
+				for (uint32_t px = first_px; px <= last_px && !conflict; px++)
+				{
+					const uint32_t x0 = std::max(x, px << map.pw_log2), x1 = std::min(x + width, (px + 1) << map.pw_log2);
+					const uint32_t bx0 = (x0 - (px << map.pw_log2)) >> map.bw_log2,
+					               bx1 = (x1 - 1 - (px << map.pw_log2)) >> map.bw_log2;
+					add_page((py * stride + px + base_page) & 511u, rows & map.col_range[bx0][bx1]);
+				}
+			}
+		}
+		else
+			for_each_block(base_block, buffer_width_64, psm, x, y, width, height, add_block);
+#ifdef RC_SELFTEST
+		if (!conflict)
+		{
+			static std::vector<uint32_t> ref;
+			ref.assign(512, 0);
+			for_each_block(base_block, buffer_width_64, psm, x, y, width, height, [&](uint32_t b) { ref[b >> 5] |= 1u << (b & 31u); });
+			for (uint32_t pg = 0; pg < 512; pg++)
+			{
+				const uint32_t got = dbg_cur[pg];
+				if (ref[pg] != got)
+				{
+					fprintf(stderr, "SELFTEST MISSING page %u ref %08x got %08x psm %x base %u x %u y %u w %u h %u\n", pg, ref[pg], got, psm, base_block, x, y, width, height);
+					abort();
+				}
+			}
+		}
+#endif
+		if (!conflict)
+			return;
+		flush_pending();
+	}
+}
+
+void TakedownNativeMemory::overlay_apply(uint32_t page, uint32_t lanes, uint32_t writer, uint32_t serial, bool rendered_bit,
+                                         bool exact_bit)
+{
+	PageOverlay &o = overlays[page];
+	if (!o.ulanes)
+		overlay_count++;
+	for (uint32_t lane = 0; lane < 4; lane++)
+		if (lanes & (1u << lane))
+		{
+			o.owner[lane] = writer;
+			o.lane_serial[lane] = serial;
+		}
+	o.ulanes = uint8_t(o.ulanes | lanes);
+	o.rendered_bits = uint8_t(rendered_bit ? (o.rendered_bits | lanes) : (o.rendered_bits & ~lanes));
+	o.exact_bits = uint8_t(exact_bit ? (o.exact_bits | lanes) : (o.exact_bits & ~lanes));
+	o.block_serial = serial;
+}
+
+void TakedownNativeMemory::materialize_page(uint32_t page) const
+{
+	auto *self = const_cast<TakedownNativeMemory *>(this);
+	PageOverlay &o = self->overlays[page];
+	const uint32_t lanes = o.ulanes;
+	if (!lanes)
+		return;
+	for (uint32_t block = page * 32u; block < page * 32u + 32u; block++)
+	{
+		self->rendered[block] = uint8_t((self->rendered[block] & ~lanes) | o.rendered_bits);
+		self->exact_lanes[block] = uint8_t((self->exact_lanes[block] & ~lanes) | o.exact_bits);
+		for (uint32_t lane = 0; lane < 4; lane++)
+			if (lanes & (1u << lane))
+			{
+				self->owners[block][lane] = o.owner[lane];
+				self->lane_serial[block][lane] = o.lane_serial[lane];
+			}
+		self->block_serial[block] = o.block_serial;
+	}
+	o.ulanes = 0;
+	self->overlay_count--;
+}
+
+void TakedownNativeMemory::materialize_all() const
+{
+	if (!overlay_count)
+		return;
+	for (uint32_t page = 0; page < uint32_t(overlays.size()); page++)
+		materialize_page(page);
+}
+
+void TakedownNativeMemory::flush_pending() const
+{
+	auto *self = const_cast<TakedownNativeMemory *>(this);
 	static const char *trace = getenv("TAKEDOWN_NATIVE_TRACE_BLOCK");
 	static const uint32_t trace_block = trace ? uint32_t(atoi(trace)) : ~0u;
-	const uint32_t writer = by_draw ? owner : kNoOwner;
-	const bool keep[4] = { !(lanes & 1u), !(lanes & 2u), !(lanes & 4u), !(lanes & 8u) };
-	const bool set_exact = by_draw && marking_exact;
-	uint8_t *rendered_data = rendered.data(), *exact_data = exact_lanes.data();
-	auto *owner_data = owners.data();
-	auto *serial_data = lane_serial.data();
-	uint32_t *block_serial_data = block_serial.data();
-	uint32_t *page_serial_data = page_serial.data(), *page_owner_data = page_owner.data(),
-	         *page_run_data = page_run_start.data();
-	for_each_block(base_block, buffer_width_64, psm, x, y, width, height, [&](uint32_t block) {
-		if (block == trace_block)
-			fprintf(stderr, "native memory: block %u %s by %s %u/%u psm %02x rect %u,%u %ux%u\n", block,
-			        by_draw ? "drawn" : "written", by_draw ? "draw" : "transfer", base_block, buffer_width_64, psm, x, y,
-			        width, height);
-		rendered_data[block] = uint8_t(by_draw ? (rendered_data[block] | lanes) : (rendered_data[block] & ~lanes));
-		auto &block_owners = owner_data[block];
-		auto &block_serials = serial_data[block];
-		for (uint32_t lane = 0; lane < 4; lane++)
+	uint8_t *rendered_data = self->rendered.data(), *exact_data = self->exact_lanes.data();
+	auto *owner_data = self->owners.data();
+	auto *serial_data = self->lane_serial.data();
+	uint32_t *block_serial_data = self->block_serial.data();
+	uint32_t *page_serial_data = self->page_serial.data(), *page_owner_data = self->page_owner.data(),
+	         *page_run_data = self->page_run_start.data();
+	const uint32_t slots = pend_slot_count;
+	
+	self->pend_slot_count = 0;
+	for (uint32_t i = 0; i < slots; i++)
+	{
+		PendingSlot &slot = self->pend_slots[i];
+		const uint32_t lanes = slot.lanes, writer = slot.writer;
+		const bool set_exact = slot.exact != 0;
+		const uint32_t serial = ++self->write_counter;
+		const bool keep[4] = { !(lanes & 1u), !(lanes & 2u), !(lanes & 4u), !(lanes & 8u) };
+		const bool full = lanes == 0xfu;
+		for (uint32_t page : slot.pages)
 		{
-			block_owners[lane] = keep[lane] ? block_owners[lane] : writer;
-			block_serials[lane] = keep[lane] ? block_serials[lane] : serial;
+			uint32_t mask = self->pend_page_mask[page];
+			self->pend_page_slot[page] = 0xffu;
+			if (page_owner_data[page] != writer)
+			{
+				page_owner_data[page] = writer;
+				page_run_data[page] = serial;
+			}
+			page_serial_data[page] = serial;
+			if (mask == ~0u)
+			{
+				self->overlay_apply(page, lanes, writer, serial, true, set_exact);
+				continue;
+			}
+			materialize(page);
+			while (mask)
+			{
+				const uint32_t block = page * 32u + uint32_t(__builtin_ctz(mask));
+				mask &= mask - 1u;
+				if (block == trace_block)
+					fprintf(stderr, "native memory: block %u drawn by draw (queued)\n", block);
+				rendered_data[block] = uint8_t(rendered_data[block] | lanes);
+				auto &block_owners = owner_data[block];
+				auto &block_serials = serial_data[block];
+				if (full)
+					for (uint32_t lane = 0; lane < 4; lane++)
+					{
+						block_owners[lane] = writer;
+						block_serials[lane] = serial;
+					}
+				else
+					for (uint32_t lane = 0; lane < 4; lane++)
+					{
+						block_owners[lane] = keep[lane] ? block_owners[lane] : writer;
+						block_serials[lane] = keep[lane] ? block_serials[lane] : serial;
+					}
+				exact_data[block] = uint8_t(set_exact ? (exact_data[block] | lanes) : (exact_data[block] & ~lanes));
+				block_serial_data[block] = serial;
+			}
 		}
-		exact_data[block] = uint8_t(set_exact ? (exact_data[block] | lanes) : (exact_data[block] & ~lanes));
-		block_serial_data[block] = serial;
-		const uint32_t page = block >> 5;
-		if (page_owner_data[page] != writer)
-		{
-			page_owner_data[page] = writer;
-			page_run_data[page] = serial;
-		}
-		page_serial_data[page] = serial;
-	});
+		slot.pages.clear();
+	}
 }
 
 void TakedownNativeMemory::touch(uint32_t base_block, uint32_t buffer_width_64, uint32_t psm, uint32_t x, uint32_t y,
@@ -502,6 +711,10 @@ void TakedownNativeMemory::touch(uint32_t base_block, uint32_t buffer_width_64, 
 		touch_draw(base_block, buffer_width_64, psm, x, y, width, height, by_draw, lanes, owner);
 		return;
 	}
+	if (pend_slot_count)
+		for_each_page(base_block, buffer_width_64, psm, x, y, width, height, [&](uint32_t page) {
+			sync_page(page);
+		});
 	const uint32_t serial = ++write_counter;
 	static const char *trace = getenv("TAKEDOWN_NATIVE_TRACE_BLOCK");
 	static const uint32_t trace_block = trace ? uint32_t(atoi(trace)) : ~0u;
@@ -518,6 +731,7 @@ void TakedownNativeMemory::touch(uint32_t base_block, uint32_t buffer_width_64, 
 	// four lanes' owners and serials as they are.
 	const auto apply = [&](auto full_lanes) {
 		const auto one_block = [&](uint32_t block) {
+			materialize(block >> 5);
 			if (block == trace_block)
 				fprintf(stderr, "native memory: block %u %s by %s %u/%u psm %02x rect %u,%u %ux%u\n", block,
 				        by_draw ? "drawn" : "written", by_draw ? "draw" : "transfer", base_block, buffer_width_64, psm, x, y,
@@ -553,25 +767,10 @@ void TakedownNativeMemory::touch(uint32_t base_block, uint32_t buffer_width_64, 
 		};
 		// Whole pages (32 blocks each) that are consecutive in memory.
 		const auto page_run = [&](uint32_t first_page, uint32_t count) {
-			const uint32_t first = first_page * 32u, n = count * 32u;
-			for (uint32_t i = first; i < first + n; i++)
-				rendered_data[i] = uint8_t(by_draw ? (rendered_data[i] | lanes) : (rendered_data[i] & ~lanes));
-			for (uint32_t i = first; i < first + n; i++)
-			{
-				auto &block_owners = owner_data[i];
-				auto &block_serials = serial_data[i];
-				for (uint32_t lane = 0; lane < 4; lane++)
-				{
-					block_owners[lane] = (decltype(full_lanes)::value || !keep[lane]) ? writer : block_owners[lane];
-					block_serials[lane] = (decltype(full_lanes)::value || !keep[lane]) ? serial : block_serials[lane];
-				}
-			}
-			for (uint32_t i = first; i < first + n; i++)
-				exact_data[i] = uint8_t(set_exact ? (exact_data[i] | lanes) : (exact_data[i] & ~lanes));
-			for (uint32_t i = first; i < first + n; i++)
-				block_serial_data[i] = serial;
 			for (uint32_t page = first_page; page < first_page + count; page++)
 			{
+				// (Pending draws and the page's blocks were dealt with above.)
+				overlay_apply(page, lanes, writer, serial, by_draw, set_exact);
 				if (page_owner_data[page] != writer)
 				{
 					page_owner_data[page] = writer;
@@ -627,6 +826,7 @@ void TakedownNativeMemory::touch(uint32_t base_block, uint32_t buffer_width_64, 
 void TakedownNativeMemory::upload(const BITBLTBUFBits &bitbltbuf, const TRXPOSBits &trxpos, const TRXREGBits &trxreg,
                                   const void *payload, size_t bytes)
 {
+	sync();
 	const uint32_t psm = uint32_t(bitbltbuf.DPSM), dbp = uint32_t(bitbltbuf.DBP), dbw = uint32_t(bitbltbuf.DBW);
 	const uint32_t dx = uint32_t(trxpos.DSAX), dy = uint32_t(trxpos.DSAY);
 	const uint32_t width = uint32_t(trxreg.RRW), height = uint32_t(trxreg.RRH);
@@ -677,7 +877,8 @@ void TakedownNativeMemory::upload(const BITBLTBUFBits &bitbltbuf, const TRXPOSBi
 	case PSMT4HH: upload_range<PSMT4HH>(vram.data(), payload, dbp, dbw, dx, dy, width, skip, written, mask); break;
 	}
 	// Keep this payload to recognise the next flush of the transfer.
-	if (bytes <= kMaxKeptUpload)
+	// (A transfer that delivered every pixel has no later prefix to recognise.)
+	if (bytes <= kMaxKeptUpload && size_t(written) < size_t(width) * height)
 	{
 		last_upload.payload.resize(bytes);
 		std::memcpy(last_upload.payload.data() + skip * bits / 8, static_cast<const uint8_t *>(payload) + skip * bits / 8,
@@ -698,6 +899,7 @@ void TakedownNativeMemory::upload(const BITBLTBUFBits &bitbltbuf, const TRXPOSBi
 void TakedownNativeMemory::copy_local(const BITBLTBUFBits &bitbltbuf, const TRXPOSBits &trxpos,
                                       const TRXREGBits &trxreg)
 {
+	sync();
 	last_upload.valid = false;
 	const uint32_t spsm = uint32_t(bitbltbuf.SPSM), dpsm = uint32_t(bitbltbuf.DPSM);
 	const uint32_t width = uint32_t(trxreg.RRW), height = uint32_t(trxreg.RRH);
@@ -710,7 +912,11 @@ void TakedownNativeMemory::copy_local(const BITBLTBUFBits &bitbltbuf, const TRXP
 	bool source_rendered = false;
 	for_each_block(uint32_t(bitbltbuf.SBP), uint32_t(bitbltbuf.SBW), spsm, uint32_t(trxpos.SSAX), uint32_t(trxpos.SSAY),
 	               width, height,
-	               [&](uint32_t block) { source_rendered |= (rendered[block] & format_lanes(spsm)) != 0; });
+	               [&](uint32_t block) {
+		               sync_page(block >> 5);
+		               materialize(block >> 5);
+		               source_rendered |= (rendered[block] & format_lanes(spsm)) != 0;
+		               });
 	const auto element = [&](uint32_t x, uint32_t y, bool dst) {
 		return dst ? swizzle_PS2(x & 2047u, y & 2047u, uint32_t(bitbltbuf.DBP), uint32_t(bitbltbuf.DBW), dpsm, mask)
 		           : swizzle_PS2(x & 2047u, y & 2047u, uint32_t(bitbltbuf.SBP), uint32_t(bitbltbuf.SBW), spsm, mask);
@@ -759,6 +965,7 @@ void TakedownNativeMemory::copy_local(const BITBLTBUFBits &bitbltbuf, const TRXP
 void TakedownNativeMemory::write_pixel32(uint32_t base_block, uint32_t buffer_width_64, uint32_t x, uint32_t y,
                                          uint32_t value, uint32_t keep)
 {
+	sync();
 	last_upload.valid = false;
 	const uint32_t mask = uint32_t(vram.size()) - 1;
 	const uint32_t byte = (swizzle_PS2(x & 2047u, y & 2047u, base_block, buffer_width_64, PSMCT32, mask) * 4) & mask;
@@ -776,6 +983,7 @@ void TakedownNativeMemory::written(uint32_t base_block, uint32_t buffer_width_64
 
 void TakedownNativeMemory::load_clut(const TEX0Bits &tex0, const TEXCLUTBits &texclut)
 {
+	sync();
 	// Port of clut_write.comp (without the GS's forwarded-CLUT speed hack).
 	const uint32_t psm = uint32_t(tex0.PSM);
 	uint32_t cpsm = uint32_t(tex0.CPSM);
@@ -790,7 +998,8 @@ void TakedownNativeMemory::load_clut(const TEX0Bits &tex0, const TEXCLUTBits &te
 	const uint32_t cbw = csm2 ? uint32_t(texclut.CBW) : 0u;
 	const uint32_t mask = uint32_t(vram.size()) - 1;
 
-	if (getenv("TAKEDOWN_NATIVE_TRACE_CLUT"))
+	static const bool trace_clut = getenv("TAKEDOWN_NATIVE_TRACE_CLUT") != nullptr;
+	if (trace_clut)
 	{
 		const bool drawn = reads_rendered(cbp, csm2 ? cbw : 1u, cpsm, 0, 0, csm2 ? 256u : 16u, csm2 ? 1u : 16u);
 		fprintf(stderr, "native clut: load CBP %u CPSM %02x PSM %02x CSM %u CSA %u%s\n", cbp, cpsm, psm, csm2 ? 1u : 0u,
@@ -892,9 +1101,12 @@ void TakedownNativeMemory::clear_exact(uint32_t base_block, uint32_t buffer_widt
 	if (!lanes || x1 < x0 || y1 < y0)
 		return;
 	// A change of state like a write: serials move so cached views are rebuilt.
+	sync(); // (earlier draws first: their serials must stay below this one)
 	const uint32_t serial = ++write_counter;
 	for_each_block(base_block, buffer_width_64, psm, uint32_t(x0), uint32_t(y0), uint32_t(x1 - x0 + 1),
 	               uint32_t(y1 - y0 + 1), [&](uint32_t block) {
+		               sync_page(block >> 5);
+		               materialize(block >> 5);
 		               exact_lanes[block] = uint8_t(exact_lanes[block] & ~lanes);
 		               for (uint32_t lane = 0; lane < 4; lane++)
 			               if (lanes & (1u << lane))
@@ -979,7 +1191,11 @@ bool TakedownNativeMemory::reads_rendered(uint32_t base_block, uint32_t buffer_w
 			}
 			bool any = false;
 			for_each_block(base_block, buffer_width_64, psm, sx0, sy0, sx1 - sx0, sy1 - sy0,
-			               [&](uint32_t b) { any |= (rendered[b] & lanes) != 0; });
+			               [&](uint32_t b) {
+			               sync_page(b >> 5);
+			               materialize(b >> 5);
+			               any |= (rendered[b] & lanes) != 0;
+			               });
 			if (any)
 				return true;
 		}
@@ -1024,35 +1240,84 @@ uint64_t TakedownNativeMemory::content_hash(uint32_t base_block, uint32_t buffer
 	return h;
 }
 
+bool TakedownNativeMemory::page_state(uint32_t page, std::array<std::array<uint32_t, 4>, 32> &owners_out,
+                                      std::array<std::array<uint32_t, 4>, 32> &serials_out,
+                                      std::array<uint8_t, 32> &exact_out) const
+{
+	sync_page(page);
+	const PageOverlay &o = overlays[page];
+	const uint32_t over = o.ulanes;
+	bool undrawn = false;
+	for (uint32_t b = 0; b < 32; b++)
+	{
+		const uint32_t block = page * 32u + b;
+		owners_out[b] = owners[block];
+		serials_out[b] = lane_serial[block];
+		uint32_t exact = exact_lanes[block];
+		if (over)
+		{
+			for (uint32_t lane = 0; lane < 4; lane++)
+				if (over & (1u << lane))
+				{
+					owners_out[b][lane] = o.owner[lane];
+					serials_out[b][lane] = o.lane_serial[lane];
+				}
+			exact = (exact & ~over) | o.exact_bits;
+		}
+		exact_out[b] = uint8_t(exact);
+		for (uint32_t ow : owners_out[b])
+			undrawn |= ow == kNoOwner;
+	}
+	return undrawn;
+}
+
 const TakedownNativeMemory::PageSummary &TakedownNativeMemory::summary(uint32_t page) const
 {
 	PageSummary &sum = summaries[page];
 	if (sum.serial == page_serial[page])
 		return sum;
+	sync_page(page);
+	if (sum.serial == page_serial[page])
+		return sum;
 	sum.serial = page_serial[page];
-	sum.rendered = 0;
-	sum.exact = sum.other = 0;
-	for (uint32_t b = 0; b < 32; b++)
+	// Lanes a whole-page overlay stands for are uniform; the others come from the blocks.
+	const PageOverlay &o = overlays[page];
+	const uint32_t over = o.ulanes;
+	uint32_t rendered_or = 0, exact_or = 0, other = 0;
+	for (uint32_t b = 0; b < 32 && over != 0xfu; b++)
 	{
 		const uint32_t block = page * 32u + b;
-		sum.rendered |= rendered[block];
-		sum.exact |= exact_lanes[block];
+		rendered_or |= rendered[block];
+		exact_or |= exact_lanes[block];
 		for (uint32_t lane = 0; lane < 4; lane++)
 			if (owners[block][lane] != kNoOwner && !(exact_lanes[block] & (1u << lane)))
-				sum.other |= uint8_t(1u << lane);
+				other |= 1u << lane;
 	}
+	sum.rendered = uint8_t((rendered_or & ~over) | (o.rendered_bits & over));
+	sum.exact = uint8_t((exact_or & ~over) | (o.exact_bits & over));
+	uint32_t other_over = 0;
+	for (uint32_t lane = 0; lane < 4; lane++)
+		if ((over & (1u << lane)) && o.owner[lane] != kNoOwner && !(o.exact_bits & (1u << lane)))
+			other_over |= 1u << lane;
+	sum.other = uint8_t((other & ~over) | other_over);
 	for (uint32_t lane = 0; lane < 4; lane++)
 	{
 		uint32_t drawn = kNoOwner, colour = kNoOwner;
-		for (uint32_t b = 0; b < 32; b++)
+		if (over & (1u << lane))
 		{
-			const uint32_t o = owners[page * 32u + b][lane];
-			if (o == kNoOwner)
-				continue;
-			drawn = drawn == kNoOwner ? o : drawn == o ? o : kMixedOwner;
-			if (o <= 0x30ffffffu)
-				colour = colour == kNoOwner ? o : colour == o ? o : kMixedOwner;
+			drawn = o.owner[lane];
+			colour = drawn != kNoOwner && drawn <= 0x30ffffffu ? drawn : kNoOwner;
 		}
+		else
+			for (uint32_t b = 0; b < 32; b++)
+			{
+				const uint32_t ow = owners[page * 32u + b][lane];
+				if (ow == kNoOwner)
+					continue;
+				drawn = drawn == kNoOwner ? ow : drawn == ow ? ow : kMixedOwner;
+				if (ow <= 0x30ffffffu)
+					colour = colour == kNoOwner ? ow : colour == ow ? ow : kMixedOwner;
+			}
 		sum.drawn[lane] = drawn;
 		sum.drawn_colour[lane] = colour;
 	}
@@ -1075,6 +1340,8 @@ uint32_t TakedownNativeMemory::drawn_by(uint32_t base_block, uint32_t buffer_wid
 		first = false;
 	};
 	const auto add_block = [&](uint32_t block) {
+		sync_page(block >> 5);
+		materialize(block >> 5);
 		for (uint32_t lane = 0; lane < 4; lane++)
 		{
 			if (!(lanes & (1u << lane)))
@@ -1193,7 +1460,10 @@ uint32_t TakedownNativeMemory::latest_write(uint32_t base_block, uint32_t buffer
 {
 	uint32_t latest = 0;
 	for_each_page(base_block, buffer_width_64, psm, x, y, width, height,
-	              [&](uint32_t page) { latest = std::max(latest, page_serial[page]); });
+	              [&](uint32_t page) {
+		              sync_page(page);
+		              latest = std::max(latest, page_serial[page]);
+		              });
 	return latest;
 }
 
@@ -1203,6 +1473,8 @@ void TakedownNativeMemory::pages_of_unique(uint32_t base_block, uint32_t buffer_
 {
 	static std::vector<uint8_t> seen;
 	seen.resize(page_serial.size());
+	if (pages.capacity() < pages.size() + 8)
+		pages.reserve(pages.size() + 16);
 	const size_t first = pages.size();
 	for (size_t i = 0; i < first; i++)
 		seen[pages[i]] = 1;
@@ -1232,6 +1504,7 @@ bool TakedownNativeMemory::unchanged_since(uint32_t base_block, uint32_t buffer_
 {
 	bool unchanged = true;
 	for_each_page(base_block, buffer_width_64, psm, x, y, width, height, [&](uint32_t page) {
+		sync_page(page);
 		if (page_serial[page] > serial &&
 		    (owner == kMixedOwner || owner == kNoOwner || page_owner[page] != owner || page_run_start[page] > serial))
 			unchanged = false;
@@ -1244,6 +1517,8 @@ uint64_t TakedownNativeMemory::version(uint32_t base_block, uint32_t buffer_widt
 {
 	uint64_t h = 0xcbf29ce484222325ull;
 	for_each_block(base_block, buffer_width_64, psm, x, y, width, height, [&](uint32_t block) {
+		sync_page(block >> 5);
+		materialize(block >> 5);
 		h = (h ^ (uint64_t(block) << 32 | block_serial[block])) * 0x100000001b3ull;
 	});
 	return h;
@@ -1267,6 +1542,78 @@ void TakedownNativeMemory::palette(const TEX0Bits &tex0, const TEXABits &texa, c
 }
 
 
+namespace
+{
+// One texture level of a format, a run of texels in one block row at a time.
+template <uint32_t PSM>
+void decode_level(const uint8_t *mem, uint32_t mask, const TakedownNativeMemory::Level &level, const BlockOffsets &table,
+                  const uint32_t *colours, uint32_t aem, uint32_t ta0, uint32_t ta1, uint32_t *rgba)
+{
+	const uint32_t bw = table.width, bh = table.height;
+	const bool plain = level.umsk == ~0u && level.ufix == 0;
+	const auto fetch = [&](uint32_t e) -> uint32_t {
+		switch (PSM)
+		{
+		case PSMCT24:
+		case PSMZ24:
+		{
+			uint32_t c;
+			std::memcpy(&c, &mem[(e * 4) & mask], 4);
+			return unpack24(c, aem, ta0);
+		}
+		case PSMCT16:
+		case PSMCT16S:
+		case PSMZ16:
+		case PSMZ16S:
+		{
+			uint16_t c;
+			std::memcpy(&c, &mem[(e * 2) & mask], 2);
+			return unpack16(c, aem, ta0, ta1);
+		}
+		case PSMT8:
+			return colours[mem[e & mask]];
+		case PSMT8H:
+			return colours[mem[(e * 4 + 3) & mask]];
+		case PSMT4:
+			return colours[(mem[(e >> 1) & mask] >> ((e & 1u) * 4)) & 0xfu];
+		case PSMT4HH:
+			return colours[mem[(e * 4 + 3) & mask] >> 4];
+		case PSMT4HL:
+			return colours[mem[(e * 4 + 3) & mask] & 0xfu];
+		default:
+		{
+			uint32_t out;
+			std::memcpy(&out, &mem[(e * 4) & mask], 4);
+			return out;
+		}
+		}
+	};
+	for (uint32_t j = 0; j < level.height; j++)
+	{
+		const uint32_t v = (((j & level.vmsk) + level.y) | level.vfix) & 2047u;
+		const uint32_t *row_offsets = &table.offsets[size_t(v & (bh - 1)) * bw];
+		uint32_t *out = rgba + size_t(j) * level.width;
+		uint32_t block_u = ~0u, block_start = 0;
+		uint32_t i = 0;
+		while (i < level.width)
+		{
+			const uint32_t u = (((i & level.umsk) + level.x) | level.ufix) & 2047u;
+			if ((u & ~(bw - 1)) != block_u)
+			{
+				block_u = u & ~(bw - 1);
+				block_start = swizzle_PS2(block_u, v & ~(bh - 1), level.base_block, level.buffer_width_64, PSM, mask);
+			}
+			// Without region masks, the texels up to the end of the block are consecutive.
+			const uint32_t run = plain ? std::min(level.width - i, bw - (u & (bw - 1))) : 1u;
+			const uint32_t *offsets = row_offsets + (u & (bw - 1));
+			for (uint32_t k = 0; k < run; k++)
+				out[i + k] = fetch(block_start + offsets[k]);
+			i += run;
+		}
+	}
+}
+} // namespace
+
 void TakedownNativeMemory::decode(const TEX0Bits &tex0, const TEXABits &texa, const Level &level, const uint16_t *clut,
                                   uint32_t *rgba) const
 {
@@ -1280,66 +1627,24 @@ void TakedownNativeMemory::decode(const TEX0Bits &tex0, const TEXABits &texa, co
 	if (indexed)
 		palette(tex0, texa, clut, colours);
 	const BlockOffsets &table = block_offsets(psm);
-	const uint32_t bw = table.width, bh = table.height;
 	const uint8_t *mem = vram.data();
-
-	for (uint32_t j = 0; j < level.height; j++)
+#define TD_DECODE(P) decode_level<P>(mem, mask, level, table, colours, aem, ta0, ta1, rgba)
+	switch (psm)
 	{
-		const uint32_t v = (((j & level.vmsk) + level.y) | level.vfix) & 2047u;
-		const uint32_t *row_offsets = &table.offsets[size_t(v & (bh - 1)) * bw];
-		uint32_t block_u = ~0u, block_start = 0;
-		for (uint32_t i = 0; i < level.width; i++)
-		{
-			const uint32_t u = (((i & level.umsk) + level.x) | level.ufix) & 2047u;
-			if ((u & ~(bw - 1)) != block_u)
-			{
-				block_u = u & ~(bw - 1);
-				block_start = swizzle_PS2(block_u, v & ~(bh - 1), level.base_block, level.buffer_width_64, psm, mask);
-			}
-			const uint32_t e = block_start + row_offsets[u & (bw - 1)];
-			uint32_t out;
-			switch (psm)
-			{
-			case PSMCT24:
-			case PSMZ24:
-			{
-				uint32_t c;
-				std::memcpy(&c, &mem[(e * 4) & mask], 4);
-				out = unpack24(c, aem, ta0);
-				break;
-			}
-			case PSMCT16:
-			case PSMCT16S:
-			case PSMZ16:
-			case PSMZ16S:
-			{
-				uint16_t c;
-				std::memcpy(&c, &mem[(e * 2) & mask], 2);
-				out = unpack16(c, aem, ta0, ta1);
-				break;
-			}
-			case PSMT8:
-				out = colours[mem[e & mask]];
-				break;
-			case PSMT8H:
-				out = colours[mem[(e * 4 + 3) & mask]];
-				break;
-			case PSMT4:
-				out = colours[(mem[(e >> 1) & mask] >> ((e & 1u) * 4)) & 0xfu];
-				break;
-			case PSMT4HH:
-				out = colours[mem[(e * 4 + 3) & mask] >> 4];
-				break;
-			case PSMT4HL:
-				out = colours[mem[(e * 4 + 3) & mask] & 0xfu];
-				break;
-			default:
-				std::memcpy(&out, &mem[(e * 4) & mask], 4);
-				break;
-			}
-			rgba[size_t(j) * level.width + i] = out;
-		}
+	case PSMCT24: TD_DECODE(PSMCT24); break;
+	case PSMZ24: TD_DECODE(PSMZ24); break;
+	case PSMCT16: TD_DECODE(PSMCT16); break;
+	case PSMCT16S: TD_DECODE(PSMCT16S); break;
+	case PSMZ16: TD_DECODE(PSMZ16); break;
+	case PSMZ16S: TD_DECODE(PSMZ16S); break;
+	case PSMT8: TD_DECODE(PSMT8); break;
+	case PSMT8H: TD_DECODE(PSMT8H); break;
+	case PSMT4: TD_DECODE(PSMT4); break;
+	case PSMT4HH: TD_DECODE(PSMT4HH); break;
+	case PSMT4HL: TD_DECODE(PSMT4HL); break;
+	case PSMZ32: TD_DECODE(PSMZ32); break;
+	default: TD_DECODE(PSMCT32); break;
 	}
+#undef TD_DECODE
 }
 }
-

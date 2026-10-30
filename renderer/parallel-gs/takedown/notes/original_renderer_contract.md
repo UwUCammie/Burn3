@@ -7,7 +7,7 @@ Evidence labels:
 - [L] release renderer logs `Burnout 3/.launcher/logs/*-renderer.log` (9 sessions, same exe, launched by the release stub).
 - [G] release game logs `*-game.log` in the same folder.
 - [STUB] `strings -n 2 -e l` of the release launcher stub `runtime-0.0.25-*/Burnout3.exe`.
-- [R] recovered logs and run data on the project's private recovery workspace. These come from several dev builds, so they are NOT authoritative for this exe. Used only for argv/env examples and for behaviour that the exe strings name.
+- [R] recovered logs and run data on `/run/media/cammie/EXT_2TB/Burnout-3-recomp/recovered_extras`. These come from several dev builds, so they are NOT authoritative for this exe. Used only for argv/env examples and for behaviour that the exe strings name.
 - [U] upstream paraLLEl-GS, `git show cc6184a:tools/gs_stream_replayer.cpp` (read-only).
 - [H] headers in `include/takedown/` (authoritative wire formats).
 - [INF] inference, not directly evidenced.

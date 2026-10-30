@@ -503,6 +503,93 @@ class Image:
         return entries
 
 
+# ---- Canonical-lane facts ----
+#
+# A lane is canonical when it is a clamp3 fixed point (a finite normal or a signed
+# zero): then the operand clamp of an FMAC is the identity on it. Every FMAC
+# result lane is a chop output, hence canonical, as is every ITOF result; loads,
+# FTOI and the I/Q registers say nothing. The facts are tracked per VF register
+# and ACC (index 32) as 4-bit lane masks in the write-mask order (X = 8 .. W = 1)
+# by a forward must-analysis over the node graph: entries know nothing (VF0 is
+# the constant 0,0,0,1.0), a join keeps what all its predecessors agree on.
+# Only the lanes an operation actually uses (its write mask) need to be canonical,
+# since the others are discarded before anything can observe them.
+
+ACC_FACT = 32
+
+
+def lane_bit(lane):
+    return 8 >> lane
+
+
+def fact_transfer(pair, facts):
+    out = list(facts)
+    up = pair.upper
+    low = pair.lower
+    dest = (pair.upper_word >> 21) & 0xF
+    info = FMAC.get(up["op"])
+    upper_vf = None
+    if info is not None:
+        kind, _operation, operand, writes_acc = info
+        mask = 0xE if operand == "Cross" else dest
+        target = ACC_FACT if writes_acc else up["fd"]
+        if kind == "A":
+            produced = mask
+        else:
+            left = facts[up["fs"]]
+            if operand == "Ft":
+                right = facts[up["ft"]]
+            elif operand == "FtLane":
+                right = 0xF if facts[up["ft"]] & lane_bit(up["lane"]) else 0
+            else:
+                right = 0
+            produced = mask & left & right
+        if target != 0:
+            out[target] = (facts[target] & ~mask & 0xF) | produced
+            if target != ACC_FACT:
+                upper_vf = target
+    elif up["op"] in ("Vitof", "Vftoi"):
+        target = up["fd"]
+        if target != 0:
+            produced = dest if up["op"] == "Vitof" else 0
+            out[target] = (facts[target] & ~dest & 0xF) | produced
+            upper_vf = target
+    if low is not None and low["ft"] != 0 and low["ft"] != upper_vf:
+        op = low["op"]
+        mask = low["mask"]
+        ft = low["ft"]
+        if op in ("Lq", "Lqi", "Lqd", "Mfir"):
+            out[ft] = facts[ft] & ~mask & 0xF
+        elif op in ("Move", "Mr32"):
+            source = facts[low["fs"]]
+            if op == "Mr32":
+                rotated = 0
+                for lane in range(4):
+                    if source & lane_bit((lane + 1) & 3):
+                        rotated |= lane_bit(lane)
+                source = rotated
+            out[ft] = (facts[ft] & ~mask & 0xF) | (source & mask)
+    return out
+
+
+def compute_facts(image, nodes):
+    entry_facts = [0] * 33
+    entry_facts[0] = 0xF
+    facts_in = {n.id: (list(entry_facts) if n.entry else [0xF] * 33) for n in nodes}
+    work = list(nodes)
+    while work:
+        node = work.pop()
+        if node.terminal:
+            continue
+        out = fact_transfer(image.pairs[node.pc], facts_in[node.id])
+        for _label, succ in node.succ:
+            merged = [a & b for a, b in zip(facts_in[succ.id], out)]
+            if merged != facts_in[succ.id]:
+                facts_in[succ.id] = merged
+                work.append(succ)
+    return facts_in
+
+
 # ---- C++ emission ----
 
 def vf(index):
@@ -586,6 +673,7 @@ class Emitter:
         out = self.out
         nodes = [n for n in image.order]
         memo = {}
+        self.facts = compute_facts(image, nodes)
         # Handoffs at joins rebuild the VI write history from saved values.
         self.transfers = {}
         for node in nodes:
@@ -815,25 +903,29 @@ class Emitter:
                 base = vf(up["fd"])
                 upper_target = ("vf", up["fd"])
             if kind == "A":
-                # MADD/MSUB consume the incoming ACC facts, never their own
-                # newly written result facts, so this reads nctx before the
-                # write below updates it.
-                canonical_acc = (operation in ("MultiplyAdd", "MultiplySubtract")
-                                 and nctx.acc == 0xF)
-                entry = ("vu0_native_fmac_canonical_acc" if canonical_acc
-                         else "vu0_native_fmac")
-                b.append(f"        const auto u = {entry}<vu0_detail::Vu0Fmac::{operation}, {mask}U>("
-                         f"{left}, {right}, acc, {base});")
+                # Operand lanes proven canonical skip their clamp3 (see the
+                # facts above); MADD/MSUB consume the incoming ACC facts.
+                facts = self.facts[node.id]
+                canon = 0
+                if operand != "Cross" and (facts[up["fs"]] & mask) == mask:
+                    canon |= 1
+                if operand == "Ft" and (facts[up["ft"]] & mask) == mask:
+                    canon |= 2
+                elif operand == "FtLane" and facts[up["ft"]] & lane_bit(up["lane"]):
+                    canon |= 2
+                if operation in ("MultiplyAdd", "MultiplySubtract") and (facts[ACC_FACT] & mask) == mask:
+                    canon |= 4
+                if canon:
+                    b.append(f"        const auto u = vu0_native_fmac_c<vu0_detail::Vu0Fmac::{operation}, {mask}U, {canon}U>("
+                             f"{left}, {right}, acc, {base});")
+                else:
+                    b.append(f"        const auto u = vu0_native_fmac<vu0_detail::Vu0Fmac::{operation}, {mask}U>("
+                             f"{left}, {right}, acc, {base});")
                 mac_local = f"mac{node.id}"
                 self.mac_locals.append(mac_local)
             else:
                 maximum = "true" if kind == "Max" else "false"
                 b.append(f"        const auto u = vu0_native_min_max<{maximum}, {mask}U>({left}, {right}, {base});")
-            if writes_acc:
-                # The committed ACC lanes are this FMAC's result for the written
-                # lanes (always chop output) and the untouched old ACC for the
-                # rest, so the write mask adds exactly those facts.
-                nctx.acc |= mask
         elif up["op"] in ("Vitof", "Vftoi"):
             function = "vu0_native_itof" if up["op"] == "Vitof" else "vu0_native_ftoi"
             b.append(f"        const auto u = {function}<{up['fraction']}U, {dest}U>({vf(up['fs'])}, {vf(up['fd'])});")

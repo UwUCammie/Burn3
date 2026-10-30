@@ -19,7 +19,8 @@
 // tint channels, retaining original animation geometry and fades exactly.
 // Flags: bit 0 keep the image's aspect (the width follows the height),
 //   bits 1-2 text size (0 normal, 1 small, 2 large), bit 3 right-aligned text,
-//   bit 4 Burnout font, bit 5 its heading font, bit 6 no outline, bit 7 a
+//   bit 4 Burnout font, bit 5 its heading font, bit 6 no outline (Burnout font
+//   text with both size bits is slanted), bit 7 a
 //   text's exact box follows its bytes as four f32 (x, y, width, height).
 // On a widescreen picture, items are placed together with the game's own UI
 // layer: they keep their 4:3 shape and move with the elements around them
@@ -58,6 +59,13 @@ constexpr std::uint8_t kParallelGsUiBurnoutFont = 1U << 4U;
 constexpr std::uint8_t kParallelGsUiHeadingFont = 1U << 5U;
 // Burnout font text without its black outline (the prompt bar's style).
 constexpr std::uint8_t kParallelGsUiNoOutline = 1U << 6U;
+// Burnout font text drawn like the game's menu text (both size bits set:
+// GlobalFont, or HeadFont with the heading bit): wider, slanted, with a drop
+// shadow under its outline. Other fonts ignore it.
+constexpr std::uint8_t kParallelGsUiTextItalic = 3U << 1U;
+constexpr float kParallelGsUiItalicSlant = 0.25f; // x per unit of height
+constexpr float kParallelGsUiItalicShadow = 2.0f; // picture pixels, down and right
+constexpr float kParallelGsUiItalicWidth = 1.15f; // the game draws menu text this much wider
 // Text in an exact (sub-pixel) box: corners[0..3] hold x, y, width and height
 // in picture pixels and are sent after the text; the integer fields are their
 // rounding.

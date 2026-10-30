@@ -24,6 +24,24 @@ using Granite::DrawPipeline;
 
 namespace
 {
+// The game runs under Wine on Linux and sends Windows paths; a Linux build of
+// the renderer (stream replays) opens Z:\ paths as the Unix paths they are.
+std::string host_path(const std::string &path)
+{
+#ifdef _WIN32
+	return path;
+#else
+	if (path.size() >= 3 && (path[0] == 'Z' || path[0] == 'z') && path[1] == ':' &&
+	    (path[2] == '\\' || path[2] == '/'))
+	{
+		std::string unix_path = path.substr(2);
+		std::replace(unix_path.begin(), unix_path.end(), '\\', '/');
+		return unix_path;
+	}
+	return path;
+#endif
+}
+
 using takedown::platform::ParallelGsUiItem;
 using takedown::platform::ParallelGsUiKind;
 using takedown::presentation::BitmapGlyphQuad;
@@ -193,22 +211,11 @@ void HostUiRenderer::render_flat(Vulkan::Device &device, Granite::FlatRenderer &
 			// Drawn by render_native, with the native UI shaders.
 			break;
 		case ParallelGsUiKind::Rectangle:
-			flat.render_quad(vec3(at, depth), extent, color);
+			// Drawn by render_native, in order with the text.
 			break;
 		case ParallelGsUiKind::Image:
-		{
-			const Vulkan::ImageView *view = image(device, item.text);
-			if (!view)
-				break;
-			const float w = float(view->get_image().get_width());
-			const float h = float(view->get_image().get_height());
-			vec2 image_extent = extent;
-			if ((item.flags & takedown::platform::kParallelGsUiKeepAspect) != 0)
-				image_extent.x = image_extent.y * w / h;
-			flat.render_textured_quad(*view, vec3(at, depth), image_extent, vec2(0.0f), vec2(w, h),
-			                          DrawPipeline::AlphaBlend, color, Vulkan::StockSampler::TrilinearClamp);
+			// Drawn by render_native, in order with the text.
 			break;
-		}
 		case ParallelGsUiKind::Text:
 		{
 			// Burnout font text is drawn by render_native while its font loads;
@@ -266,6 +273,26 @@ void HostUiRenderer::render_native(Vulkan::Device &device, Vulkan::CommandBuffer
 				continue;
 			append_image_quad(vertices, item);
 		}
+		else if (item.kind == ParallelGsUiKind::Rectangle)
+		{
+			view = white(device);
+			if (!view || item.width == 0 || item.height == 0)
+				continue;
+			append_rect(vertices, float(item.x), float(item.y), float(item.width), float(item.height), 0.0f, 0.0f,
+			            1.0f, 1.0f, colour_channels(item.colour));
+		}
+		else if (item.kind == ParallelGsUiKind::Image)
+		{
+			view = image(device, item.text);
+			if (!view)
+				continue;
+			float width = float(item.width);
+			if ((item.flags & takedown::platform::kParallelGsUiKeepAspect) != 0)
+				width = float(item.height) * float(view->get_image().get_width()) /
+				        float(view->get_image().get_height());
+			append_rect(vertices, float(item.x), float(item.y), width, float(item.height), 0.0f, 0.0f, 1.0f, 1.0f,
+			            colour_channels(item.colour));
+		}
 		else if (item.kind == ParallelGsUiKind::Text &&
 		         (item.flags & takedown::platform::kParallelGsUiBurnoutFont) != 0)
 		{
@@ -277,11 +304,32 @@ void HostUiRenderer::render_native(Vulkan::Device &device, Vulkan::CommandBuffer
 				continue;
 			const Box box = text_box(item);
 			const bool right_aligned = (item.flags & takedown::platform::kParallelGsUiAlignRight) != 0;
-			const std::vector<BitmapGlyphQuad> quads =
-				layout_bitmap_text(font->metrics, item.text, box.width, box.height, right_aligned);
+			const bool menu_style = (item.flags & takedown::platform::kParallelGsUiTextSizeMask) ==
+			                        takedown::platform::kParallelGsUiTextItalic;
+			// Menu text is laid out narrower and then widened to the box, as
+			// the game scales its menu font.
+			const float stretch = menu_style ? takedown::platform::kParallelGsUiItalicWidth : 1.0f;
+			std::vector<BitmapGlyphQuad> quads =
+				layout_bitmap_text(font->metrics, item.text, box.width / stretch, box.height, right_aligned);
 			if (quads.empty())
 				continue;
+			for (auto &quad : quads)
+			{
+				quad.x *= stretch;
+				quad.width *= stretch;
+			}
 			const auto colour = colour_channels(item.colour);
+			// Menu text has a drop shadow under its outline, as the game draws it.
+			if (menu_style && (item.flags & takedown::platform::kParallelGsUiNoOutline) == 0)
+			{
+				const std::array<float, 4> shadow{0.0f, 0.0f, 0.0f, colour[3] * 0.75f};
+				const float offset = takedown::platform::kParallelGsUiItalicShadow;
+				for (const BitmapGlyphQuad &quad : quads)
+				{
+					append_rect(vertices, box.x + quad.x + offset, box.y + quad.y + offset, quad.width, quad.height,
+					            quad.u, quad.v, quad.uw, quad.vh, shadow);
+				}
+			}
 			// The game's outline is drawn first, under the glyphs: the four
 			// diagonal copies, in black with the text's alpha.
 			if ((item.flags & takedown::platform::kParallelGsUiNoOutline) == 0)
@@ -304,6 +352,14 @@ void HostUiRenderer::render_native(Vulkan::Device &device, Vulkan::CommandBuffer
 			{
 				append_rect(vertices, box.x + quad.x, box.y + quad.y, quad.width, quad.height, quad.u, quad.v,
 				            quad.uw, quad.vh, colour);
+			}
+			// Slanted text leans about the box's bottom edge, as the game shears
+			// its menu text.
+			if (menu_style)
+			{
+				const float bottom = box.y + box.height;
+				for (auto &vertex : vertices)
+					vertex.x += takedown::platform::kParallelGsUiItalicSlant * (bottom - vertex.y);
 			}
 		}
 		else
@@ -347,7 +403,24 @@ void HostUiRenderer::render_native(Vulkan::Device &device, Vulkan::CommandBuffer
 	cmd.set_viewport(full);
 }
 
-void HostUiRenderer::reset_device_objects() { images_.clear(); }
+void HostUiRenderer::reset_device_objects()
+{
+	images_.clear();
+	white_.reset();
+}
+
+const Vulkan::ImageView *HostUiRenderer::white(Vulkan::Device &device)
+{
+	if (!white_)
+	{
+		const std::uint32_t pixel = 0xffffffffU;
+		const auto info = Vulkan::ImageCreateInfo::immutable_2d_image(1, 1, VK_FORMAT_R8G8B8A8_UNORM);
+		Vulkan::ImageInitialData initial = {};
+		initial.data = &pixel;
+		white_ = device.create_image(info, &initial);
+	}
+	return white_ ? &white_->get_view() : nullptr;
+}
 
 const Vulkan::ImageView *HostUiRenderer::image(Vulkan::Device &device, const std::string &path)
 {
@@ -355,7 +428,7 @@ const Vulkan::ImageView *HostUiRenderer::image(Vulkan::Device &device, const std
 	if (found == images_.end())
 	{
 		Vulkan::ImageHandle created;
-		std::ifstream file(path, std::ios::binary);
+		std::ifstream file(host_path(path), std::ios::binary);
 		std::vector<char> data((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
 		auto texture = data.empty() ? Vulkan::MemoryMappedTexture{} :
 		               Vulkan::load_texture_from_memory(data.data(), data.size(), Vulkan::ColorSpace::sRGB);
@@ -383,7 +456,7 @@ const HostUiRenderer::BurnoutFont *HostUiRenderer::burnout_font(Vulkan::Device &
 	const char *name = (item.flags & takedown::platform::kParallelGsUiHeadingFont) != 0 ? "HeadFont" :
 	                   (item.flags & takedown::platform::kParallelGsUiTextSizeMask) ==
 	                           takedown::platform::kParallelGsUiTextSmall ? "SmallFont" : "GlobalFont";
-	const std::string base = (std::filesystem::path(directory) / name).string();
+	const std::string base = (std::filesystem::path(host_path(directory)) / name).string();
 	auto found = burnout_fonts_.find(base);
 	if (found == burnout_fonts_.end())
 	{

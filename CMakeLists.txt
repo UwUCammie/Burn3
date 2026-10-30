@@ -398,9 +398,13 @@ target_sources(
         src/runtime/slus_21050_camera_fov.cpp
         src/runtime/slus_21050_controllers.cpp
         src/runtime/slus_21050_native_cars.cpp
+        src/runtime/slus_21050_car_trusted.cpp
         src/runtime/slus_21050_added_cars.cpp
         src/runtime/slus_21050_car_select.cpp
         src/runtime/slus_21050_native_pc_options.cpp
+        src/runtime/slus_21050_settings_page.cpp
+        src/runtime/slus_21050_online_count.cpp
+        src/net/online_player_count.cpp
         src/runtime/slus_21050_menu_mouse.cpp
         src/runtime/slus_21050_boot_volume.cpp
         src/runtime/slus_21050_scenery_detail.cpp
@@ -538,6 +542,8 @@ target_sources(
         src/ui/options_menu.cpp
         src/ui/pc_options_session.cpp
         src/ui/controls_session.cpp
+        src/ui/controls_editor.cpp
+        src/ui/settings_menu.cpp
         src/ui/mod_sync_session.cpp
     src/ui/car_select.cpp
 )
@@ -1311,6 +1317,7 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         tools/verify_native_model_live.cpp
         tools/verify_native_model_original_vu.cpp
         src/runtime/slus_21050_native_cars.cpp
+        src/runtime/slus_21050_car_trusted.cpp
         APPEND PROPERTY COMPILE_OPTIONS "-frounding-math" "-ffp-contract=off")
 endif()
 

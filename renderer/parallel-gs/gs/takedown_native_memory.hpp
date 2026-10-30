@@ -74,18 +74,22 @@ public:
 	// earlier: nothing in the rectangle was written since. Cheap: one lookup per page.
 	uint32_t latest_write(uint32_t base_block, uint32_t buffer_width_64, uint32_t psm, uint32_t x, uint32_t y,
 	                      uint32_t width, uint32_t height) const;
-	uint32_t write_serial() const { return write_counter; }
+	uint32_t write_serial() const { sync(); return write_counter; }
 	// Raw state for the exact effect path (NativeScene's GS memory model).
-	const std::array<uint32_t, 4> &block_owners(uint32_t block) const { return owners[block]; }
-	uint32_t page_write_serial(uint32_t page) const { return page_serial[page]; }
+	const std::array<uint32_t, 4> &block_owners(uint32_t block) const { sync_page(block >> 5); materialize(block >> 5); return owners[block]; }
+	uint32_t page_write_serial(uint32_t page) const { sync_page(page); return page_serial[page]; }
 	uint32_t page_count() const { return uint32_t(page_serial.size()); }
-	uint32_t block_write_serial(uint32_t block) const { return block_serial[block]; }
+	uint32_t block_write_serial(uint32_t block) const { sync_page(block >> 5); materialize(block >> 5); return block_serial[block]; }
+	// A page's per-block owners, per-lane write serials and exact lanes (as the accessors
+	// above give them); true when some lane of some block was never drawn.
+	bool page_state(uint32_t page, std::array<std::array<uint32_t, 4>, 32> &owners_out,
+	                std::array<std::array<uint32_t, 4>, 32> &serials_out, std::array<uint8_t, 32> &exact_out) const;
 	// Per byte lane of a block: the write counter when it was last written.
-	const std::array<uint32_t, 4> &lane_write_serials(uint32_t block) const { return lane_serial[block]; }
+	const std::array<uint32_t, 4> &lane_write_serials(uint32_t block) const { sync_page(block >> 5); materialize(block >> 5); return lane_serial[block]; }
 	// Lanes whose last write was a draw the exact path executes (NativeScene runs
 	// it on its GPU copy of GS memory, which then holds them; mirrors only
 	// approximate them). Draws marked while set_marking_exact(true) are such.
-	uint8_t block_exact(uint32_t block) const { return exact_lanes[block]; }
+	uint8_t block_exact(uint32_t block) const { sync_page(block >> 5); materialize(block >> 5); return exact_lanes[block]; }
 	void set_marking_exact(bool exact) { marking_exact = exact; }
 	// That draw was not executed after all: its lanes are ordinary drawn lanes.
 	void clear_exact(uint32_t base_block, uint32_t buffer_width_64, uint32_t psm, uint32_t fbmsk, int x0, int y0, int x1,
@@ -110,9 +114,12 @@ public:
 	bool pages_unchanged_since(const std::vector<uint32_t> &pages, uint32_t serial, uint32_t owner) const
 	{
 		for (uint32_t page : pages)
+		{
+			sync_page(page);
 			if (page_serial[page] > serial &&
 			    (owner == kMixedOwner || owner == kNoOwner || page_owner[page] != owner || page_run_start[page] > serial))
 				return false;
+		}
 		return true;
 	}
 	bool unchanged_since(uint32_t base_block, uint32_t buffer_width_64, uint32_t psm, uint32_t x, uint32_t y,
@@ -140,6 +147,47 @@ public:
 
 private:
 	std::vector<uint8_t> vram;
+	// Draws queued by touch_draw (see there): per page the effect slot that owns it
+	// (0xff: none) and the blocks of the page it wrote.
+	static constexpr uint32_t kMaxPendingSlots = 8;
+	struct PendingSlot
+	{
+		uint32_t lanes = 0, writer = 0, exact = 0;
+		std::vector<uint32_t> pages;
+	};
+	PendingSlot pend_slots[kMaxPendingSlots];
+	uint32_t pend_slot_count = 0;
+	std::vector<uint8_t> pend_page_slot;
+	std::vector<uint32_t> pend_page_mask;
+	void flush_pending() const;
+	// Whole pages a draw wrote (all 32 blocks) are kept as one record per page
+	// until a block of the page is read or written on its own: for the lanes in
+	// `ulanes` it stands for what the per-block arrays below hold.
+	struct PageOverlay
+	{
+		uint8_t ulanes = 0, rendered_bits = 0, exact_bits = 0;
+		uint32_t owner[4] = {}, lane_serial[4] = {}, block_serial = 0;
+	};
+	std::vector<PageOverlay> overlays;
+	uint32_t overlay_count = 0;
+	void overlay_apply(uint32_t page, uint32_t lanes, uint32_t writer, uint32_t serial, bool rendered_bit, bool exact_bit);
+	void materialize_page(uint32_t page) const;
+	void materialize_all() const;
+	void materialize(uint32_t page) const
+	{
+		if (overlays[page].ulanes)
+			materialize_page(page);
+	}
+	void sync_page(uint32_t page) const
+	{
+		if (pend_page_slot[page] != 0xffu)
+			flush_pending();
+	}
+	void sync() const
+	{
+		if (pend_slot_count)
+			flush_pending();
+	}
 	std::array<uint16_t, 512> clut_buffer = {};
 	uint64_t clut_serial = 0;
 	// Per 256-byte block: which bytes of its words a draw wrote since they were

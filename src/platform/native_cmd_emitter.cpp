@@ -2,7 +2,11 @@
 
 #include "takedown/platform/native_cmd_emitter.hpp"
 
+#include "takedown/runtime/slus_21050_car_trusted.hpp"
+
 #include <algorithm>
+#include <map>
+#include <tuple>
 #include <chrono>
 #include <cstdio>
 #include <unordered_set>
@@ -51,7 +55,7 @@ NativeCmdConfig native_cmd_config_from_environment() {
     if (c.mode < 0 || c.mode > 2) {
         c.mode = 0;
     }
-    c.elide = env_flag("TAKEDOWN_NATIVE_CMD_ELIDE", false);
+    c.elide = env_flag("TAKEDOWN_NATIVE_CMD_ELIDE", env_flag("TAKEDOWN_NATIVE_CMD_TRUST", true)); // trusted mode: 1-quadword tokens
     c.v2 = env_flag("TAKEDOWN_NATIVE_CMD_V2", true);
     c.echo = env_flag("TAKEDOWN_NATIVE_CMD_ECHO", false);
     c.force = env_flag("TAKEDOWN_NATIVE_CMD_FORCE", false);
@@ -80,6 +84,313 @@ bool native_cmd_renderer_supports(const std::filesystem::path& pipe_path, const 
 }
 
 struct NativeCmdEmitter::Impl {
+    // ---- TAKEDOWN_NATIVE_CMD_STATECHECK=1: what a world/prop microprogram leaves behind (opt3x trusted-mode analysis) ----
+    struct StateSlot {
+        std::uint64_t changed{};
+        std::unordered_map<std::uint64_t, std::uint64_t> values; // capped
+    };
+    struct ProgStats {
+        std::uint64_t launches{};
+        StateSlot vf[32], vi[32], acc;
+        std::uint64_t dm_changed[1024]{};
+        std::uint64_t dm_in_input[1024]{}; // changed inside [top, top + window)
+        std::uint64_t cont_values[8][2]{};
+        std::unordered_map<std::uint64_t, std::uint64_t> cont;
+        std::uint64_t flags_changed[3]{};
+        std::unordered_map<std::uint64_t, std::uint64_t> tops;
+    };
+    bool chk_on{false};
+    struct Decision;
+    std::FILE* train_file{nullptr};
+    std::uint64_t train_count{}, train_bytes{};
+    void train_dump(const Decision& d) {
+        if (train_file == nullptr || d.is_car || d.mesh_hold == nullptr || pkt_entry == nullptr || (d.draw.flags & nc::kDrawLines) != 0U || (++train_count & 3U) != 0U ||
+            train_bytes > (400ULL << 20U)) {
+            return;
+        }
+        const MeshEntry& me = *d.mesh_hold;
+        std::vector<std::uint32_t> tri;
+        nc::strip_to_triangles(me.m.flags, me.m.n, tri);
+        const std::uint32_t ntri = static_cast<std::uint32_t>(tri.size() / 3U);
+        const std::uint32_t words = (ntri + 31U) / 32U;
+        std::vector<std::uint32_t> mask(words, 0xFFFFFFFFU);
+        if ((d.draw.flags & nc::kDrawHasMask) != 0U) {
+            mask = d.mask;
+        }
+        const std::uint32_t head[8] = {0x324E5254U, d.draw.program, me.m.n, ntri, (d.draw.flags & nc::kDrawMirror) != 0U ? 1U : 0U, d.draw.prim, d.draw.nverts, d.draw.kicks};
+        std::fwrite(head, 4, 8, train_file);
+        std::fwrite(pkt_entry->dm_tail, 4, 96, train_file);
+        std::fwrite(d.draw.xform, 4, 12, train_file);
+        std::fwrite(me.m.pos.data(), 4, me.m.pos.size(), train_file);
+        std::fwrite(me.m.flags.data(), 4, me.m.flags.size(), train_file);
+        std::fwrite(me.m.uv.data(), 4, me.m.uv.size(), train_file);
+        std::vector<std::uint8_t> col(me.m.col);
+        col.resize(4U * me.m.n);
+        std::fwrite(col.data(), 1, col.size(), train_file);
+        std::fwrite(mask.data(), 4, words, train_file);
+        train_bytes += 4U * (8U + 96U + 12U + me.m.pos.size() + me.m.flags.size() + me.m.uv.size() + words) + col.size();
+    }
+
+    bool chk_active{false};
+    std::uint32_t chk_ad_lines{0};
+    std::uint64_t ent_launch[256][2]{}, ent_match[256][2]{};
+    // persistence of program writes into the next traced launch (per program+entry, per qw)
+    std::vector<std::uint8_t> chk_prev_before, chk_prev_after;
+    std::pair<int, int> chk_prev_key{-1, -1};
+    std::map<std::pair<int, int>, std::vector<std::pair<std::uint32_t, std::uint32_t>>> chk_survive; // key -> per qw (survived, overwritten)
+    std::map<std::tuple<int, int, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t>, std::uint64_t> chk_words; // (prog, entry, qw, lane, before, after) -> count
+    // scramble experiment
+    bool scr_on{false};
+    std::uint64_t scr_counter{0};
+    int scr_pending{-1};
+    std::uint64_t scr_launches[64]{}, scr_matched[64]{};
+    static constexpr int kScrTargets = 48;
+    void scr_apply(const guest::Vu1Launch& l) {
+        auto& state = const_cast<guest::Vu1State&>(l.state);
+        const int target = static_cast<int>(scr_counter++ % kScrTargets);
+        scr_pending = target;
+        std::uint64_t x = 0x9E3779B97F4A7C15ULL * (scr_counter + 17U);
+        const auto rnd = [&x]() { x ^= x << 13U; x ^= x >> 7U; x ^= x << 17U; return x; };
+        const auto rndf = [&rnd]() { return std::bit_cast<std::uint32_t>(static_cast<float>(static_cast<std::int64_t>(rnd() % 20001U) - 10000) / 7.0F); };
+        if (target >= 1 && target <= 31) {
+            for (auto& w : state.vectors[static_cast<std::size_t>(target)].words) { w = rndf(); }
+        } else if (target >= 32 && target <= 43) {
+            state.control[static_cast<std::size_t>(target - 31)] = static_cast<std::uint32_t>(rnd() & 0x3FFU);
+        } else if (target == 44) {
+            state.control[15] = static_cast<std::uint32_t>(rnd() & 0x3FFU);
+        } else if (target == 45) {
+            for (auto& w : state.accumulator.words) { w = rndf(); }
+        } else if (target == 46) {
+            for (std::size_t i = 16; i != 19; ++i) { state.control[i] = static_cast<std::uint32_t>(rnd() & 0xFFFFFU); }
+            for (auto& v : state.clip_flag_history) { v = static_cast<std::uint32_t>(rnd() & 0xFFFFFU); }
+            for (auto& v : state.mac_flag_history) { v = static_cast<std::uint32_t>(rnd() & 0xFFFU); }
+            for (auto& v : state.status_flag_history) { v = static_cast<std::uint32_t>(rnd() & 0xFFFU); }
+        }
+        if (target < 48) { ++scr_launches[target]; }
+    }
+    std::vector<std::uint8_t> chk_dm;
+    guest::Vu1State chk_state{};
+    const nc::ProgramInfo* chk_info{};
+    std::uint16_t chk_entry{}, chk_top{}, chk_itop{};
+    std::map<std::pair<int, int>, ProgStats> chk_stats;
+    std::map<std::tuple<int, int, int, std::uint32_t, int, bool>, std::pair<std::uint64_t, std::uint64_t>> chk_tags; // (strip_shape, flg, nreg, regs12, eop, token) -> (count, nloop sum)
+    std::map<std::uint64_t, std::uint64_t> chk_tag_prims;
+    std::uint32_t chk_examples{0};
+    std::map<std::tuple<int, int, std::uint32_t>, std::uint64_t> chk_dm_tags; // (program, entry, qw - top) of tag-shaped quadwords after the run
+    void chk_tag(const nc::Quad& q, const nc::Tags& t) {
+        const bool token = nc::is_token(q);
+        auto& e = chk_tags[{t.strip_shape ? 1 : 0, static_cast<int>(t.flg), static_cast<int>(t.nreg), q[2] & 0xFFFFFFFU, t.eop ? 1 : 0, token}];
+        ++e.first;
+        e.second += t.nloop;
+        if (t.strip_shape) {
+            ++chk_tag_prims[(static_cast<std::uint64_t>(t.prim) << 1U) | (t.pre ? 1U : 0U)];
+        } else if (!token && chk_examples < 24U) {
+            ++chk_examples;
+            std::fprintf(stderr, "[STATECHECK] non-strip tag: %08x %08x %08x %08x (flg %u nreg %u nloop %u eop %d)\n", q[3], q[2], q[1], q[0], t.flg, t.nreg, t.nloop, t.eop ? 1 : 0);
+        }
+    }
+    static void slot_note(StateSlot& s, std::uint64_t h) {
+        ++s.changed;
+        if (s.values.size() < 24U || s.values.count(h) != 0U) {
+            ++s.values[h];
+        }
+    }
+    void chk_before(const guest::Vu1Launch& l, const nc::ProgramInfo* info) {
+        if (!chk_prev_before.empty() && chk_prev_key.first >= 0) {
+            auto& sv = chk_survive[chk_prev_key];
+            sv.resize(1024);
+            const auto* nowp = reinterpret_cast<const std::uint8_t*>(l.data.data());
+            for (std::uint32_t q = 0; q != 1024U; ++q) {
+                if (std::memcmp(chk_prev_after.data() + q * 16U, chk_prev_before.data() + q * 16U, 16U) != 0) {
+                    if (std::memcmp(nowp + q * 16U, chk_prev_after.data() + q * 16U, 16U) == 0) {
+                        ++sv[q].first;
+                    } else {
+                        ++sv[q].second;
+                    }
+                }
+            }
+        }
+        chk_prev_key = {-1, -1};
+        chk_active = true;
+        chk_dm.assign(reinterpret_cast<const std::uint8_t*>(l.data.data()), reinterpret_cast<const std::uint8_t*>(l.data.data()) + 16384U);
+        chk_state = l.state;
+        chk_info = info;
+        chk_entry = l.entry;
+        chk_top = l.top;
+        chk_itop = l.itop;
+    }
+    void chk_after(const guest::Vu1Launch& l) {
+        if (!chk_active) {
+            return;
+        }
+        chk_active = false;
+        ProgStats& ps = chk_stats[{chk_info->program, chk_entry}];
+        ++ps.launches;
+        chk_prev_before = chk_dm;
+        chk_prev_after.assign(reinterpret_cast<const std::uint8_t*>(l.data.data()), reinterpret_cast<const std::uint8_t*>(l.data.data()) + 16384U);
+        chk_prev_key = {chk_info->program, chk_entry};
+        for (const std::uint32_t q : {1013U, 932U, 1011U, 1012U, 1006U, 1007U, 1008U, 1009U, 1010U, 1005U}) {
+            for (std::uint32_t lane = 0; lane != 4U; ++lane) {
+                std::uint32_t a, b;
+                std::memcpy(&a, chk_dm.data() + q * 16U + lane * 4U, 4U);
+                std::memcpy(&b, chk_prev_after.data() + q * 16U + lane * 4U, 4U);
+                if (a != b) {
+                    auto& e = chk_words[{chk_info->program, chk_entry, q, lane, a, b, 0U}];
+                    ++e;
+                }
+            }
+        }
+        ++ps.tops[chk_top];
+        const auto* now = reinterpret_cast<const std::uint8_t*>(l.data.data());
+        const std::uint32_t win = nc::window_quadwords(chk_info->decoder, chk_itop);
+        for (std::uint32_t q = 0; q != 1024U; ++q) {
+            if (std::memcmp(now + q * 16U, chk_dm.data() + q * 16U, 16U) != 0) {
+                ++ps.dm_changed[q];
+                const std::uint32_t rel = (q - chk_top) & 1023U;
+                if (rel < win) {
+                    ++ps.dm_in_input[q];
+                }
+            }
+        }
+        for (std::uint32_t q = 0; q != 1024U; ++q) {
+            std::uint32_t w[4];
+            std::memcpy(w, now + q * 16U, 16U);
+            const nc::Tags t = nc::parse_gif_tag(nc::Quad{w[0], w[1], w[2], w[3]});
+            if (t.strip_shape && t.nloop >= 2U && t.nloop <= 2U * chk_itop + 8U) {
+                ++chk_dm_tags[{chk_info->program, chk_entry, (q - chk_top) & 1023U}];
+            }
+        }
+        if (chk_entry == 4U && chk_ad_lines < 60U) {
+            const auto ad_positions = [](const std::uint8_t* dm, std::vector<std::uint32_t>& out) {
+                for (std::uint32_t q = 0; q != 1023U; ++q) {
+                    std::uint32_t w[4];
+                    std::memcpy(w, dm + q * 16U, 16U);
+                    const std::uint32_t nl = w[0] & 0x7FFFU;
+                    if (nl >= 1U && nl <= 16U && (w[0] & 0x8000U) == 0U && (w[1] >> 28U) == 1U && ((w[1] >> 26U) & 3U) == 0U && (w[2] & 0xFU) == 0xEU && w[3] == 0U) {
+                        out.push_back(q);
+                    }
+                }
+            };
+            std::vector<std::uint32_t> before_pos, after_pos;
+            ad_positions(chk_dm.data(), before_pos);
+            ad_positions(now, after_pos);
+            ++chk_ad_lines;
+            std::fprintf(stderr, "[STATECHECK] p%d e4 top=%u itop=%u A+D tags before:", chk_info->program, chk_top, chk_itop);
+            for (const auto q : before_pos) { std::uint32_t w0; std::memcpy(&w0, chk_dm.data() + q * 16U, 4U); std::fprintf(stderr, " %u(n%u)", q, w0 & 0x7FFFU); }
+            std::fprintf(stderr, " after:");
+            for (const auto q : after_pos) {
+                std::uint32_t w0; std::memcpy(&w0, now + q * 16U, 4U);
+                const bool same = q + 1U + (w0 & 0x7FFFU) <= 1024U && std::memcmp(now + q * 16U, chk_dm.data() + q * 16U, 16U * (1U + (w0 & 0x7FFFU))) == 0;
+                std::fprintf(stderr, " %u(n%u%s)", q, w0 & 0x7FFFU, same ? ",unchanged" : ",CHANGED");
+            }
+            std::fprintf(stderr, "\n");
+        }
+        for (std::size_t i = 1; i != 32U; ++i) {
+            if (!(l.state.vectors[i] == chk_state.vectors[i])) {
+                slot_note(ps.vf[i], nc::hash64(l.state.vectors[i].words.data(), 16U, 7U));
+            }
+            if (l.state.control[i] != chk_state.control[i]) {
+                slot_note(ps.vi[i], l.state.control[i]);
+            }
+        }
+        if (!(l.state.accumulator == chk_state.accumulator)) {
+            slot_note(ps.acc, nc::hash64(l.state.accumulator.words.data(), 16U, 7U));
+        }
+        ++ps.cont[l.state.control[26]];
+        for (std::size_t i = 0; i != 3U; ++i) {
+            if (l.state.control[16U + i] != chk_state.control[16U + i]) {
+                ++ps.flags_changed[i];
+            }
+        }
+    }
+    void chk_report() {
+        for (const auto& [k, v] : chk_tags) {
+            std::fprintf(stderr, "[STATECHECK] gif tag strip=%d flg=%d nreg=%d regs=%07x eop=%d token=%d: count %llu nloop-sum %llu\n", std::get<0>(k), std::get<1>(k), std::get<2>(k), std::get<3>(k), std::get<4>(k),
+                         std::get<5>(k) ? 1 : 0, static_cast<unsigned long long>(v.first), static_cast<unsigned long long>(v.second));
+        }
+        for (const auto& [k, v] : chk_tag_prims) {
+            std::fprintf(stderr, "[STATECHECK] strip prim=%llx pre=%llu: %llu\n", static_cast<unsigned long long>(k >> 1U), static_cast<unsigned long long>(k & 1U), static_cast<unsigned long long>(v));
+        }
+        for (const auto& [k, v] : chk_dm_tags) {
+            if (v > 20U) {
+                std::fprintf(stderr, "[STATECHECK] DM tag-shaped p%d e%x at qw top+%u: %llu\n", std::get<0>(k), std::get<1>(k), std::get<2>(k), static_cast<unsigned long long>(v));
+            }
+        }
+        for (const auto& [k, v] : chk_words) {
+            if (v >= 50U) {
+                std::fprintf(stderr, "[STATECHECK] word p%d e%x qw%u.%u: %08x -> %08x x%llu\n", std::get<0>(k), std::get<1>(k), std::get<2>(k), std::get<3>(k), std::get<4>(k), std::get<5>(k), static_cast<unsigned long long>(v));
+            }
+        }
+        for (const auto& [key, sv] : chk_survive) {
+            std::uint32_t q = 0;
+            while (q < sv.size()) {
+                if (sv[q].first + sv[q].second == 0U) { ++q; continue; }
+                std::uint32_t e = q;
+                std::uint64_t s0 = 0, s1 = 0;
+                while (e < sv.size() && sv[e].first + sv[e].second != 0U) { s0 += sv[e].first; s1 += sv[e].second; ++e; }
+                std::fprintf(stderr, "[STATECHECK] survive p%d e%x qw %u..%u: written-then-kept-by-next-launch %llu, overwritten-before-next-launch %llu\n", key.first, key.second, q, e - 1U, static_cast<unsigned long long>(s0), static_cast<unsigned long long>(s1));
+                q = e;
+            }
+        }
+        for (int pr = 0; pr != 256; ++pr) {
+            if (ent_launch[pr][0] + ent_launch[pr][1] != 0U) {
+                std::fprintf(stderr, "[STATECHECK] program %d: legacy-matched/launched  loop %llu/%llu  e4 %llu/%llu\n", pr, static_cast<unsigned long long>(ent_match[pr][0]), static_cast<unsigned long long>(ent_launch[pr][0]),
+                             static_cast<unsigned long long>(ent_match[pr][1]), static_cast<unsigned long long>(ent_launch[pr][1]));
+            }
+        }
+        for (int i = 0; i != kScrTargets; ++i) {
+            std::fprintf(stderr, "[STATECHECK] scramble target %d: launches %llu matched %llu\n", i, static_cast<unsigned long long>(scr_launches[i]), static_cast<unsigned long long>(scr_matched[i]));
+        }
+        for (auto& [key, ps] : chk_stats) {
+            std::fprintf(stderr, "[STATECHECK] program %d entry 0x%x: launches=%llu distinct tops=%zu cont(TPC)=", key.first, key.second,
+                         static_cast<unsigned long long>(ps.launches), ps.tops.size());
+            for (const auto& [v, c] : ps.cont) {
+                std::fprintf(stderr, "%x:%llu ", static_cast<unsigned>(v), static_cast<unsigned long long>(c));
+            }
+            std::fprintf(stderr, "flag-writes(status,mac,clip)=%llu,%llu,%llu\n", static_cast<unsigned long long>(ps.flags_changed[0]),
+                         static_cast<unsigned long long>(ps.flags_changed[1]), static_cast<unsigned long long>(ps.flags_changed[2]));
+            for (std::size_t i = 1; i != 32U; ++i) {
+                if (ps.vi[i].changed != 0U) {
+                    std::fprintf(stderr, "[STATECHECK]   p%d e%x vi/ctl[%zu] changed %llu distinct %zu:", key.first, key.second, i,
+                                 static_cast<unsigned long long>(ps.vi[i].changed), ps.vi[i].values.size());
+                    int n = 0;
+                    for (const auto& [v, c] : ps.vi[i].values) {
+                        if (n++ < 6) {
+                            std::fprintf(stderr, " %llx*%llu", static_cast<unsigned long long>(v), static_cast<unsigned long long>(c));
+                        }
+                    }
+                    std::fprintf(stderr, "\n");
+                }
+                if (ps.vf[i].changed != 0U) {
+                    std::fprintf(stderr, "[STATECHECK]   p%d e%x vf[%zu] changed %llu distinct-values %zu\n", key.first, key.second, i,
+                                 static_cast<unsigned long long>(ps.vf[i].changed), ps.vf[i].values.size());
+                }
+            }
+            if (ps.acc.changed != 0U) {
+                std::fprintf(stderr, "[STATECHECK]   p%d e%x ACC changed %llu distinct %zu\n", key.first, key.second,
+                             static_cast<unsigned long long>(ps.acc.changed), ps.acc.values.size());
+            }
+            std::uint32_t q = 0;
+            while (q != 1024U) {
+                if (ps.dm_changed[q] == 0U) {
+                    ++q;
+                    continue;
+                }
+                std::uint32_t e = q;
+                std::uint64_t mx = 0, mn = ~0ULL, in_in = 0;
+                while (e != 1024U && ps.dm_changed[e] != 0U) {
+                    mx = std::max(mx, ps.dm_changed[e]);
+                    mn = std::min(mn, ps.dm_changed[e]);
+                    in_in += ps.dm_in_input[e];
+                    ++e;
+                }
+                std::fprintf(stderr, "[STATECHECK]   p%d e%x DM qw %u..%u (%u qw) changed per-qw %llu..%llu, of which inside input window %llu\n", key.first, key.second, q, e - 1U, e - q,
+                             static_cast<unsigned long long>(mn), static_cast<unsigned long long>(mx), static_cast<unsigned long long>(in_in));
+                q = e;
+            }
+        }
+    }
+
     // ---- cached geometry ----
     struct MeshEntry {
         std::uint64_t wkey{};
@@ -88,6 +399,9 @@ struct NativeCmdEmitter::Impl {
         std::uint64_t last_frame{};
         std::vector<std::uint8_t> body[2]; // wire bodies: [0] triangles, [1] lines
         bool built[2]{};
+        std::vector<std::uint32_t> tris; // strip_to_triangles of m (opt3x worldsub: computed once per mesh)
+        bool tris_built{false};
+        float lo[3]{}, hi[3]{}; // bounding box of the vertex positions (trusted mode)
         [[nodiscard]] std::uint64_t bytes() const { return m.pos.size() * 4U + m.flags.size() * 4U + m.uv.size() * 4U + m.col.size() + m.nrm.size() * 4U + 256U; }
     };
     struct ViewSlot {
@@ -124,6 +438,9 @@ struct NativeCmdEmitter::Impl {
         float y0{};
         std::vector<nc::PropInstance> inst;
         std::vector<nc::ProjectedMesh> proj; // one per instance (props) or one (world)
+        std::uint16_t entry{0};
+        int scr{-1};                          // TAKEDOWN_NATIVE_CMD_SCRAMBLE: the register scrambled before this launch (-1 none)
+        std::uint32_t dm_tail[24 * 4]{};     // TAKEDOWN_NATIVE_CMD_TRAIN: qw 1000..1023
         std::vector<std::uint32_t> canon;    // v2: per vertex, the first vertex with the same projected position and uv (mask keys)
     };
     struct CarStrip {
@@ -146,6 +463,30 @@ struct NativeCmdEmitter::Impl {
     Impl(NativeCmdEmitter& owner_, ParallelGsRawStreamWriter& writer_, guest::Vu1LaunchObserver* inner_, NativeCmdConfig cfg_)
         : owner(owner_), writer(writer_), inner(inner_), cfg(cfg_), st(owner_.stats_), registry(cfg_.mesh_budget) {
         zeros.assign(static_cast<std::size_t>(nc::kMaxStripVertices) * 3U, guest::GsQuadword{});
+        chk_on = env_flag("TAKEDOWN_NATIVE_CMD_STATECHECK", false);
+        scr_on = env_flag("TAKEDOWN_NATIVE_CMD_SCRAMBLE", false);
+        {
+            // TAKEDOWN_NATIVE_CMD_TRUST_E4=<comma list of program numbers>; default 254 (the entry-4 program); 3,4,10,11 are faithful in data but showed picture differences, see the REPORT; 0 = none
+            const char* e = std::getenv("TAKEDOWN_NATIVE_CMD_TRUST_E4");
+            std::string list = (e != nullptr && *e != '\0') ? e : "254";
+            std::size_t at = 0;
+            while (at < list.size()) {
+                const unsigned long v = std::strtoul(list.c_str() + at, nullptr, 10);
+                if (v == 254UL) {
+                    trust_e4_mask |= 1ULL << 63U;
+                } else if (v < 63UL && v != 0UL) {
+                    trust_e4_mask |= 1ULL << v;
+                }
+                const std::size_t comma = list.find(',', at);
+                at = comma == std::string::npos ? list.size() : comma + 1U;
+            }
+        }
+        trust_on = cfg_.mode == 2 && env_flag("TAKEDOWN_NATIVE_CMD_TRUST", true) && !chk_on && !scr_on;
+        car_check_on = env_flag("TAKEDOWN_NATIVE_CMD_CARCHECK", false);
+        car_trust_on = trust_on && env_flag("TAKEDOWN_NATIVE_CMD_TRUST_CARS", true) && !env_flag("TAKEDOWN_NATIVE_CARS_VERIFY", false) && !car_check_on;
+        if (const char* tp = std::getenv("TAKEDOWN_NATIVE_CMD_TRAIN"); tp != nullptr && *tp != '\0') {
+            train_file = std::fopen(tp, "wb");
+        }
         session = now_ns() ^ 0x5DEECE66DULL;
         tsc_start = __rdtsc();
         ns_start = now_ns();
@@ -306,7 +647,16 @@ struct NativeCmdEmitter::Impl {
     std::shared_ptr<MeshEntry> mesh_for(const nc::VuData& vu, const guest::Vu1Launch& l, const nc::ProgramInfo* info) {
         const std::uint32_t n = l.itop;
         const std::uint32_t qw = nc::window_quadwords(info->decoder, n);
-        const std::uint64_t wkey = nc::group_hash(info->decoder, vu, l.top, n, info->program * 0x9E3779B1ULL + 1U);
+        std::uint64_t wkey = nc::group_hash(info->decoder, vu, l.top, n, info->program * 0x9E3779B1ULL + 1U);
+        // Program 254 scrolls the texture: with qw 1005.x set it adds 1005.y to every vertex's u (and, by the look of it, 1005.z to v;
+        // always 0 in the captures). The game steps the offset each frame (the arrow light boards' running lights), so each offset is a
+        // mesh of its own.
+        float uv_offset[2] = {0.0F, 0.0F};
+        if (info->program == 0xFEU && vu.word(1005U, 0) != 0U) {
+            uv_offset[0] = vu.f(1005U, 1);
+            uv_offset[1] = vu.f(1005U, 2);
+            wkey = nc::hash_mix(wkey, (static_cast<std::uint64_t>(vu.word(1005U, 1)) << 32U) | vu.word(1005U, 2));
+        }
         static_cast<void>(qw);
         const auto it = meshes.find(wkey);
         if (it != meshes.end()) {
@@ -324,6 +674,23 @@ struct NativeCmdEmitter::Impl {
             nc::decode_prop(vu, l.top, n, e->m);
         } else {
             nc::decode_world3(vu, l.top, n, info->decoder == nc::Decoder::kWorld3N, e->m); // programs 3/4: normals + intensity
+            if (uv_offset[0] != 0.0F || uv_offset[1] != 0.0F) {
+                for (std::uint32_t i = 0; i != e->m.n; ++i) {
+                    e->m.uv[2U * i] += uv_offset[0];
+                    e->m.uv[2U * i + 1U] += uv_offset[1];
+                }
+            }
+        }
+        if (n != 0U) {
+            for (std::uint32_t c = 0; c != 3U; ++c) {
+                e->lo[c] = e->hi[c] = e->m.pos[c];
+            }
+            for (std::uint32_t i = 1; i != n; ++i) {
+                for (std::uint32_t c = 0; c != 3U; ++c) {
+                    e->lo[c] = std::min(e->lo[c], e->m.pos[3U * i + c]);
+                    e->hi[c] = std::max(e->hi[c], e->m.pos[3U * i + c]);
+                }
+            }
         }
         mesh_bytes += e->bytes();
         touched.push_back(wkey);
@@ -331,13 +698,19 @@ struct NativeCmdEmitter::Impl {
         return e;
     }
 
-    void handle_car_launch(const guest::Vu1Launch& l, const guest::Vu1LaunchReplacement& r) {
+    // What a car launch shares between the packet-matching and the trusted paths: the batch (mesh) and constants definitions, the view,
+    // and the clip history at the launch.
+    struct CarCommon {
+        std::uint64_t mkey{};
+        std::uint64_t ckey{};
+        std::shared_ptr<CarConstSlot> cslot;
+        std::shared_ptr<ViewSlot> vslot;
+        std::uint32_t aux{};
+    };
+    CarCommon car_common(const guest::Vu1Launch& l, const guest::Vu1LaunchReplacement& r) {
+        CarCommon cc;
         const nc::VuData vu{reinterpret_cast<const std::uint8_t*>(l.data.data())};
         const std::uint32_t count = l.itop;
-        if (count == 0U || count > nc::kMaxGroupVertices || r.packet.empty()) {
-            return;
-        }
-        ++st.launches_car;
         // The key covers the batch proper (three quadwords per vertex, rounded up to four vertices). The quadword after it (the clip
         // history's lookahead of the exact stage) is stale VU memory that differs from launch to launch: it travels with the
         // first definition of the batch but is not part of its identity.
@@ -413,8 +786,25 @@ struct NativeCmdEmitter::Impl {
             cslot->body = c;
         }
         cslot->last_frame = frame;
-        const std::shared_ptr<ViewSlot> vslot = view_slot(vu);
-        const std::uint32_t aux = l.state.flag_history_initialized ? l.state.clip_flag_history[3] : l.state.control[18];
+        cc.mkey = mkey;
+        cc.ckey = ckey;
+        cc.cslot = cslot;
+        cc.vslot = view_slot(vu);
+        cc.aux = l.state.flag_history_initialized ? l.state.clip_flag_history[3] : l.state.control[18];
+        return cc;
+    }
+
+    void handle_car_launch(const guest::Vu1Launch& l, const guest::Vu1LaunchReplacement& r) {
+        const std::uint32_t count = l.itop;
+        if (count == 0U || count > nc::kMaxGroupVertices || r.packet.empty()) {
+            return;
+        }
+        ++st.launches_car;
+        const CarCommon cc = car_common(l, r);
+        const std::uint64_t mkey = cc.mkey, ckey = cc.ckey;
+        const std::shared_ptr<CarConstSlot>& cslot = cc.cslot;
+        const std::shared_ptr<ViewSlot>& vslot = cc.vslot;
+        const std::uint32_t aux = cc.aux;
         // expected strips of the packet native cars built
         const auto& p = r.packet;
         std::size_t i = 0;
@@ -444,6 +834,235 @@ struct NativeCmdEmitter::Impl {
         }
     }
 
+    // ------------------------------------------------------------------ trusted cars (opt3x)
+    // A launch of the car program answered without running the native car program: no vertex arithmetic, no packet, no packet hashing and
+    // no strip matching. The replacement keeps what later launches see (registers, the CLIP history, the few kept memory words, the
+    // register-prefix quadwords) and carries one token per strip the program would have sent; the DRAW record is written when a token
+    // passes the GIF observer (trusted_token), exactly where the matched strip's would have been.
+    struct CarTrustStats {
+        std::uint64_t launches{}, draws{}, declined{}, check_launches{}, check_bad{};
+    } cts;
+    bool car_trust_on{false};
+    bool handle_trusted_car(const guest::Vu1Launch& l, guest::Vu1LaunchReplacement& rep) {
+        runtime::Slus21050CarTrusted::Strips strips;
+        const std::uint32_t count = l.itop;
+        if (l.entry != 0U && (count == 0U || count > nc::kMaxGroupVertices)) {
+            ++cts.declined;
+            return false;
+        }
+        std::optional<guest::Vu1LaunchReplacement> res = runtime::Slus21050CarTrusted::run(l, strips);
+        if (!res.has_value()) {
+            ++cts.declined;
+            return false;
+        }
+        if (l.entry == 0U) {
+            rep = std::move(*res);
+            return true;
+        }
+        ++st.launches_car;
+        ++cts.launches;
+        const CarCommon cc = car_common(l, *res);
+        const std::size_t per = 1U + (cfg.elide ? 0U : 3U * static_cast<std::size_t>(count));
+        std::size_t at = res->packet.size();
+        res->packet.resize(at + per * strips.passes, std::array<std::uint32_t, 4>{});
+        for (std::uint32_t pass = 0; pass != strips.passes; ++pass) {
+            const nc::Tags tg = nc::parse_gif_tag(strips.tags[pass]);
+            TrustedDraw td;
+            td.id = next_trust_id++ & 0xFFFFFFU;
+            if (next_trust_id > 0xFFFFFFU) {
+                next_trust_id = 1;
+            }
+            Decision& d = td.d;
+            d.matched = true;
+            d.is_car = true;
+            d.draw.nverts = count;
+            d.draw.prim = tg.prim | (tg.pre ? (1U << 11U) : 0U);
+            d.draw.tint[0] = d.draw.tint[1] = d.draw.tint[2] = d.draw.tint[3] = 1.0F;
+            d.draw.xform[0] = d.draw.xform[5] = d.draw.xform[10] = 1.0F;
+            d.draw.category = static_cast<std::uint16_t>(nc::Category::kCar);
+            d.draw.program = 5;
+            d.draw.pass = static_cast<std::uint16_t>(pass);
+            d.draw.flags = nc::kDrawAdcMesh | (pass != 0U ? nc::kDrawEnvPass : 0U);
+            d.draw.mesh_key = cc.mkey;
+            d.draw.const_key = cc.ckey;
+            d.draw.aux = cc.aux;
+            d.draw.view_id = cc.vslot->id;
+            d.view = cc.vslot;
+            d.cslot = cc.cslot;
+            d.const_key = cc.ckey;
+            d.mesh_key = cc.mkey;
+            const nc::Token tok{td.id, count, tg.prim, tg.pre, tg.eop};
+            res->packet[at] = nc::encode_token(tok, cfg.elide);
+            at += per;
+            ++cts.draws;
+            trusted.push_back(std::move(td));
+        }
+        while (trusted.size() > kMaxTrusted) {
+            trusted.pop_front();
+            ++ts.tokens_lost;
+        }
+        rep = std::move(*res);
+        return true;
+    }
+
+    // TAKEDOWN_NATIVE_CMD_CARCHECK=1: the full native car program runs (and is applied) as before; the trusted result is computed as well,
+    // from a shadow of VU1 data memory as trusted mode would hold it (the program's skipped quadword writes reverted until the guest
+    // overwrites them), and compared with it.
+    bool car_check_on{false};
+    std::vector<std::uint8_t> cc_shadow;
+    struct CcDirty {
+        std::uint32_t val[4]{}, old[4]{};
+        std::uint8_t mask{0};
+    };
+    std::array<CcDirty, 1024> cc_dirty{};
+    std::vector<std::uint16_t> cc_list;
+    std::map<std::string, std::uint64_t> cc_bad;
+    std::uint64_t cc_examples{0};
+    void cc_note(const char* what, const std::string& detail) {
+        ++cts.check_bad;
+        ++cc_bad[what];
+        if (cc_examples < 12U) {
+            ++cc_examples;
+            std::fprintf(stderr, "[CARCHECK] launch %llu: %s %s\n", static_cast<unsigned long long>(cts.check_launches), what, detail.c_str());
+        }
+    }
+    void car_check(const guest::Vu1Launch& l, const guest::Vu1LaunchReplacement& r) {
+        const auto* actual = reinterpret_cast<const std::uint8_t*>(l.data.data());
+        if (cc_shadow.empty()) {
+            cc_shadow.assign(16384U, 0U);
+        }
+        std::memcpy(cc_shadow.data(), actual, 16384U);
+        // revert the skipped writes that still stand
+        std::vector<std::uint16_t> keep;
+        for (const std::uint16_t a : cc_list) {
+            CcDirty& dq = cc_dirty[a];
+            std::uint32_t cur[4];
+            std::memcpy(cur, actual + a * 16U, 16U);
+            for (unsigned k = 0; k != 4U; ++k) {
+                if ((dq.mask >> k & 1U) != 0U) {
+                    if (cur[k] == dq.val[k]) {
+                        std::memcpy(cc_shadow.data() + a * 16U + k * 4U, &dq.old[k], 4U);
+                    } else {
+                        dq.mask = static_cast<std::uint8_t>(dq.mask & ~(1U << k));
+                    }
+                }
+            }
+            if (dq.mask != 0U) {
+                keep.push_back(a);
+            }
+        }
+        cc_list.swap(keep);
+        ++cts.check_launches;
+        guest::Vu1Launch sl{l.micro, std::span<const std::byte>(reinterpret_cast<const std::byte*>(cc_shadow.data()), 16384U), l.state, l.entry, l.top, l.itop, l.source};
+        runtime::Slus21050CarTrusted::Strips strips;
+        const std::optional<guest::Vu1LaunchReplacement> t = runtime::Slus21050CarTrusted::run(sl, strips);
+        if (!t.has_value()) {
+            cc_note("declined", "");
+        } else {
+            if (t->integer_writes != r.integer_writes) {
+                cc_note("integer_writes", "");
+            }
+            if (t->vector_writes != r.vector_writes) {
+                cc_note("vector_writes", "");
+            }
+            if (t->data_writes != r.data_writes) {
+                cc_note("data_writes", "");
+            }
+            if (t->clip_flags != r.clip_flags) {
+                char b[96];
+                std::snprintf(b, sizeof b, "trusted %08llx full %08llx (entry %u count %u refl %d dmg %d)",
+                              t->clip_flags ? static_cast<unsigned long long>(*t->clip_flags) : 0xFFFFFFFFFFULL,
+                              r.clip_flags ? static_cast<unsigned long long>(*r.clip_flags) : 0xFFFFFFFFFFULL, l.entry, l.itop, strips.reflective ? 1 : 0, strips.damaged ? 1 : 0);
+                {
+                    const std::uint32_t la = (l.top + 3U * l.itop) & 1023U;
+                    char b2[256];
+                    std::uint32_t av[4], sv[4];
+                    std::memcpy(av, actual + la * 16U, 16U);
+                    std::memcpy(sv, cc_shadow.data() + la * 16U, 16U);
+                    std::snprintf(b2, sizeof b2, " top=%u la=%u vi13=%u vi14=%u actual=%08x,%08x,%08x,%08x shadow=%08x,%08x,%08x,%08x", l.top, la, l.state.read_integer(13U), l.state.read_integer(14U),
+                                  av[0], av[1], av[2], av[3], sv[0], sv[1], sv[2], sv[3]);
+                    std::string b3 = std::string(b) + b2;
+                    cc_note("clip_flags", b3);
+                }
+            }
+            if (t->continuation != r.continuation) {
+                cc_note("continuation", "");
+            }
+            if (l.entry != 0U) {
+                const std::size_t pre = t->packet.size();
+                if (r.packet.size() < pre || !std::equal(t->packet.begin(), t->packet.end(), r.packet.begin())) {
+                    cc_note("prefix", "");
+                }
+                std::size_t i = pre;
+                std::uint32_t pass = 0;
+                while (i < r.packet.size()) {
+                    const nc::Tags tg = nc::parse_gif_tag(r.packet[i]);
+                    if (pass >= strips.passes || r.packet[i] != strips.tags[pass]) {
+                        cc_note("strip_tag", "pass " + std::to_string(pass));
+                    }
+                    ++pass;
+                    i += 1U + (tg.flg == 0U ? static_cast<std::size_t>(tg.nloop) * (tg.nreg == 0U ? 16U : tg.nreg) : tg.nloop);
+                }
+                if (pass != strips.passes) {
+                    cc_note("strip_count", "");
+                }
+            }
+        }
+        // the writes the trusted mode skips: after the launch, full memory = actual + the full result's writes, shadow = shadow + the trusted ones
+        std::vector<std::uint8_t> after(actual, actual + 16384U);
+        const auto apply = [](std::vector<std::uint8_t>& image, const guest::Vu1LaunchReplacement& rr) {
+            for (const auto& [a, v] : rr.quadword_writes) {
+                std::memcpy(image.data() + (a & 1023U) * 16U, v.data(), 16U);
+            }
+            for (const auto& [w, v] : rr.data_writes) {
+                std::memcpy(image.data() + (w & 4095U) * 4U, &v, 4U);
+            }
+        };
+        apply(after, r);
+        if (t.has_value()) {
+            apply(cc_shadow, *t);
+        }
+        std::vector<std::uint16_t> touched_q;
+        for (const auto& [a, v] : r.quadword_writes) {
+            touched_q.push_back(a & 1023U);
+        }
+        if (t.has_value()) {
+            for (const auto& [a, v] : t->quadword_writes) {
+                touched_q.push_back(a & 1023U);
+            }
+        }
+        for (const auto& [w, v] : r.data_writes) {
+            touched_q.push_back(static_cast<std::uint16_t>((w >> 2U) & 1023U));
+        }
+        for (const std::uint16_t qa : touched_q) {
+            CcDirty& dq = cc_dirty[qa];
+            const bool was = dq.mask != 0U;
+            std::uint8_t mask = 0;
+            for (unsigned k = 0; k != 4U; ++k) {
+                std::uint32_t av, sv;
+                std::memcpy(&av, after.data() + qa * 16U + k * 4U, 4U);
+                std::memcpy(&sv, cc_shadow.data() + qa * 16U + k * 4U, 4U);
+                if (av != sv) {
+                    mask |= static_cast<std::uint8_t>(1U << k);
+                    dq.val[k] = av;
+                    dq.old[k] = sv;
+                } else if ((dq.mask >> k & 1U) != 0U) {
+                    // identical again
+                }
+            }
+            dq.mask = mask;
+            if (mask != 0U && !was) {
+                cc_list.push_back(qa);
+            }
+        }
+    }
+    void car_check_report() {
+        std::fprintf(stderr, "[CARCHECK] launches=%llu bad=%llu\n", static_cast<unsigned long long>(cts.check_launches), static_cast<unsigned long long>(cts.check_bad));
+        for (const auto& [k, v] : cc_bad) {
+            std::fprintf(stderr, "[CARCHECK]   %s: %llu\n", k.c_str(), static_cast<unsigned long long>(v));
+        }
+    }
+
     void handle_strip_launch(const guest::Vu1Launch& l, const nc::ProgramInfo* info) {
         const std::uint32_t n = l.itop;
         if (n < 3U || n > nc::kMaxGroupVertices) {
@@ -455,6 +1074,12 @@ struct NativeCmdEmitter::Impl {
         const nc::VuData vu{reinterpret_cast<const std::uint8_t*>(l.data.data())};
         std::uint64_t lc = tsc();
         auto p = new_pending();
+        p->scr = scr_pending;
+        p->entry = l.entry;
+        ++ent_launch[info->program & 255U][l.entry == 4U ? 1 : 0];
+        if (train_file != nullptr) {
+            std::memcpy(p->dm_tail, l.data.data() + 1000U * 16U, sizeof p->dm_tail);
+        }
         p->launch = launch_counter;
         p->info = info;
         p->n = n;
@@ -576,6 +1201,10 @@ struct NativeCmdEmitter::Impl {
             if (it != range.second) {
                 legacy_hash = nc::hash64(sv.q, (static_cast<std::size_t>(sv.nverts) * 3U + 1U) * 16U);
                 d.draw.legacy_hash = legacy_hash;
+                static const bool zero_legacy = env_flag("TAKEDOWN_NATIVE_CMD_ZERO_LEGACY", false); // comparison runs against trusted cars
+                if (zero_legacy) {
+                    d.draw.legacy_hash = 0;
+                }
                 while (it != range.second && it->second.full_hash != legacy_hash) {
                     ++it;
                 }
@@ -650,6 +1279,11 @@ struct NativeCmdEmitter::Impl {
                 Pending& m = *queue.front();
                 fill_strip_draw(d, m, k, sv, lines, tg);
                 pkt_entry = &m;
+                ++ent_match[m.info->program & 255U][m.entry == 4U ? 1 : 0];
+                if (m.scr >= 0) {
+                    ++scr_matched[m.scr];
+                    m.scr = -1;
+                }
                 // Props too: the prop program drops the triangles outside its guard band (big polygons beside the camera); the mask keeps
                 // the native draw to what it drew.
                 if (cfg.v2 && !lines && !build_mask(d, m, sv, m.info->decoder == nc::Decoder::kProp ? k : 0U)) {
@@ -880,6 +1514,466 @@ struct NativeCmdEmitter::Impl {
         static_cast<void>(tg);
     }
 
+
+    // ------------------------------------------------------------------ trusted mode (opt3x)
+    // For a world / prop launch the emitter would replace by tokens anyway, the VU1 microprogram is not run at all: the launch is
+    // answered with a replacement that carries one token packet per visible draw, and the DRAW record is written when that token
+    // passes the GIF observer (the same stream position as before). What the program decided (back-face culling, strip restarts, the
+    // pixel-less slivers of the GS front end) is computed here from the decoded mesh; clipping and guard band are left to the renderer.
+    struct TrustedDraw {
+        std::uint32_t id{};
+        Decision d;
+    };
+    struct TrustStats {
+        std::uint64_t launches{}, offscreen{}, empty{}, declined{}, draws{}, tris_total{}, tris_kept{}, tokens_matched{}, tokens_lost{}, instances_off{}, stale_camera{};
+    } ts;
+    bool trust_on{false};
+    std::uint64_t trust_e4_mask{0};   // programs (bit = program number, 254 = bit 63) whose first batch (entry 4) is trusted too
+    std::deque<TrustedDraw> trusted;
+    std::uint32_t next_trust_id{1};
+    std::vector<double> t_xc, t_yc, t_w;
+    std::vector<std::int32_t> t_x16;
+    std::vector<std::uint32_t> t_mask;
+    static constexpr std::size_t kMaxTrusted = 8192U;
+
+    // True when the box (local lo..hi, through xform when given) lies completely outside one side of the view volume (or behind the eye),
+    // by a margin of 16 pixels.
+    static bool box_outside(const nc::ViewParams& v, const float* lo, const float* hi, const float* xform, double far_w) noexcept {
+        const double fx = 16.0 / std::max(1.0, v.vs[0]), fy = 16.0 / std::max(1.0, v.vs[1]);
+        unsigned all = 0x3FU;
+        for (unsigned corner = 0; corner != 8U; ++corner) {
+            double x = (corner & 1U) != 0U ? hi[0] : lo[0], y = (corner & 2U) != 0U ? hi[1] : lo[1], z = (corner & 4U) != 0U ? hi[2] : lo[2];
+            if (xform != nullptr) {
+                const double wx = xform[0] * x + xform[1] * y + xform[2] * z + xform[3];
+                const double wy = xform[4] * x + xform[5] * y + xform[6] * z + xform[7];
+                const double wz = xform[8] * x + xform[9] * y + xform[10] * z + xform[11];
+                x = wx, y = wy, z = wz;
+            }
+            const double xc = v.c[0][0] * x + v.c[1][0] * y + v.c[2][0] * z + v.c[3][0];
+            const double yc = v.c[0][1] * x + v.c[1][1] * y + v.c[2][1] * z + v.c[3][1];
+            const double w = v.c[0][3] * x + v.c[1][3] * y + v.c[2][3] * z + v.c[3][3];
+            unsigned bits = 0;
+            bits |= xc < -fx * w ? 1U : 0U;
+            bits |= xc > (1.0 + fx) * w ? 2U : 0U;
+            bits |= yc < -fy * w ? 4U : 0U;
+            bits |= yc > (1.0 + fy) * w ? 8U : 0U;
+            bits |= w <= 1e-6 ? 16U : 0U;
+            bits |= w > far_w ? 32U : 0U;
+            // a corner behind the eye makes the side tests meaningless (the signs flip): only the all-behind case counts
+            if ((bits & 16U) != 0U) {
+                bits &= 16U | 32U;
+                bits &= ~0xFU;
+            }
+            all &= bits;
+            if (all == 0U) {
+                return false;
+            }
+        }
+        return all != 0U;
+    }
+
+    // The triangles of the mesh (strip_to_triangles order) the VU1 program would have kicked: front-facing when `cull_back`, and not an
+    // edge-on sliver the GS front end draws no pixel of. Triangles with a vertex behind the eye are kept when the homogeneous winding
+    // is right (the renderer clips them). Returns the number kept; `mask` gets one bit per triangle.
+    std::uint32_t trusted_mask(const nc::ViewParams& v, MeshEntry& me, const float* xform, bool cull_back, double near_w, double far_w, std::uint32_t& front_count) {
+        const nc::StripMesh& m = me.m;
+        const std::uint32_t n = m.n;
+        t_xc.resize(n);
+        t_yc.resize(n);
+        t_w.resize(n);
+        t_x16.resize(n);
+        for (std::uint32_t i = 0; i != n; ++i) {
+            double x = m.pos[3U * i], y = m.pos[3U * i + 1U], z = m.pos[3U * i + 2U];
+            if (xform != nullptr) {
+                const double wx = xform[0] * x + xform[1] * y + xform[2] * z + xform[3];
+                const double wy = xform[4] * x + xform[5] * y + xform[6] * z + xform[7];
+                const double wz = xform[8] * x + xform[9] * y + xform[10] * z + xform[11];
+                x = wx, y = wy, z = wz;
+            }
+            const double xc = v.c[0][0] * x + v.c[1][0] * y + v.c[2][0] * z + v.c[3][0];
+            const double yc = v.c[0][1] * x + v.c[1][1] * y + v.c[2][1] * z + v.c[3][1];
+            const double w = v.c[0][3] * x + v.c[1][3] * y + v.c[2][3] * z + v.c[3][3];
+            t_xc[i] = xc, t_yc[i] = yc, t_w[i] = w;
+            if (w > 1e-6) {
+                const double sx = v.off[0] + v.vs[0] * (xc / w - 0.5);
+                t_x16[i] = static_cast<std::int32_t>(std::max(-1e9, std::min(1e9, std::floor(sx * 16.0))));
+            } else {
+                t_x16[i] = 0;
+            }
+        }
+        if (!me.tris_built) {
+            nc::strip_to_triangles(m.flags, n, me.tris);
+            me.tris_built = true;
+        }
+        const std::vector<std::uint32_t>& t_tri = me.tris;
+        const std::uint32_t ntri = static_cast<std::uint32_t>(t_tri.size() / 3U);
+        t_mask.assign((ntri + 31U) / 32U, 0U);
+        std::uint32_t kept = 0;
+        front_count = 0;
+        for (std::uint32_t t = 0; t != ntri; ++t) {
+            const std::uint32_t a = t_tri[3U * t], b = t_tri[3U * t + 1U], c = t_tri[3U * t + 2U];
+            if ((t_w[a] <= near_w && t_w[b] <= near_w && t_w[c] <= near_w) || t_w[a] > far_w || t_w[b] > far_w || t_w[c] > far_w) {
+                continue; // the VU1 program drops triangles wholly nearer than the near plane or with a vertex beyond the far plane
+            }
+            const double det = t_xc[a] * (t_yc[b] * t_w[c] - t_yc[c] * t_w[b]) - t_yc[a] * (t_xc[b] * t_w[c] - t_xc[c] * t_w[b]) +
+                               t_w[a] * (t_xc[b] * t_yc[c] - t_xc[c] * t_yc[b]);
+            const bool front = det < 0.0;
+            front_count += front ? 1U : 0U;
+            if (cull_back && !front) {
+                continue;
+            }
+            if (t_w[a] > 1e-6 && t_w[b] > 1e-6 && t_w[c] > 1e-6) {
+                const std::int32_t lo = std::min({t_x16[a], t_x16[b], t_x16[c]}), hi = std::max({t_x16[a], t_x16[b], t_x16[c]});
+                if (!(((lo + 15) >> 4) <= ((hi - 1) >> 4) && hi != 0)) {
+                    continue; // covers no pixel column (see covers_pixel)
+                }
+            }
+            t_mask[t >> 5U] |= 1U << (t & 31U);
+            ++kept;
+        }
+        return kept;
+    }
+
+    // The GIF tag template the program copies into its strip packet: DM qw 1006, word 1 (PRIM, PRE), word 2 the register list (ST RGBAQ XYZF2).
+    bool trusted_prim(const nc::VuData& vu, const nc::ProgramInfo* info, std::uint32_t& prim) {
+        static_cast<void>(info);
+        const std::uint32_t w1 = vu.word(1006U, 1), w2 = vu.word(1006U, 2);
+        if ((w1 >> 28U) != 3U || ((w1 >> 26U) & 3U) != 0U || (w2 & 0xFFFU) != 0x412U) {
+            return false;
+        }
+        prim = ((w1 >> 15U) & 0x7FFU) | (((w1 >> 14U) & 1U) != 0U ? (1U << 11U) : 0U);
+        return true;
+    }
+    // What the program leaves behind that a later launch can see (see the REPORT): the output buffer pointers swap when a packet was sent;
+    // the program ends at its loop entry.
+    void trusted_side_effects(const guest::Vu1Launch& l, const nc::ProgramInfo* info, guest::Vu1LaunchReplacement& rep) {
+        if (!rep.packet.empty()) {
+            rep.integer_writes.push_back({13U, l.state.read_integer(14U)});
+            rep.integer_writes.push_back({14U, l.state.read_integer(13U)});
+        }
+        if (l.entry == 4U) {
+            rep.integer_writes.push_back({15U, 4U});
+        }
+        if (info->decoder != nc::Decoder::kProp) {
+            rep.data_writes.push_back({1013U * 4U + 3U, 0U}); // the program consumes the flag word of qw 1013 (the guest sets it per object)
+        }
+        rep.continuation = draw_entry(info->program);
+    }
+
+
+    // Entry 0 of the world / prop programs is a reset: it sets the buffer pointers and the continuation and touches nothing else. The delta
+    // is learned from real runs (confirmed three times, vectors, accumulator, flags and data memory unchanged) and replayed afterwards.
+    struct ResetDelta {
+        int confirmed{0};
+        bool bad{false};
+        std::vector<std::pair<std::uint8_t, std::uint16_t>> ints;
+        std::uint32_t cont{0};
+    };
+    std::map<const nc::ProgramInfo*, ResetDelta> reset_deltas;
+    bool rd_active{false};
+    const nc::ProgramInfo* rd_info{nullptr};
+    guest::Vu1State rd_state{};
+    std::vector<std::uint8_t> rd_dm;
+    std::uint64_t reset_replayed{0};
+    bool try_reset_replacement(const guest::Vu1Launch& l, const nc::ProgramInfo* info, guest::Vu1LaunchReplacement& rep) {
+        ResetDelta& d = reset_deltas[info];
+        if (d.bad) {
+            return false;
+        }
+        if (d.confirmed >= 3) {
+            rep.integer_writes = d.ints;
+            rep.continuation = static_cast<std::uint16_t>(d.cont);
+            ++reset_replayed;
+            return true;
+        }
+        rd_active = true;
+        rd_info = info;
+        rd_state = l.state;
+        rd_dm.assign(reinterpret_cast<const std::uint8_t*>(l.data.data()), reinterpret_cast<const std::uint8_t*>(l.data.data()) + 16384U);
+        return false;
+    }
+    void reset_learn(const guest::Vu1Launch& l) {
+        if (!rd_active) {
+            return;
+        }
+        rd_active = false;
+        ResetDelta& d = reset_deltas[rd_info];
+        bool clean = std::memcmp(reinterpret_cast<const std::uint8_t*>(l.data.data()), rd_dm.data(), 16384U) == 0 && l.state.accumulator == rd_state.accumulator &&
+                     l.state.clip_flag_history == rd_state.clip_flag_history && l.state.mac_flag_history == rd_state.mac_flag_history &&
+                     l.state.status_flag_history == rd_state.status_flag_history;
+        for (std::size_t i = 0; i != 32U && clean; ++i) {
+            clean = l.state.vectors[i] == rd_state.vectors[i];
+        }
+        std::vector<std::pair<std::uint8_t, std::uint16_t>> ints;
+        for (std::size_t i = 1; i != 32U && clean; ++i) {
+            if (l.state.control[i] != rd_state.control[i]) {
+                if (i > 15U && i != 26U) {
+                    clean = false;
+                } else if (i != 26U) {
+                    ints.push_back({static_cast<std::uint8_t>(i), static_cast<std::uint16_t>(l.state.control[i])});
+                }
+            }
+        }
+        if (!clean) {
+            d.bad = true;
+            return;
+        }
+        const std::uint32_t cont = l.state.control[26];
+        if (d.confirmed == 0 || (ints == d.ints && cont == d.cont)) {
+            d.ints = ints;
+            d.cont = cont;
+            ++d.confirmed;
+        } else {
+            d.bad = true;
+        }
+    }
+
+    static bool program_culls(std::uint16_t program) noexcept { return program == 10U || program == 3U || program == 0xFEU; }
+
+    // The draw-entry address of a program (MSCAL operand); other entries of the same micro image (setup, continuation) are not draws.
+    static std::uint16_t draw_entry(std::uint16_t program) noexcept {
+        switch (program) {
+        case 10: return 0x2a9;
+        case 11: return 0x263;
+        case 12: return 0x273;
+        case 3: return 0x322;
+        case 4: return 0x2dc;
+        case 14: return 0x1dd;
+        case 0xFE: return 0x2a9;
+        default: return 0xFFFF;
+        }
+    }
+
+    // Answers a launch of a world / prop program without running it. False: the launch is not handled (the program runs, legacy path).
+    // The camera a world program draws with. Programs 3, 4, 10/254, 11 and 12 load it into registers only when the guest set the object's
+    // flag (qw 1013.w, which the program clears): VF28..31 = the columns of qw 1014..1017 as ((x - w/2) sx, (y - w/2) sy, 0, w) with the
+    // screen scale of qw 1018, VF2.xyz =
+    // the offset (qw 1019). With the flag clear they draw with the camera still in those registers, which data memory need not hold any
+    // more: another pass (the car's reflection map, with its own camera) may have uploaded its block since. That happens at camera cuts
+    // (the Time Attack start, where reading memory drew a road piece with the reflection camera into the picture: huge polygons over the
+    // sky). True when the registers do not hold the camera of data memory: the launch is then left to the program.
+    // r = (m - w/2) * scale as the VU computes it (rounding toward zero): equal within a few ulps of the operands (the difference can cancel).
+    static bool near_scaled_difference(float r, float m, float half_w, float scale) noexcept {
+        const float expected = (m - half_w) * scale;
+        return std::fabs(r - expected) <= (std::fabs(m) + std::fabs(half_w)) * std::fabs(scale) * 1.0e-6F + 1.0e-30F;
+    }
+    bool camera_stale(const guest::Vu1Launch& l, const nc::ProgramInfo* info, const nc::VuData& vu) const {
+        if (info->decoder == nc::Decoder::kProp || (vu.word(1013U, 3) & 0xFFFFU) != 0U) {
+            return false;
+        }
+        for (std::uint32_t k = 0; k != 4U; ++k) {
+            const auto& r = l.state.read_vector_ref(28U + k).words;
+            const float mx = vu.f(1014U + k, 0), my = vu.f(1014U + k, 1), mw = vu.f(1014U + k, 3);
+            if (!near_scaled_difference(std::bit_cast<float>(r[0]), mx, 0.5F * mw, vu.f(1018U, 0)) ||
+                !near_scaled_difference(std::bit_cast<float>(r[1]), my, 0.5F * mw, vu.f(1018U, 1)) ||
+                r[3] != vu.word(1014U + k, 3)) {
+                log_stale(l, vu, k);
+                return true;
+            }
+        }
+        const auto& o = l.state.read_vector_ref(2U).words;
+        if (o[0] != vu.word(1019U, 0) || o[1] != vu.word(1019U, 1) || o[2] != vu.word(1019U, 2)) {
+            log_stale(l, vu, 4U);
+            return true;
+        }
+        return false;
+    }
+    // TAKEDOWN_NATIVE_CMD_LOG_STALE=1: the first stale cameras (which register, memory and register values).
+    void log_stale(const guest::Vu1Launch& l, const nc::VuData& vu, std::uint32_t which) const {
+        static const bool on = env_flag("TAKEDOWN_NATIVE_CMD_LOG_STALE", false);
+        static unsigned logged = 0;
+        if (!on || logged >= 40U) {
+            return;
+        }
+        ++logged;
+        const std::uint32_t qw = which < 4U ? 1014U + which : 1019U;
+        const auto& r = l.state.read_vector_ref(which < 4U ? 28U + which : 2U).words;
+        std::fprintf(stderr, "[STALECAM] frame %llu entry %x reg %s: memory %g %g %g %g registers %g %g %g %g\n", static_cast<unsigned long long>(frame), l.entry,
+                     which < 4U ? "vf28+" : "vf2", vu.f(qw, 0), vu.f(qw, 1), vu.f(qw, 2), vu.f(qw, 3), std::bit_cast<float>(r[0]), std::bit_cast<float>(r[1]),
+                     std::bit_cast<float>(r[2]), std::bit_cast<float>(r[3]));
+    }
+
+    bool handle_trusted_launch(const guest::Vu1Launch& l, const nc::ProgramInfo* info, guest::Vu1LaunchReplacement& rep) {
+        const std::uint32_t n = l.itop;
+        if (info->decoder == nc::Decoder::kCar || info->decoder == nc::Decoder::kNone) {
+            return false;
+        }
+        // The loop entry always; entry 4 (the first batch after an upload: the loop body plus a prologue that only sets vi15 = 4) for the
+        // programs whose prologue is known (see REPORT); programs 12 and 14 load constants into vector registers there.
+        const bool first_batch = l.entry == 4U && ((trust_e4_mask >> (info->program == 0xFEU ? 63U : (info->program & 63U))) & 1U) != 0U;
+        if (!first_batch && draw_entry(info->program) != l.entry) {
+            return false;
+        }
+        if (n < 3U || n > nc::kMaxGroupVertices || (info->decoder == nc::Decoder::kWorld3N && n > nc::kWorld3NMaxVertices)) {
+            return false;
+        }
+        const nc::VuData vu{reinterpret_cast<const std::uint8_t*>(l.data.data())};
+        const bool prop = info->decoder == nc::Decoder::kProp;
+        nc::PropInstance inst[18];
+        std::uint32_t ninst = 1;
+        if (prop) {
+            ninst = nc::read_prop_instances(vu, inst, 18U);
+            if (ninst == 0U) {
+                return false;
+            }
+            for (std::uint32_t k = 0; k != ninst; ++k) {
+                for (const float t : inst[k].tint) {
+                    if (!(t >= 0.0F && t * 255.0F < 255.5F)) {
+                        return false; // a lit prop: the strip stays a legacy strip
+                    }
+                }
+            }
+        }
+        std::uint32_t prim = 0;
+        if (!trusted_prim(vu, info, prim)) {
+            return false;
+        }
+        const double far_w = vu.f(1020U, 3), near_w = vu.f(1021U, 3);
+        if (!(near_w >= 0.0 && far_w > near_w && far_w < 1e9)) {
+            return false;
+        }
+        ++ts.launches;
+        // Off by default: the launches it sent back to the program (~7%) were dropped from the native picture (holes in the far
+        // mountains), while drawing them with the data-memory camera matches the VU1 picture (Time Attack lap, top half within 0.1%).
+        static const bool stale_check = env_flag("TAKEDOWN_NATIVE_CMD_STALE_CHECK", false);
+        if (stale_check && camera_stale(l, info, vu)) {
+            ++ts.stale_camera;   // the program draws with an older camera than data memory holds: it runs (legacy path), exact
+            return false;
+        }
+        std::shared_ptr<MeshEntry> mesh = mesh_for(vu, l, info);
+        const std::shared_ptr<ViewSlot> view = view_slot(vu);
+        const nc::ViewParams& vp = view->params;
+        std::shared_ptr<SpecSlot> spec;
+        float y0 = 0.0F;
+        float mirror[12] = {1, 0, 0, 0, 0, -1, 0, 0, 0, 0, 1, 0};
+        if (info->program == 12U) {
+            y0 = 2.0F * vu.f(1009U, 1);
+            mirror[7] = y0;
+        }
+        std::vector<TrustedDraw> out;
+        for (std::uint32_t k = 0; k != ninst; ++k) {
+            const float* xform = prop ? inst[k].xform : (info->program == 12U ? mirror : nullptr);
+            if (box_outside(vp, mesh->lo, mesh->hi, xform, far_w)) {
+                ++ts.instances_off;
+                continue;
+            }
+            std::uint32_t front = 0;
+            const std::uint32_t kept = trusted_mask(vp, *mesh, xform, program_culls(info->program), std::max(near_w, 1e-6), far_w, front);
+            const std::uint32_t ntri = static_cast<std::uint32_t>(mesh->tris.size() / 3U);
+            ts.tris_total += ntri;
+            ts.tris_kept += kept;
+            if (kept == 0U) {
+                continue;
+            }
+            if (info->decoder == nc::Decoder::kWorld3N && !spec) {
+                spec = spec_slot(vu);
+            }
+            TrustedDraw td;
+            Decision& d = td.d;
+            d.matched = true;
+            d.draw.nverts = n;
+            d.draw.prim = prim;
+            d.draw.tint[0] = d.draw.tint[1] = d.draw.tint[2] = d.draw.tint[3] = 1.0F;
+            d.draw.xform[0] = d.draw.xform[5] = d.draw.xform[10] = 1.0F;
+            d.draw.category = static_cast<std::uint16_t>(info->category);
+            d.draw.program = info->program;
+            d.draw.pass = static_cast<std::uint16_t>(prop ? k : static_cast<std::uint32_t>(out.size()));
+            d.draw.flags = nc::kDrawAdcMesh | nc::kDrawVerified | (prop ? 0U : nc::kDrawWorldSpace) | (info->program == 12U ? nc::kDrawMirror : 0U);
+            d.mesh_hold = mesh;
+            d.mesh_body = &wire_mesh_body(*mesh, false, d.mesh_key);
+            d.draw.mesh_key = d.mesh_key;
+            d.draw.view_id = view->id;
+            d.view = view;
+            if (spec) {
+                d.draw.flags |= nc::kDrawSpecular;
+                d.draw.const_key = spec->key;
+                d.spec = spec;
+            }
+            if (prop) {
+                std::memcpy(d.draw.xform, inst[k].xform, sizeof d.draw.xform);
+                std::memcpy(d.draw.tint, inst[k].tint, sizeof d.draw.tint);
+            } else if (info->program == 12U) {
+                std::memcpy(d.draw.xform, mirror, sizeof mirror);
+            }
+            d.draw.surv_pos = static_cast<std::uint16_t>(std::min<std::uint32_t>(kept, 65535U));
+            d.draw.kicks = kept;
+            if (kept != ntri) {
+                d.draw.flags |= nc::kDrawHasMask;
+                d.mask = t_mask;
+                d.mask_triangles = ntri;
+                ++st.masked;
+            }
+            out.push_back(std::move(td));
+        }
+        if (out.empty()) {
+            ++ts.offscreen;
+        }
+        // The token packet: one token (and, unless elided, its zero payload) per draw, EOP on the last.
+        std::size_t qw = 0;
+        for (std::size_t i = 0; i != out.size(); ++i) {
+            qw += 1U + (cfg.elide ? 0U : 3U * static_cast<std::size_t>(n));
+        }
+        rep.packet.assign(qw, std::array<std::uint32_t, 4>{});
+        std::size_t at = 0;
+        for (std::size_t i = 0; i != out.size(); ++i) {
+            out[i].id = next_trust_id++ & 0xFFFFFFU;
+            if (next_trust_id > 0xFFFFFFU) {
+                next_trust_id = 1;
+            }
+            const nc::Token tok{out[i].id, n, prim & 0x7FFU, ((prim >> 11U) & 1U) != 0U, i + 1U == out.size()};
+            rep.packet[at] = nc::encode_token(tok, cfg.elide);
+            at += 1U + (cfg.elide ? 0U : 3U * static_cast<std::size_t>(n));
+            ++ts.draws;
+            trusted.push_back(std::move(out[i]));
+        }
+        while (trusted.size() > kMaxTrusted) {
+            trusted.pop_front();
+            ++ts.tokens_lost;
+        }
+        trusted_side_effects(l, info, rep);
+        return true;
+    }
+
+    // A trusted token reached the GIF observer: write its definitions and DRAW record now (the position the strip would have had) and the
+    // token with its final sequence number. False: not a token of ours (forward unchanged).
+    bool trusted_token(const nc::Quad& q) {
+        if (trusted.empty() || !nc::is_token(q)) {
+            return false;
+        }
+        const nc::Token t = nc::decode_token(q);
+        while (!trusted.empty() && trusted.front().id != t.seq24) {
+            trusted.pop_front();
+            ++ts.tokens_lost;
+        }
+        if (trusted.empty()) {
+            ++ts.tokens_lost;
+            nc::Quad nop = q;
+            nop[2] = 0xFU;
+            nop[3] = 0U;
+            writer.write_gif_quadword(guest::GifPath::Path1, guest::GsQuadword{nop[0], nop[1], nop[2], nop[3]});
+            return true;
+        }
+        TrustedDraw td = std::move(trusted.front());
+        trusted.pop_front();
+        Decision& d = td.d;
+        d.draw.seq = next_seq;
+        write_defs_and_draw(d, nc::Tags{}, false);
+        emit_record();
+        const nc::Token tok{next_seq & 0xFFFFFFU, t.nverts, t.prim, t.pre, t.eop};
+        const nc::Quad out = nc::encode_token(tok, cfg.elide);
+        writer.write_gif_quadword(guest::GifPath::Path1, guest::GsQuadword{out[0], out[1], out[2], out[3]});
+        ++st.tokens;
+        ++f_tokens;
+        ++ts.tokens_matched;
+        if (d.is_car) {
+            ++st.matched_car;
+        } else {
+            ++st.matched_world;
+        }
+        ++next_seq;
+        return true;
+    }
+
     void forward_legacy(const guest::GsQuadword* strip, std::size_t count) {
         writer.on_gs_gif_quadwords(guest::GifPath::Path1, std::span<const guest::GsQuadword>(strip, count));
     }
@@ -931,6 +2025,9 @@ struct NativeCmdEmitter::Impl {
             }
         }
         lap(kSecDecide, lc);
+        if (d.matched && train_file != nullptr) {
+            train_dump(d);
+        }
         if (!d.matched) {
             forward_legacy(strip, count);
             ++st.strips_left;
@@ -1005,7 +2102,17 @@ struct NativeCmdEmitter::Impl {
         if (remaining == 0U) {
             const nc::Quad qq{q[0], q[1], q[2], q[3]};
             cur_tag = nc::parse_gif_tag(qq);
+            if (chk_on) {
+                chk_tag(qq, cur_tag);
+            }
             const std::uint32_t pay = payload_quadwords(cur_tag);
+            if (!trusted.empty() && trusted_token(qq)) {
+                remaining = pay;
+                if (pay == 0U) {
+                    end_of_tag();
+                }
+                return;
+            }
             if (is_candidate(cur_tag)) {
                 holding = true;
                 hold.clear();
@@ -1056,6 +2163,9 @@ struct NativeCmdEmitter::Impl {
                 if (is_candidate(t)) {
                     const std::size_t total = 1U + static_cast<std::size_t>(payload_quadwords(t));
                     if (i + total <= run.size()) {
+                        if (chk_on) {
+                            chk_tag(qq, t);
+                        }
                         cur_tag = t;
                         ++st.strips_held;
                         finish_strip(run.data() + i, total);
@@ -1147,6 +2257,12 @@ struct NativeCmdEmitter::Impl {
         ++frame;
         if (cfg.log_every != 0U && frame % cfg.log_every == 0U) {
             owner.log_stats("frame");
+            if (chk_on) {
+                chk_report();
+            }
+            if (train_file != nullptr) {
+                std::fflush(train_file);
+            }
         }
     }
 };
@@ -1169,6 +2285,12 @@ NativeCmdEmitter::NativeCmdEmitter(ParallelGsRawStreamWriter& writer, guest::Vu1
 }
 
 NativeCmdEmitter::~NativeCmdEmitter() {
+    if (impl_->chk_on) {
+        impl_->chk_report();
+    }
+    if (impl_->train_file != nullptr) {
+        std::fclose(impl_->train_file);
+    }
     if (native_cmd_stream_hooks() == this) {
         set_native_cmd_stream_hooks(nullptr);
     }
@@ -1177,19 +2299,53 @@ NativeCmdEmitter::~NativeCmdEmitter() {
 
 std::optional<guest::Vu1LaunchReplacement> NativeCmdEmitter::before_vu1_launch(const guest::EeMemory& memory, const guest::Vu1Launch& launch) {
     std::optional<guest::Vu1LaunchReplacement> r;
-    if (impl_->inner != nullptr) {
-        r = impl_->inner->before_vu1_launch(memory, launch);
-    }
     Impl& m = *impl_;
     const std::uint64_t t0 = m.cfg.timing ? now_ns() : 0U;
     ++stats_.launches;
     ++m.launch_counter;
     std::uint64_t lc = m.tsc();
-    const nc::ProgramInfo* info = m.identify(launch.micro);
-    m.lap(kSecIdentify, lc);
+    const nc::ProgramInfo* info = nullptr;
+    bool car_done = false;
+    if (m.car_trust_on) {
+        info = m.identify(launch.micro);
+        m.lap(kSecIdentify, lc);
+        if (info != nullptr && info->decoder == nc::Decoder::kCar) {
+            guest::Vu1LaunchReplacement rep;
+            if (m.handle_trusted_car(launch, rep)) {
+                r = std::move(rep);
+                car_done = true;
+                m.lap(kSecCarLaunch, lc);
+            }
+        }
+    }
+    if (!car_done) {
+        if (impl_->inner != nullptr) {
+            r = impl_->inner->before_vu1_launch(memory, launch);
+        }
+        if (!m.car_trust_on) {
+            info = m.identify(launch.micro);
+            m.lap(kSecIdentify, lc);
+        }
+    }
+    m.scr_pending = -1;
+    if (info != nullptr && m.trust_on && !r.has_value() && launch.entry == 0U && info->decoder != nc::Decoder::kCar && info->program != 13U) {
+        guest::Vu1LaunchReplacement rep;
+        if (m.try_reset_replacement(launch, info, rep)) {
+            return rep;
+        }
+    }
+    if (info != nullptr && m.scr_on && !r.has_value() && info->decoder != nc::Decoder::kCar && launch.entry != 0U && launch.entry != 4U) {
+        m.scr_apply(launch);
+    }
+    if (info != nullptr && m.chk_on && !r.has_value() && info->decoder != nc::Decoder::kCar) {
+        m.chk_before(launch, info);
+    }
     if (info != nullptr) {
         if (info->decoder == nc::Decoder::kCar) {
-            if (r.has_value() && launch.entry != 0U) {
+            if (r.has_value() && m.car_check_on) {
+                m.car_check(launch, *r);
+            }
+            if (r.has_value() && launch.entry != 0U && !car_done) {
                 m.handle_car_launch(launch, *r);
                 m.lap(kSecCarLaunch, lc);
             }
@@ -1200,7 +2356,19 @@ std::optional<guest::Vu1LaunchReplacement> NativeCmdEmitter::before_vu1_launch(c
             // renderer computes it; TAKEDOWN_NATIVE_CMD_P34=0 keeps them on the GS path.
             static const bool native_p34 = env_flag("TAKEDOWN_NATIVE_CMD_P34", true);
             if (native_p34 || (info->program != 3U && info->program != 4U)) {
-                m.handle_strip_launch(launch, info);
+                bool done = false;
+                if (m.trust_on) {
+                    guest::Vu1LaunchReplacement rep;
+                    if (m.handle_trusted_launch(launch, info, rep)) {
+                        r = std::move(rep);
+                        done = true;
+                    } else {
+                        ++m.ts.declined;
+                    }
+                }
+                if (!done) {
+                    m.handle_strip_launch(launch, info);
+                }
             }
         }
     }
@@ -1211,6 +2379,10 @@ std::optional<guest::Vu1LaunchReplacement> NativeCmdEmitter::before_vu1_launch(c
 }
 
 void NativeCmdEmitter::after_vu1_launch(const guest::EeMemory& memory, const guest::Vu1Launch& launch) {
+    if (impl_->chk_on) {
+        impl_->chk_after(launch);
+    }
+    impl_->reset_learn(launch);
     if (impl_->inner != nullptr) {
         impl_->inner->after_vu1_launch(memory, launch);
     }
@@ -1281,6 +2453,22 @@ void NativeCmdEmitter::log_stats(const char* tag) const {
                  static_cast<unsigned long long>(s.resets), static_cast<unsigned long long>(s.def_bytes), static_cast<unsigned long long>(s.draw_bytes),
                  static_cast<unsigned long long>(s.replaced_qw), static_cast<unsigned long long>(s.probe_mismatch), static_cast<unsigned long long>(s.records),
                  static_cast<unsigned long long>(s.ns_launch), static_cast<unsigned long long>(s.ns_stream));
+    {
+        const auto& t = impl_->ts;
+        std::fprintf(stderr, "[NATIVECMD] %s trust=%d reset-replayed=%llu: launches=%llu declined=%llu offscreen-launches=%llu instances-offscreen=%llu draws=%llu tokens=%llu lost=%llu tris kept/total=%llu/%llu stale-camera=%llu\n", tag, impl_->trust_on ? 1 : 0, static_cast<unsigned long long>(impl_->reset_replayed),
+                     static_cast<unsigned long long>(t.launches), static_cast<unsigned long long>(t.declined), static_cast<unsigned long long>(t.offscreen),
+                     static_cast<unsigned long long>(t.instances_off), static_cast<unsigned long long>(t.draws), static_cast<unsigned long long>(t.tokens_matched),
+                     static_cast<unsigned long long>(t.tokens_lost), static_cast<unsigned long long>(t.tris_kept), static_cast<unsigned long long>(t.tris_total), static_cast<unsigned long long>(t.stale_camera));
+    }
+    if (impl_->car_trust_on) {
+        const auto& c = impl_->cts;
+        std::fprintf(stderr, "[CARTRUST] %s launches=%llu draws=%llu declined=%llu tokens_matched=%llu tokens_lost=%llu\n", tag, static_cast<unsigned long long>(c.launches),
+                     static_cast<unsigned long long>(c.draws), static_cast<unsigned long long>(c.declined), static_cast<unsigned long long>(impl_->ts.tokens_matched),
+                     static_cast<unsigned long long>(impl_->ts.tokens_lost));
+    }
+    if (impl_->car_check_on) {
+        impl_->car_check_report();
+    }
     std::fprintf(stderr, "[NATIVECMD] %s v2: lines/odd-tint strips left to the GS=%llu unmapped strips left=%llu masked draws=%llu\n", tag, static_cast<unsigned long long>(s.v2_left), static_cast<unsigned long long>(s.v2_unmapped), static_cast<unsigned long long>(s.masked));
 }
 

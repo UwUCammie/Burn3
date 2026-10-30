@@ -255,7 +255,12 @@ inline constexpr std::uint32_t kLobbyPopupButtonStride = 128U;
 inline constexpr guest::GuestAddress kLobbyPopupPosition = kRegion + 0xCA00U;
 inline constexpr guest::GuestAddress kLobbyPopupSize = kRegion + 0xCA08U;
 inline constexpr guest::GuestAddress kLobbyPopupCentre = kRegion + 0xCA10U;
-inline constexpr std::uint32_t kVersionValue = 13U;
+// SETTINGS page (one page with tabs, drawn and driven by the host; the game
+// draws its title, header and footer).
+inline constexpr guest::GuestAddress kSettingsUpdate = kRegion + 0x4A0U;
+inline constexpr guest::GuestAddress kSettingsPage = kRegion + 0xD000U;
+inline constexpr guest::GuestAddress kSettingsVtable = kRegion + 0xD100U;
+inline constexpr std::uint32_t kVersionValue = 14U;
 } // namespace native_pc_layout
 
 // Retail addresses this module reads, patches or acts at (SLUS-21050). Each
@@ -299,6 +304,15 @@ inline constexpr guest::GuestAddress kHubWidgetInitCall = 0x003F3A84U; // jal 0x
 inline constexpr guest::GuestAddress kHubSelectionTable = 0x004A5514U; // entry for item 6 (data)
 inline constexpr guest::GuestAddress kHubSelectionTableCamera = 0x004A5518U; // entry for item 7 (data)
 inline constexpr guest::GuestAddress kHubSelectionTableMods = 0x004A551CU; // entry for item 8 (data)
+// The hub's confirm: the selected row (v1) is checked against EA GAMES TRAX
+// (row 4) before the table lookup. The SETTINGS hub has the rows SETTINGS,
+// EA GAMES TRAX and MODS, remapped here to table entries 7, 4 and 6.
+inline constexpr guest::GuestAddress kHubSelectSite = 0x003EC5A0U; // addiu v0, zero, 4
+inline constexpr guest::GuestAddress kHubSelectionTableSettings = kHubSelectionTableMods;
+inline constexpr std::uint32_t kSettingsDetail = 9U;
+inline constexpr std::uint32_t kSettingsStringId = 454U; // "SETTINGS"
+inline constexpr std::uint32_t kAudioPauseStringId = 408U; // "AUDIO"
+inline constexpr std::uint32_t kControllersStringId = 199U; // "CONTROLLERS"
 
 // Options detail screen 0x0045C140, sub-page switch.
 inline constexpr guest::GuestAddress kDetailScreen = 0x0045C140U;     // addiu sp, sp, -80
@@ -408,6 +422,16 @@ class Slus21050NativePcOptions {
     [[nodiscard]] std::optional<std::string> consume_lobby_error();
 
     [[nodiscard]] bool installed() const noexcept { return installed_; }
+
+    // SETTINGS page. The host draws it and handles its input while it is the
+    // game's current page; these requests are carried out by the page's next
+    // update, inside the game's frame: retail sounds, the audio settings
+    // refresh (after the host wrote the profile's audio bytes) and Back.
+    [[nodiscard]] bool settings_page_active(const guest::EeMemory& memory) const;
+    [[nodiscard]] bool settings_pause_context() const noexcept { return settings_pause_; }
+    void settings_play_sound(std::uint32_t sound);
+    void settings_apply_audio() noexcept { settings_apply_audio_ = true; }
+    void settings_back() noexcept { settings_back_ = true; }
     // True once after the player chose QUIT GAME on the main menu.
     [[nodiscard]] bool consume_quit_request() noexcept { return std::exchange(quit_requested_, false); }
     // While the MODS page is the game's current page: the focused row of the
@@ -453,7 +477,7 @@ class Slus21050NativePcOptions {
     // The page update's input checks, in the retail order.
     enum class UpdatePhase : std::uint8_t { Up, Down, Side };
     // Which of the two pages the current sequence belongs to.
-    enum class PageKind : std::uint8_t { Pc, Mods, Camera, Controls, Gameplay };
+    enum class PageKind : std::uint8_t { Pc, Mods, Camera, Controls, Gameplay, Settings };
 
     [[nodiscard]] bool install(guest::EeMemory& memory);
     [[nodiscard]] bool patch_string_table(guest::EeMemory& memory, bool first_time);
@@ -568,6 +592,11 @@ class Slus21050NativePcOptions {
     bool init_pause_context_{false};
     // Entries the hub init owes after its patched count (0 when none).
     std::uint32_t hub_items_{0U};
+    std::uint32_t hub_rows_{0U}; // rows of the SETTINGS hub while it is built
+    std::vector<std::uint32_t> settings_sounds_;
+    bool settings_apply_audio_{false};
+    bool settings_back_{false};
+    bool settings_pause_{false};
     // The main menu init's count was extended, so its rows must be too.
     bool main_menu_extended_{false};
     bool quit_requested_{false};

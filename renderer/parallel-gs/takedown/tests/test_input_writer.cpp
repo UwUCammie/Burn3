@@ -69,7 +69,7 @@ constexpr std::uint32_t kAdvanceBit = 1U << 17U;
 constexpr std::uint32_t kCaptureBit = 1U << 18U;
 constexpr std::uint32_t kQuitBit = 1U << 19U;
 
-const std::string kScratchDir = (std::filesystem::temp_directory_path() / "takedown-input-writer-test").string();
+const std::string kScratchDir = "/tmp/claude-1000/agent-input";
 
 // Creates a FIFO and removes it again when the test ends.
 class Fifo

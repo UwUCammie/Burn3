@@ -2,6 +2,7 @@
 #if defined(_WIN32)
 #include "takedown/platform/windows_gs_pipe.hpp"
 #include "takedown/platform/native_cmd_protocol.hpp"
+#include "gs_shm_ring.h"
 #endif
 #include <exception>
 #include <cstdio>
@@ -139,12 +140,30 @@ bool is_live_pipe_name(const std::string &path)
 
 std::FILE *open_graphics_stream(const std::string &path, std::string &error, bool announce_native_cmd)
 {
+	return open_graphics_stream(path, error, announce_native_cmd, nullptr);
+}
+
+std::FILE *open_graphics_stream(const std::string &path, std::string &error, bool announce_native_cmd, GsShm **ring)
+{
+	if (ring)
+		*ring = nullptr;
 #if defined(_WIN32)
 	if (is_live_pipe_name(path))
 	{
 		try
 		{
 			namespace pipe = takedown::platform::windows_gs_pipe;
+			const std::wstring wide = pipe::widen(path.c_str());
+			const char *shm_env = std::getenv("TAKEDOWN_GS_STREAM_SHM");
+			const bool want_ring = ring && stream_dump_path().empty() && !(shm_env && shm_env[0] == '0');
+			char base[40] = {};
+			if (want_ring)
+			{
+				// Announce shared-memory support before connecting; kept for the life of the process.
+				gs_shm_cap_name(wide.c_str(), base, sizeof(base));
+				static HANDLE announce = gs_shm_cap_create(base);
+				(void)announce;
+			}
 			if (announce_native_cmd)
 			{
 				// The game looks for this event when it connects; it stays open (manual reset, never set) for the life of the process.
@@ -155,7 +174,7 @@ std::FILE *open_graphics_stream(const std::string &path, std::string &error, boo
 				else
 					std::fprintf(stderr, "[INFO]: Native command stream v%u announced (%s).\n", takedown::native_cmd::kVersion, name.c_str());
 			}
-			HANDLE handle = pipe::open_reader(pipe::widen(path.c_str()).c_str());
+			HANDLE handle = pipe::open_reader(wide.c_str());
 			const int descriptor = _open_osfhandle(reinterpret_cast<std::intptr_t>(handle), _O_RDONLY | _O_BINARY);
 			if (descriptor < 0)
 			{
@@ -168,8 +187,51 @@ std::FILE *open_graphics_stream(const std::string &path, std::string &error, boo
 			{
 				_close(descriptor);
 				error = "could not wrap GS pipe stream";
+				return nullptr;
 			}
-			return maybe_tee(file);
+			file = maybe_tee(file);
+			if (!want_ring || !file)
+				return file;
+
+			// The first byte tells the carrier: 0xFE opens a hello record, anything else is the stream
+			// itself (no valid record starts with 0xFE) and is pushed back.
+			const int first = std::fgetc(file);
+			if (first == EOF)
+				return file;
+			if (first != 0xFE)
+			{
+				std::ungetc(first, file);
+				return file;
+			}
+			unsigned char hello[GS_SHM_HELLO_BYTES];
+			hello[0] = 0xFE;
+			uint32_t ring_bytes = 0;
+			if (std::fread(hello + 1, 1, sizeof(hello) - 1, file) != sizeof(hello) - 1 || !gs_shm_hello_decode(hello, &ring_bytes))
+			{
+				std::fclose(file);
+				error = "malformed shared-memory hello from the game";
+				return nullptr;
+			}
+			ULONG server_pid = 0;
+			HANDLE peer = nullptr;
+			if (GetNamedPipeServerProcessId(reinterpret_cast<HANDLE>(_get_osfhandle(_fileno(file))), &server_pid))
+				peer = OpenProcess(SYNCHRONIZE, FALSE, server_pid);
+			uint32_t spin_us = 0;
+			if (const char *spin = std::getenv("TAKEDOWN_GS_STREAM_SHM_SPIN_US"); spin && *spin)
+				spin_us = uint32_t(std::strtoul(spin, nullptr, 10));
+			auto *opened = new GsShm;
+			if (gs_shm_consumer_open(opened, base, spin_us, peer) != 0)
+			{
+				delete opened;
+				if (peer)
+					CloseHandle(peer);
+				std::fclose(file);
+				error = "could not open the game's shared-memory ring";
+				return nullptr;
+			}
+			std::fprintf(stderr, "[INFO]: Graphics stream: shared-memory ring %u KB.\n", ring_bytes >> 10);
+			*ring = opened;
+			return file;
 		}
 		catch (const std::exception &e)
 		{
