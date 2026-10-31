@@ -15,6 +15,7 @@
 #include "takedown/engine/world/trail.hpp"
 #include "takedown/engine/world/view_frustum.hpp"
 #include "takedown/runtime/guest_call.hpp"
+#include "takedown/runtime/game/hot_leaves.hpp"
 #include "takedown/runtime/guest_memory.hpp"
 #include "takedown/runtime/slus_21050_camera_fov.hpp"
 #include "takedown/runtime/slus_21050_engine_function_table.hpp"
@@ -2919,6 +2920,14 @@ constexpr std::array kFunctions{
                    {}, 1e-4, kSunProjectionAbsoluteTolerance},
     EngineFunction{0x002187b0U, 1356U, 0x6c197529d2999fcbULL, "AppendSpriteStrip", 12000U, append_sprite_strip,
                    EngineReturn::Nothing, {}, 1e-4, 1e-6, {}, sprite_strip_cost},
+    EngineFunction{0x0019d1c0U, 632U, 0xfcecd14e5a0d5a0bULL, "AppendColouredQuad", 158U,
+                   hot_leaves::append_coloured_quad, EngineReturn::Nothing},
+    EngineFunction{0x001c6f90U, 2288U, 0x413673ce29274cccULL, "UpdateEngineRevs", 300U,
+                   hot_leaves::update_engine_revs, EngineReturn::Float},
+    EngineFunction{0x001de198U, 196U, 0xab1b41d138f86332ULL, "NormalizeVector", 39U, hot_leaves::normalize_vector,
+                   EngineReturn::Float, {}, 1e-4, 1e-6, {}, hot_leaves::normalize_vector_cost},
+    EngineFunction{0x002ae3c0U, 344U, 0xe2fafb809f33005aULL, "PointsToFrameAxes", 203U, hot_leaves::to_frame_axes,
+                   EngineReturn::Nothing, {}, 1e-4, 1e-6, {}, hot_leaves::to_frame_axes_cost},
     EngineFunction{0x002f0640U, 10288U, 0x2a18626732110246ULL, "TestBoxPair", 3200U, test_box_pair,
                    EngineReturn::Integer},
     EngineFunction{0x002f2e70U, 1616U, 0x73b94a6ab9ec5163ULL, "TestMeshAgainstBox", 12000U, test_mesh_against_box,

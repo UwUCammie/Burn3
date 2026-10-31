@@ -521,6 +521,7 @@ target_sources(
         src/runtime/game/audio.cpp
         src/runtime/game/c_library.cpp
         src/runtime/game/content.cpp
+        src/runtime/game/hot_leaves.cpp
         src/runtime/game/render.cpp
         src/runtime/game/text.cpp
         src/runtime/game/track.cpp
@@ -542,6 +543,7 @@ target_sources(
         src/ui/options_menu.cpp
         src/ui/pc_options_session.cpp
         src/ui/controls_session.cpp
+        src/ui/control_style.cpp
         src/ui/controls_editor.cpp
         src/ui/settings_menu.cpp
         src/ui/mod_sync_session.cpp

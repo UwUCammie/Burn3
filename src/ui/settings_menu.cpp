@@ -1,5 +1,7 @@
 #include "takedown/ui/settings_menu.hpp"
 
+#include "takedown/ui/control_style.hpp"
+
 #include "takedown/presentation/bitmap_font.hpp"
 
 #include <algorithm>
@@ -802,6 +804,105 @@ platform::ParallelGsHostUi SettingsMenu::host_ui(const std::string& font_directo
             centred_text(b, lines[i], 120.0f, 520.0f, top + 12.0f + 16.0f * static_cast<float>(i), kValueSize, kText);
         }
     }
+    return ui;
+}
+
+
+platform::ParallelGsHostUi control_style_prompt_ui(const std::string& font_directory, const std::string& art_directory,
+                                                   const ControlStylePrompt& prompt) {
+    platform::ParallelGsHostUi ui;
+    if (!prompt.is_open()) {
+        return ui;
+    }
+    Builder b{ui.items, art_directory, font_directory};
+    {
+        ParallelGsUiItem fonts;
+        fonts.kind = ParallelGsUiKind::FontDirectory;
+        fonts.text = font_directory;
+        ui.items.push_back(std::move(fonts));
+    }
+    const auto fade = [](const float t) { return std::clamp(t, 0.0f, 1.0f); };
+    const float out = 1.0f - fade(prompt.closing() / 0.25f);
+    const float page_alpha = fade(prompt.clock() / kOpenFade) * out;
+    const auto animate = [&ui](const std::size_t first, const float dy, const float alpha) {
+        for (std::size_t k = first; k < ui.items.size(); ++k) {
+            ParallelGsUiItem& item = ui.items[k];
+            item.y = static_cast<std::int16_t>(std::lround(static_cast<float>(item.y) + dy));
+            if (item.kind == ParallelGsUiKind::Text && (item.flags & platform::kParallelGsUiExactOrigin) != 0U) {
+                item.corners[1] += dy;
+            }
+            const auto a = static_cast<std::uint32_t>(std::lround(static_cast<float>(item.colour >> 24U) * alpha));
+            item.colour = (item.colour & 0x00FFFFFFU) | (a << 24U);
+        }
+    };
+
+    // The game behind, dimmed; the panel; the title and what it is for.
+    const std::size_t page_first = ui.items.size();
+    b.rect(0.0f, 0.0f, 640.0f, 448.0f, rgba(4, 8, 20, 170));
+    constexpr float kLeft = 72.0f, kTop = 66.0f, kWidth = 496.0f, kHeight = 318.0f;
+    b.rect(kLeft, kTop, kWidth, kHeight, kPanel);
+    b.frame(kLeft, kTop, kWidth, kHeight, kPanelEdge);
+    centred_text(b, "CONTROLLER LAYOUT", kLeft, kLeft + kWidth, kTop + 14.0f, 20.0f, kText, kTabFont);
+    b.rect(kLeft + 150.0f, kTop + 40.0f, kWidth - 300.0f, 3.0f, kAccent);
+    centred_text(b, "CHOOSE THE BUTTON LAYOUT FOR YOUR CONTROLLER.", kLeft, kLeft + kWidth, kTop + 52.0f,
+                 kDescriptionText, kValueText);
+    centred_text(b, "YOU CAN CHANGE IT LATER IN SETTINGS, CONTROLS.", kLeft, kLeft + kWidth, kTop + 66.0f,
+                 kDescriptionText, kTextDim);
+    animate(page_first, 0.0f, page_alpha);
+
+    struct Card {
+        ControlStyle style;
+        const char* title;
+        std::array<std::pair<const char*, const char*>, 7> rows;
+    };
+    const std::array<Card, 2> cards{{
+        {ControlStyle::PlayStation2, "PLAYSTATION 2",
+         {{{"ACCELERATE", "CROSS"}, {"BRAKE", "SQUARE"}, {"BOOST", "R1"}, {"CRASHBREAKER", "R2"}, {"LOOK BACK", "L1"},
+           {"CAMERA", "TRIANGLE"}, {"MENUS", "CROSS / TRIANGLE"}}}},
+        {ControlStyle::Xbox, "XBOX",
+         {{{"ACCELERATE", "RT"}, {"BRAKE", "LT"}, {"BOOST", "A"}, {"CRASHBREAKER", "B"}, {"LOOK BACK", "X"},
+           {"CAMERA", "Y"}, {"MENUS", "A / B"}}}},
+    }};
+    for (std::size_t i = 0U; i < cards.size(); ++i) {
+        const Card& card = cards[i];
+        const std::size_t first = ui.items.size();
+        const auto r = ControlStylePrompt::card(card.style);
+        const bool selected = prompt.selection() == card.style;
+        b.rect(r[0], r[1], r[2], r[3], selected ? rgba(30, 60, 110, 220) : kBox);
+        b.frame(r[0], r[1], r[2], r[3], selected ? kText : kBoxEdge);
+        if (selected) {
+            b.rect(r[0] + 1.0f, r[1] + 1.0f, r[2] - 2.0f, 3.0f, kAccent);
+        }
+        centred_text(b, card.title, r[0], r[0] + r[2], r[1] + (selected ? 10.0f : 12.0f),
+                     selected ? kFocusText : kRowText, selected ? kText : kTextDim, kMenuFont);
+        b.rect(r[0] + 12.0f, r[1] + 33.0f, r[2] - 24.0f, 1.0f, kPanelEdge);
+        for (std::size_t row = 0U; row < card.rows.size(); ++row) {
+            const float y = r[1] + 42.0f + 18.0f * static_cast<float>(row) + (row + 1U == card.rows.size() ? 6.0f : 0.0f);
+            if (row + 1U == card.rows.size()) {
+                b.rect(r[0] + 12.0f, y - 6.0f, r[2] - 24.0f, 1.0f, kPanelEdge);
+            }
+            b.text(card.rows[row].first, r[0] + 14.0f, y, 100.0f, kDescriptionText - 1.0f, selected ? kTextDim : kTextDisabled);
+            b.text(card.rows[row].second, r[0] + 100.0f, y, r[2] - 114.0f, kValueSize,
+                   selected ? kText : kTextDim, platform::kParallelGsUiAlignRight);
+        }
+        // Cards rise into place one after the other, as the settings rows slide in.
+        const float t = fade((prompt.clock() - 0.08f - kRowStagger * 2.0f * static_cast<float>(i)) / kRowSlide);
+        const float eased = 1.0f - (1.0f - t) * (1.0f - t) * (1.0f - t);
+        animate(first, 24.0f * (1.0f - eased), t * out);
+    }
+
+    // Arrows beside the cards and the buttons that take the choice.
+    const std::size_t footer_first = ui.items.size();
+    const auto ps2 = ControlStylePrompt::card(ControlStyle::PlayStation2);
+    const auto xbox = ControlStylePrompt::card(ControlStyle::Xbox);
+    const float arrow_y = ps2[1] + ps2[3] * 0.5f - 6.5f;
+    const bool on_xbox = prompt.selection() == ControlStyle::Xbox;
+    b.image("arrow-left.png", ps2[0] - 14.0f, arrow_y, 7.0f, 13.0f, on_xbox ? 0xFFFFFFFFU : 0x50FFFFFFU);
+    b.image("arrow-right.png", xbox[0] + xbox[2] + 7.0f, arrow_y, 7.0f, 13.0f, on_xbox ? 0x50FFFFFFU : 0xFFFFFFFFU);
+    b.rect(kLeft + 16.0f, kTop + kHeight - 30.0f, kWidth - 32.0f, 1.0f, kPanelEdge);
+    centred_text(b, "LEFT / RIGHT: CHOOSE        CROSS / A / ENTER: CONFIRM", kLeft, kLeft + kWidth,
+                 kTop + kHeight - 21.0f, kDescriptionText, kTextDim);
+    animate(footer_first, 0.0f, page_alpha);
     return ui;
 }
 

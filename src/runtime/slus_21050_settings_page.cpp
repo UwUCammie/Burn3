@@ -205,7 +205,13 @@ ui::SettingsPageContent Slus21050SettingsPage::content(const guest::EeMemory& me
         row.description = !controls.notice.empty() ? controls.notice
                           : action ? "Confirm adds a control to this action, or removes one that is already bound. "
                                      "An action can have several."
-                                   : std::string{};
+                          : index == ui::ControlsEditor::kPlayStation2LayoutRow
+                              ? "Controller buttons as on PlayStation 2: Cross accelerates, Square brakes, R1 boosts, "
+                                "R2 Crashbreaker. Keyboard bindings are kept."
+                          : index == ui::ControlsEditor::kXboxLayoutRow
+                              ? "Controller buttons as on Xbox: RT accelerates, LT brakes, A boosts, B Crashbreaker; "
+                                "A confirms and B goes back in menus. Keyboard bindings are kept."
+                              : std::string{};
         controls_tab.push_back(std::move(row));
     }
     if (controls.capturing) {

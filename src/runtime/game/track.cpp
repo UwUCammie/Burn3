@@ -368,6 +368,24 @@ NativeFunctionExecution route_open_ahead_of(NativeFunctionContext& context) {
     return call.finish(18U + 16U * static_cast<std::uint32_t>(ahead.quads_tested));
 }
 
+// The exact cost of a RouteOpenAhead / RouteOpenAheadOf call, decided before
+// it runs (both only read memory), so a call fits the scheduler's next
+// deadline by what it will really do rather than by the longest route.
+std::uint32_t route_open_ahead_cost(const NativeFunctionPrepareContext& context) {
+    const auto object = context.cpu.read_gpr_u32(4U);
+    if ((object & 0xffU) == kNoStripObject) {
+        return 5U;
+    }
+    const auto ahead = strip_route_open_ahead(context.memory, object, context.cpu.read_gpr_u32(5U),
+                                              context.cpu.read_gpr_u32(6U));
+    return 14U + 16U * static_cast<std::uint32_t>(ahead.quads_tested);
+}
+std::uint32_t route_open_ahead_of_cost(const NativeFunctionPrepareContext& context) {
+    const auto ahead = route_open_along(context.memory, context.memory.read_u32_le(context.cpu.read_gpr_u32(4U) + 4U),
+                                        context.cpu.read_gpr_u32(5U), context.cpu.read_gpr_u32(6U));
+    return 18U + 16U * static_cast<std::uint32_t>(ahead.quads_tested);
+}
+
 // Strip navigation. A place on the strips is an object handle (the address
 // FindNearestStripQuad gives, 0 for none) and a quad of that object's strip.
 // Each quad record names the neighbour across its start side (0) and its
@@ -528,16 +546,33 @@ GuestAddress locate_strip_quad(const guest::EeMemory& memory, GuestAddress handl
 
 // LocateStripQuad (original 0x001461d0): locate_strip_quad from handle a0 and
 // the u16 quad at a1 (which gets the quad) of the point at a2.
+struct LocatedStripQuad {
+    GuestAddress handle{};
+    std::uint16_t quad{};
+    std::uint32_t work{};
+};
+// Reads only; the call writes the quad afterwards.
+LocatedStripQuad locate_strip_quad_from(const guest::EeMemory& memory, const GuestAddress handle,
+                                        const GuestAddress quad_at, const GuestAddress point) {
+    LocatedStripQuad located{.quad = static_cast<std::uint16_t>(memory.read_u16_le(quad_at)), .work = 30U};
+    located.handle = locate_strip_quad(memory, handle, located.quad, load_vector4(memory, point & ~15U).xyz(),
+                                       located.work);
+    return located;
+}
+// Its exact cost, decided before it runs (a walk across many quads is rare;
+// the registration's ceiling covers the longest).
+std::uint32_t locate_strip_quad_cost(const NativeFunctionPrepareContext& context) {
+    return locate_strip_quad_from(context.memory, context.cpu.read_gpr_u32(4U), context.cpu.read_gpr_u32(5U),
+                                  context.cpu.read_gpr_u32(6U))
+        .work;
+}
 NativeFunctionExecution locate_strip_quad_call(NativeFunctionContext& context) {
     GuestCall call{context};
     auto& memory = call.memory();
-    auto quad = static_cast<std::uint16_t>(memory.read_u16_le(call.arg(1)));
-    std::uint32_t work = 30U;
-    const GuestAddress handle =
-        locate_strip_quad(memory, call.arg(0), quad, load_vector4(memory, call.arg(2) & ~15U).xyz(), work);
-    memory.write_u16_le(call.arg(1), quad);
-    call.return_value(handle);
-    return call.finish(work);
+    const LocatedStripQuad located = locate_strip_quad_from(memory, call.arg(0), call.arg(1), call.arg(2));
+    memory.write_u16_le(call.arg(1), located.quad);
+    call.return_value(located.handle);
+    return call.finish(located.work);
 }
 
 // StripQuadEdgesBeyond (original 0x00148690): engine::quad_edges_beyond of
@@ -790,41 +825,64 @@ engine::CubicBasis load_cubic_basis(const guest::EeMemory& memory, const GuestAd
 // NeighbourQuadEntry (original 0x00149c90): for the point at a1 in quad a3 of
 // strip object a2 (its handle), the point is copied to t0 when it lies
 // within the quad's sides; otherwise the quads across the side it lies
-// beyond are walked until one the driver of vehicle a0 may enter (by
-// RouteOpenAhead one quad, then QuadEntryForDriver), whose entry bits are
-// returned.
-NativeFunctionExecution neighbour_quad_entry(NativeFunctionContext& context) {
-    GuestCall call{context};
-    auto& memory = call.memory();
-    const GuestAddress point = call.arg(1) & ~15U;
-    const std::uint32_t outside = strip_quad_outside_edges(memory, call.arg(2), call.arg(3),
-                                                          load_vector4(memory, point).xyz());
+// beyond are walked while the driver of vehicle a0 may enter them (by
+// RouteOpenAhead one quad, then QuadEntryForDriver).
+struct NeighbourQuadEntryResult {
+    bool copy_point{};
+    std::uint32_t value{};
+    std::uint32_t cost{};
+};
+// Reads only; the call then copies the point when it lies within the quad.
+NeighbourQuadEntryResult evaluate_neighbour_quad_entry(const guest::EeMemory& memory, const GuestAddress vehicle,
+                                                       const GuestAddress point_at, const GuestAddress handle,
+                                                       const std::uint32_t start_quad) {
+    const GuestAddress point = point_at & ~15U;
+    const std::uint32_t outside = strip_quad_outside_edges(memory, handle, start_quad, load_vector4(memory, point).xyz());
     if ((outside & (engine::kQuadEdgeStartSide | engine::kQuadEdgeEndSide)) == 0U) {
-        copy_quadword(memory, call.arg(4) & ~15U, point);
-        call.return_value(outside);
-        return call.finish(140U);
+        return {true, outside, 140U};
     }
     const GuestAddress side = (outside & engine::kQuadEdgeStartSide) != 0U ? 0U : 1U;
-    const GuestAddress rules = memory.read_u32_le(call.arg(0) + RouteSplineLayout::kDriver) + kDriverQuadRules;
-    GuestAddress record = quad_record(memory, memory.read_u32_le(call.arg(2) + 4U), call.arg(3));
+    const GuestAddress rules = memory.read_u32_le(vehicle + RouteSplineLayout::kDriver) + kDriverQuadRules;
+    GuestAddress record = quad_record(memory, memory.read_u32_le(handle + 4U), start_quad);
     std::uint32_t cost = 150U;
+    // Across quads the driver may enter, to the first one it may not: 0 when
+    // the route there is closed (or there is no neighbour), else that quad's
+    // entry bits (with kQuadEntryClosed set).
     for (;;) {
         const std::uint8_t object = memory.read_u8(record + kQuadRecordNeighbourObject + side);
         const std::uint16_t quad = memory.read_u16_le(record + kQuadRecordNeighbourQuad + side * 2U);
         cost += 45U;
-        if (object != kNoStripObject) {
-            const auto ahead = strip_route_open_ahead(memory, object, quad, 1U);
-            cost += 16U * static_cast<std::uint32_t>(ahead.quads_tested);
-            if (ahead.open) {
-                const std::uint32_t entry = quad_entry_for(memory, rules, strip_object_strip(memory, object), quad);
-                if ((entry & engine::kQuadEntryClosed) == 0U) {
-                    call.return_value(entry);
-                    return call.finish(cost + 22U);
-                }
-            }
+        if (object == kNoStripObject) {
+            return {false, 0U, cost + 5U};
+        }
+        const auto ahead = strip_route_open_ahead(memory, object, quad, 1U);
+        cost += 16U * static_cast<std::uint32_t>(ahead.quads_tested);
+        if (!ahead.open) {
+            return {false, 0U, cost};
+        }
+        const std::uint32_t entry = quad_entry_for(memory, rules, strip_object_strip(memory, object), quad);
+        cost += 22U;
+        if ((entry & engine::kQuadEntryClosed) != 0U) {
+            return {false, entry, cost};
         }
         record = quad_record(memory, strip_object_strip(memory, object), quad);
     }
+}
+std::uint32_t neighbour_quad_entry_cost(const NativeFunctionPrepareContext& context) {
+    const auto& cpu = context.cpu;
+    return evaluate_neighbour_quad_entry(context.memory, cpu.read_gpr_u32(4U), cpu.read_gpr_u32(5U),
+                                         cpu.read_gpr_u32(6U), cpu.read_gpr_u32(7U))
+        .cost;
+}
+NativeFunctionExecution neighbour_quad_entry(NativeFunctionContext& context) {
+    GuestCall call{context};
+    auto& memory = call.memory();
+    const auto result = evaluate_neighbour_quad_entry(memory, call.arg(0), call.arg(1), call.arg(2), call.arg(3));
+    if (result.copy_point) {
+        copy_quadword(memory, call.arg(4) & ~15U, call.arg(1) & ~15U);
+    }
+    call.return_value(result.value);
+    return call.finish(result.cost);
 }
 
 // PlaceRouteSplinePoints (original 0x00149180): puts the vehicle a0's six
@@ -1007,6 +1065,15 @@ NativeFunctionExecution mark_strip_quad_in_lane_profile(NativeFunctionContext& c
 
 std::uint32_t best_lane_gap_cost(const std::int32_t low, const std::int32_t high) {
     return 30U + 42U * static_cast<std::uint32_t>(high - low > 6 ? high - low - 6 : 0);
+}
+
+std::uint32_t best_lane_gap_call_cost(const NativeFunctionPrepareContext& context) {
+    const auto& memory = context.memory;
+    const GuestAddress profile = context.cpu.read_gpr_u32(4U);
+    const float centre = load_float(memory, profile + LaneProfileLayout::kCentre);
+    return best_lane_gap_cost(engine::clamped_lane_bin(-centre),
+                              engine::clamped_lane_bin(engine::chop_sub(
+                                  load_float(memory, profile + LaneProfileLayout::kGapEnd), centre)));
 }
 
 // BestLaneGap (original 0x0013e790): the most open bin of lane profile a0
@@ -2579,23 +2646,23 @@ constexpr std::array kFunctions{
                    {}, 1e-4, 1e-6, {}, follow_strip_cost},
     EngineFunction{0x0013e530U, 608U, 0xce3fc2efd6a88772ULL, "MarkStripQuadInLaneProfile", 6000U,
                    mark_strip_quad_in_lane_profile, EngineReturn::Nothing},
-    EngineFunction{0x0013e790U, 396U, 0xd143f438dce3df91ULL, "BestLaneGap", 12000U, best_lane_gap},
+    EngineFunction{0x0013e790U, 396U, 0xd143f438dce3df91ULL, "BestLaneGap", 12000U, best_lane_gap, EngineReturn::Integer, {}, 1e-4, 1e-6, {}, best_lane_gap_call_cost},
     EngineFunction{0x00140a30U, 3656U, 0x92eb58fdde23c811ULL, "ChooseLaneTarget", 30000U, choose_lane_target,
                    EngineReturn::Nothing},
     EngineFunction{0x00148440U, 592U, 0x5b33c143df96797eULL, "ClassifyPointInStripQuad", 200U,
                    classify_point_in_strip_quad},
-    EngineFunction{0x00148ca0U, 184U, 0x6ea4094a0703a949ULL, "RouteOpenAhead", 1100000U, route_open_ahead},
-    EngineFunction{0x00148d60U, 144U, 0xf6a6b9b487d050c6ULL, "RouteOpenAheadOf", 1100000U, route_open_ahead_of},
+    EngineFunction{0x00148ca0U, 184U, 0x6ea4094a0703a949ULL, "RouteOpenAhead", 1100000U, route_open_ahead, EngineReturn::Integer, {}, 1e-4, 1e-6, {}, route_open_ahead_cost},
+    EngineFunction{0x00148d60U, 144U, 0xf6a6b9b487d050c6ULL, "RouteOpenAheadOf", 1100000U, route_open_ahead_of, EngineReturn::Integer, {}, 1e-4, 1e-6, {}, route_open_ahead_of_cost},
     EngineFunction{0x00146db0U, 364U, 0xdef7d04d9136b4f9ULL, "CrossStripSide", 20000U, cross_strip_side_call},
     EngineFunction{0x00146f20U, 604U, 0x6a4c38295610723cULL, "StepAlongStrip", 400U, step_along_strip_call},
-    EngineFunction{0x001461d0U, 868U, 0xca99b68df4155885ULL, "LocateStripQuad", 60000U, locate_strip_quad_call},
+    EngineFunction{0x001461d0U, 868U, 0xca99b68df4155885ULL, "LocateStripQuad", 60000U, locate_strip_quad_call, EngineReturn::Integer, {}, 1e-4, 1e-6, {}, locate_strip_quad_cost},
     EngineFunction{0x00148690U, 1000U, 0x62c81bf6961255cbULL, "StripQuadEdgesBeyond", 400U, strip_quad_edges_beyond},
     EngineFunction{0x00147f50U, 112U, 0x68d8b4b079ae8645ULL, "StripStartSideNormal", 40U, strip_side_normal_call<0U>},
     EngineFunction{0x00147ee0U, 112U, 0x61337fbcf1ef7a2dULL, "StripEndSideNormal", 40U, strip_side_normal_call<1U>},
     EngineFunction{0x001423e0U, 5240U, 0xa6d14f5e0af121f3ULL, "RacerFollowStrip", 80000U, racer_follow_strip,
                    EngineReturn::Nothing},
     EngineFunction{0x0014a480U, 224U, 0x3d823e68a7cbc973ULL, "QuadEntryForDriver", 40U, quad_entry_for_driver},
-    EngineFunction{0x00149c90U, 496U, 0xe4be0e32c30a5c2eULL, "NeighbourQuadEntry", 100000U, neighbour_quad_entry},
+    EngineFunction{0x00149c90U, 496U, 0xe4be0e32c30a5c2eULL, "NeighbourQuadEntry", 100000U, neighbour_quad_entry, EngineReturn::Integer, {}, 1e-4, 1e-6, {}, neighbour_quad_entry_cost},
     EngineFunction{0x00149180U, 1080U, 0x96ebc2aa20070d02ULL, "PlaceRouteSplinePoints", 2000U, place_route_spline_points,
                    EngineReturn::Nothing, kRouteSplineUnusedWords, 1e-4, kRouteSplineAbsoluteTolerance},
     EngineFunction{0x00251740U, 184U, 0x48758c7b3e254637ULL, "FindTrackSection", 200U, find_track_section},

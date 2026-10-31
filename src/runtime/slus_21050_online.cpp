@@ -175,7 +175,7 @@ void write_wide(guest::EeMemory& memory, Address address, std::string_view text)
 }
 
 std::string utf8_from_guest_utf16(const guest::EeMemory& memory, Address pointer) {
-    std::string encoded;
+    std::string result;
     for (std::size_t i = 0U; i <= 511U; ++i) {
         const Address at = pointer + static_cast<std::uint32_t>(i) * 2U;
         if (!ram(memory, at, 2U)) {
@@ -185,20 +185,18 @@ std::string utf8_from_guest_utf16(const guest::EeMemory& memory, Address pointer
         if (value == 0U) {
             break;
         }
-        if (value - 0xD800U <= 1023U) {
-            const Address next = pointer + static_cast<std::uint32_t>(i + 1U) * 2U;
-            if (ram(memory, next, 2U)) {
-                const std::uint32_t low = memory.read_u16_le(next);
-                if (low - 0xDC00U <= 1023U) {
-                    value = ((value - 0xD800U) << 10U) + low + 9216U;
-                    ++i;
-                } else {
-                    value = 0xFFFDU;
-                }
+        if (value - 0xD800U <= 1023U && ram(memory, pointer + static_cast<std::uint32_t>(i + 1U) * 2U, 2U)) {
+            const auto low = memory.read_u16_le(pointer + static_cast<std::uint32_t>(i + 1U) * 2U);
+            if (low >= 0xDC00U && low <= 0xDFFFU) {
+                value = ((value - 0xD800U) << 10U) + low + 9216U;
+                ++i;
+            } else {
+                value = 0xFFFDU;
             }
         } else if (value - 0xDC00U <= 1023U) {
             value = 0xFFFDU;
         }
+        std::string encoded;
         if (value <= 127U) {
             encoded.push_back(static_cast<char>(value));
         } else if (value <= 2047U) {
@@ -214,8 +212,13 @@ std::string utf8_from_guest_utf16(const guest::EeMemory& memory, Address pointer
             encoded.push_back(static_cast<char>(128U | ((value >> 6U) & 63U)));
             encoded.push_back(static_cast<char>(128U | (value & 63U)));
         }
+        // Keep whole characters only, and at most 127 bytes for the guest's text buffer.
+        if (result.size() + encoded.size() > 127U) {
+            break;
+        }
+        result += encoded;
     }
-    return encoded;
+    return result;
 }
 
 std::string percent_decode(std::string_view value) {
@@ -248,7 +251,8 @@ std::map<std::string, std::string> parse_fields(std::string_view text) {
         if (equals != std::string_view::npos) {
             auto value = line.substr(equals + 1U);
             if (value.size() >= 2U && value.front() == '"' && value.back() == '"') {
-                value = value.substr(1U, value.size() - 2U);
+                value.remove_prefix(1U);
+                value.remove_suffix(1U);
             }
             fields.emplace(std::string(line.substr(0U, equals)), percent_decode(value));
         }
@@ -350,50 +354,50 @@ bool signature_matches(const guest::EeMemory& memory, const Signature& signature
     return hash == signature.hash;
 }
 
-Address hook_address(const Address entry) {
-    if (entry == 0x00313230U) {
+Address hook_address(const Signature& signature) {
+    if (signature.begin == 0x00313230U) {
         return 0x0031336CU;
     }
-    if (entry == 0x00397280U) {
+    if (signature.begin == 0x00397280U) {
         return 0x003973F8U;
     }
-    if (entry == 0x00338D60U) {
+    if (signature.begin == 0x00338D60U) {
         return 0x00338DCCU;
     }
-    if (entry == 0x0033C390U) {
+    if (signature.begin == 0x0033C390U) {
         return 0x0033C5A4U;
     }
-    if (entry == 0x0035F4D0U) {
+    if (signature.begin == 0x0035F4D0U) {
         return 0x00360950U;
     }
-    if (entry == 0x00323A10U) {
+    if (signature.begin == 0x00323A10U) {
         return 0x00323A50U;
     }
-    if (entry == 0x00323E30U) {
+    if (signature.begin == 0x00323E30U) {
         return 0x00323E34U;
     }
-    if (entry == 0x003406C0U) {
+    if (signature.begin == 0x003406C0U) {
         return 0x0034115CU;
     }
-    if (entry == 0x0034BC30U) {
+    if (signature.begin == 0x0034BC30U) {
         return 0x0034BD60U;
     }
-    if (entry == 0x0034CD50U) {
+    if (signature.begin == 0x0034CD50U) {
         return 0x0034CD68U;
     }
-    if (entry == 0x00347440U) {
+    if (signature.begin == 0x00347440U) {
         return 0x003474ACU;
     }
-    if (entry == 0x003530F0U) {
+    if (signature.begin == 0x003530F0U) {
         return 0x00353114U;
     }
-    if (entry == 0x003181E0U) {
+    if (signature.begin == 0x003181E0U) {
         return 0x0031826CU;
     }
-    if (entry == 0x0034A430U) {
+    if (signature.begin == 0x0034A430U) {
         return 0x0034A478U;
     }
-    return entry;
+    return signature.begin;
 }
 
 } // namespace
@@ -431,7 +435,7 @@ struct Slus21050Online::Impl {
         bool used{};
         bool connected{};
         std::deque<Reply> replies;
-        std::uint32_t persona{};
+        bool persona{};
         std::map<std::uint32_t, LobbyUser> visible_users;
     };
     struct GuestJoin {
@@ -471,8 +475,8 @@ struct Slus21050Online::Impl {
     std::uint32_t news_request{};
     std::optional<std::string> news_body;
     bool news_failed{};
-    std::chrono::steady_clock::time_point news_deadline;
-    std::array<Ref, 4> refs;
+    std::chrono::steady_clock::time_point news_deadline{};
+    std::array<Ref, 4> refs{};
     std::map<std::uint32_t, LobbyUser> lobby_users;
     std::optional<GuestJoin> last_guest_join;
     std::optional<GuestJoin> blocked_join;
@@ -484,7 +488,7 @@ struct Slus21050Online::Impl {
     std::uint32_t rejoin_list_request{};
     std::uint32_t rejoin_join_request{};
     std::uint32_t retired_rejoin_request{};
-    std::chrono::steady_clock::time_point rejoin_deadline;
+    std::chrono::steady_clock::time_point rejoin_deadline{};
     std::optional<std::string> rejoin_error;
     bool discarded_session{};
     std::map<std::uint32_t, Pending> pending;
@@ -500,17 +504,18 @@ struct Slus21050Online::Impl {
     std::uint32_t socket_diagnostics{};
     std::vector<std::uint32_t> readiness_roster;
     std::map<std::uint32_t, std::chrono::steady_clock::time_point> readiness_reports;
-    std::chrono::steady_clock::time_point readiness_advertisement;
+    std::chrono::steady_clock::time_point readiness_advertisement{};
     bool advertised_ready{};
     std::deque<net::PeerMessage> datagrams;
     std::chrono::steady_clock::time_point epoch{std::chrono::steady_clock::now()};
     content::JsonValue::Array buddies;
     std::map<std::uint32_t, BuddyRequest> buddy_requests;
     std::deque<BuddyCallback> buddy_callbacks;
-    std::chrono::steady_clock::time_point buddy_refresh;
+    std::chrono::steady_clock::time_point buddy_refresh{};
     bool buddies_changed{};
     bool buddy_initialized{};
 
+    explicit Impl(net::MatchmakingConfig value) : config(std::move(value)) {}
 
     void clear_buddies() {
         buddies.clear();
@@ -700,13 +705,15 @@ struct Slus21050Online::Impl {
                memory.read_u32_le(5199132U) == 32020928U;
     }
 
+    // Callers check blocked_join.has_value() first.
     bool blocked_reference_live() const {
-        return blocked_join.has_value() && (*blocked_join).ref <= 3U && refs[(*blocked_join).ref].used &&
-               refs[(*blocked_join).ref].connected && refs[(*blocked_join).ref].persona != 0U;
+        return (*blocked_join).ref <= 3U && refs[(*blocked_join).ref].used &&
+               refs[(*blocked_join).ref].connected && refs[(*blocked_join).ref].persona;
     }
 
     bool blocked_page_active(const guest::EeMemory& memory) const {
-        return blocked_reference_live() && memory.read_u32_le(32123252U) == (*blocked_join).screen &&
+        return blocked_join.has_value() && blocked_reference_live() &&
+               memory.read_u32_le(32123252U) == (*blocked_join).screen &&
                ((*blocked_join).page == 0U || memory.read_u32_le(32048176U) == (*blocked_join).page) &&
                memory.read_u32_le(31706696U) == (*blocked_join).lobby &&
                ram(memory, (*blocked_join).lobby, 4U) &&
@@ -721,18 +728,17 @@ struct Slus21050Online::Impl {
             if (ram(c.memory, lobby_object, 4U)) {
                 const auto marker = c.memory.read_u32_le(lobby_object);
                 if (marker >= 729088U) {
-                    const auto offset = marker - 729088U;
-                    if (offset % 8960U == 0U && offset / 8960U < refs.size()) {
-                        const auto& ref = refs[offset / 8960U];
-                        live_sdk = ref.used && ref.connected && ref.persona != 0U;
+                    if ((marker - 729088U) % 8960U == 0U && (marker - 729088U) / 8960U < refs.size()) {
+                        const auto& ref = refs[(marker - 729088U) / 8960U];
+                        live_sdk = ref.used && ref.connected && ref.persona;
                     }
                 }
             }
             if (a0 == 31666112U && state == State::Online && player != 0U && peers != nullptr &&
                 live_sdk && c.memory.read_u32_le(31667428U) == 31704608U &&
                 c.memory.read_u32_le(31667524U) == 9U && c.memory.read_u32_le(31667536U) == 3658U) {
-                const auto address_text = virtual_address_text(player);
-                const std::uint32_t local = (player & 65535U) + 184418304U;
+                const auto address_text = virtual_address_text(self_address());
+                const std::uint32_t local = self_virtual_address();
                 if (c.memory.read_u32_le(31667500U) != local ||
                     c.memory.read_u32_le(31667516U) != local ||
                     read_text(c.memory, 31704636U, 16U) != address_text ||
@@ -747,7 +753,7 @@ struct Slus21050Online::Impl {
                     write_text(c.memory, 31707836U, address_text);
                 }
             }
-            c.cpu.write_gpr_sign_extended_32(3U, c.memory.read_u32_le(a0 + 1404U));
+            c.cpu.write_gpr_u64(3U, static_cast<std::uint64_t>(static_cast<std::int32_t>(c.memory.read_u32_le(a0 + 1404U))));
             c.cpu.set_pc(2312356U);
             return true;
         }
@@ -765,28 +771,32 @@ struct Slus21050Online::Impl {
             const auto a1 = c.cpu.read_gpr_u32(5U);
             if (c.cpu.read_gpr_u32(4U) == 31706436U && ram(c.memory, a1, 40U)) {
                 GuestJoin saved;
-                for (unsigned i = 0U; i != 10U; ++i) {
-                    saved.words[i] = c.memory.read_u32_le(a1 + i * 4U);
-                }
-                saved.name = read_text(c.memory, saved.words[1], 33U);
-                saved.password = read_text(c.memory, saved.words[2], 33U);
-                if (blocked_join.has_value() && admitted_rejoin_matches(blocked_join->ref) &&
-                    saved.words[0] == blocked_join->room && saved.name == blocked_join->name &&
-                    saved.password == blocked_join->password &&
-                    rejoin_dispatch_context_valid(c.memory)) {
-                    complete_admitted_rejoin();
-                }
-                saved.screen = c.memory.read_u32_le(32123252U);
-                saved.page = c.memory.read_u32_le(32048176U);
-                saved.frontend_return = c.cpu.read_gpr_u32(31U);
-                if (saved.page == 32086432U ||
-                    (saved.page == 32104528U && saved.frontend_return == 3650248U)) {
-                    for (unsigned i = 0U; i != 12U; ++i) {
-                        saved.browser_selection[i] = c.memory.read_u32_le(saved.page + i * 4U + 8U);
+                // A join snapshot that cannot be read is simply not remembered.
+                try {
+                    for (unsigned i = 0U; i != 10U; ++i) {
+                        saved.words[i] = c.memory.read_u32_le(a1 + i * 4U);
                     }
+                    saved.name = read_text(c.memory, saved.words[1], 33U);
+                    saved.password = read_text(c.memory, saved.words[2], 33U);
+                    if (blocked_join.has_value() && admitted_rejoin_matches(blocked_join->ref) &&
+                        saved.words[0] == blocked_join->room && saved.name == blocked_join->name &&
+                        saved.password == blocked_join->password &&
+                        rejoin_dispatch_context_valid(c.memory)) {
+                        complete_admitted_rejoin();
+                    }
+                    saved.screen = c.memory.read_u32_le(32123252U);
+                    saved.page = c.memory.read_u32_le(32048176U);
+                    saved.frontend_return = c.cpu.read_gpr_u32(31U);
+                    if (saved.page == 32086432U ||
+                        (saved.page == 32104528U && saved.frontend_return == 3650248U)) {
+                        for (unsigned i = 0U; i != 12U; ++i) {
+                            saved.browser_selection[i] = c.memory.read_u32_le(saved.page + i * 4U + 8U);
+                        }
+                    }
+                    saved.lobby = c.memory.read_u32_le(31706696U);
+                    last_guest_join = saved;
+                } catch (...) {
                 }
-                saved.lobby = c.memory.read_u32_le(31706696U);
-                last_guest_join = saved;
             }
             c.cpu.write_gpr_u64(29U, c.cpu.read_gpr_u32(29U) - 144U);
             c.cpu.set_pc(3382356U);
@@ -794,9 +804,7 @@ struct Slus21050Online::Impl {
         }
         if (address == 3224428U || address == 3765240U) {
             const Address target = c.cpu.read_gpr_u32(29U) + 32U;
-            const std::string encoded =
-                utf8_from_guest_utf16(c.memory, c.memory.read_u32_le(32033428U));
-            write_text(c.memory, target, encoded);
+            write_text(c.memory, target, utf8_from_guest_utf16(c.memory, c.memory.read_u32_le(32033428U)));
             c.cpu.set_pc(address == 3224428U ? 3224444U : 3765256U);
             return true;
         }
@@ -826,23 +834,22 @@ struct Slus21050Online::Impl {
             update();
             publish_presence(c.memory);
             if (presence_requested && state == State::Online && buddy_requests.empty() &&
-                buddy_refresh <= std::chrono::steady_clock::now()) {
+                std::chrono::steady_clock::now() >= buddy_refresh) {
                 request_buddies("list", std::string{}, 0U, 0U);
             }
             const auto ret = c.cpu.read_gpr_u32(31U);
             if (rejoin_stage == RejoinStage::Failed && state == State::Online) {
                 if (mod_mismatch_pending && c.memory.read_u8(31706710U) != 0U) {
-                    if (!rejoin_prepared_announced) {
-                        if (c.memory.read_u32_le(31706712U) != 0U) {
-                            fail_rejoin("The online session reported another error. Choose the lobby again.");
-                        } else {
-                            mod_mismatch_pending = false;
-                            std::clog << "Native online: acknowledging owned mod-sync join refusal\n";
-                            ui_call(c, 3378816U, ret, 31706436U, 0U, 0U, 0U);
-                            return true;
-                        }
+                    if (c.memory.read_u32_le(31706712U) != 0U) {
+                        fail_rejoin("The online session reported another error. Choose the lobby again.");
+                    } else {
+                        mod_mismatch_pending = false;
+                        std::clog << "Native online: acknowledging owned mod-sync join refusal\n";
+                        ui_call(c, 3378816U, ret, 31706436U, 0U, 0U, 0U);
+                        return true;
                     }
-                } else if (c.memory.read_u8(31706708U) == 0U && c.memory.read_u8(31706710U) == 0U) {
+                } else if (!rejoin_prepared_announced && c.memory.read_u8(31706708U) == 0U &&
+                           c.memory.read_u8(31706710U) == 0U) {
                     mod_mismatch_pending = false;
                     rejoin_prepared = true;
                     rejoin_prepared_announced = true;
@@ -855,43 +862,39 @@ struct Slus21050Online::Impl {
                 } else if (c.memory.read_u8(31706710U) != 0U) {
                     fail_rejoin("The online session reported another error. Choose the lobby again.");
                 } else if (c.memory.read_u8(31706708U) == 0U) {
-                    std::optional<ModSyncSelection> selection;
-                    if (mod_sync_selection_resolver) {
-                        const std::uint64_t vehicle_key =
-                            static_cast<std::uint64_t>(blocked_join->words[3]) |
-                            (static_cast<std::uint64_t>(blocked_join->words[4]) << 32U);
-                        selection = mod_sync_selection_resolver(c.memory, vehicle_key,
-                                                                blocked_join->words[5]);
-                    }
+                    const auto& join = *blocked_join;
+                    const std::optional<ModSyncSelection> selection =
+                        mod_sync_selection_resolver != nullptr
+                            ? mod_sync_selection_resolver(c.memory,
+                                                          static_cast<std::uint64_t>(join.words[3]) |
+                                                              (static_cast<std::uint64_t>(join.words[4]) << 32U),
+                                                          join.words[5])
+                            : std::nullopt;
                     if (!selection) {
                         fail_rejoin("No available car can join this lobby. Choose an available car and select the lobby again.");
                     } else {
                         for (std::uint32_t i = 0U; i != 10U; ++i) {
-                            c.memory.write_u32_le((i + 191488U) * 4U, blocked_join->words[i]);
+                            c.memory.write_u32_le((i + 191488U) * 4U, join.words[i]);
                         }
-                        c.memory.write_u32_le(765952U, blocked_join->room);
+                        c.memory.write_u32_le(765952U, join.room);
                         c.memory.write_u32_le(765956U, 766208U);
                         c.memory.write_u32_le(765960U, 766336U);
                         c.memory.write_u64_le(765964U, selection->vehicle_key);
                         c.memory.write_u32_le(765972U, selection->paint);
-                        write_text(c.memory, 766208U, blocked_join->name);
-                        write_text(c.memory, 766336U, blocked_join->password);
-                        const bool hosted =
-                            blocked_join->page == 32086432U &&
-                            (blocked_join->frontend_return == 3314448U ||
-                             blocked_join->frontend_return == 3312592U);
-                        const bool browsed = blocked_join->page == 32104528U &&
-                                             blocked_join->frontend_return == 3650248U;
+                        write_text(c.memory, 766208U, join.name);
+                        write_text(c.memory, 766336U, join.password);
+                        const bool hosted = join.page == 32086432U &&
+                                            (join.frontend_return == 3314448U || join.frontend_return == 3312592U);
+                        const bool browsed = join.page == 32104528U && join.frontend_return == 3650248U;
                         if (hosted || browsed) {
                             for (std::uint32_t i = 0U; i != 12U; ++i) {
-                                c.memory.write_u32_le(blocked_join->page + i * 4U + 8U,
-                                                      blocked_join->browser_selection[i]);
+                                c.memory.write_u32_le(join.page + i * 4U + 8U, join.browser_selection[i]);
                             }
                             if (hosted) {
-                                c.memory.write_u32_le(blocked_join->page + 6928U, blocked_join->room);
-                                c.memory.write_u8(blocked_join->page + 6933U, 1U);
+                                c.memory.write_u32_le(join.page + 6928U, join.room);
+                                c.memory.write_u8(join.page + 6933U, 1U);
                             } else {
-                                c.memory.write_u8(blocked_join->page + 6466U, 5U);
+                                c.memory.write_u8(join.page + 6466U, 5U);
                             }
                         }
                         rejoin_stage = RejoinStage::Admitted;
@@ -900,23 +903,22 @@ struct Slus21050Online::Impl {
                     }
                 }
             }
-            if (text_entry_focused(c.memory)) {
-                if (!text_keys.empty()) {
-                    const auto key = text_keys.front();
-                    text_keys.pop_front();
-                    if (key == 1114113U) {
-                        text_keys.clear();
-                        ui_call(c, 3206512U, ret, 32123248U, 3U, 0U, 0U);
-                        return true;
-                    }
-                    if (key == 1114112U) {
-                        text_keys.clear();
-                    }
-                    ui_call(c, 3463440U, ret, 32020928U, key == 1114112U ? 10U : key, 0U, 0U);
+            if (!text_entry_focused(c.memory)) {
+                text_keys.clear();
+            }
+            if (!text_keys.empty()) {
+                const auto key = text_keys.front();
+                text_keys.pop_front();
+                if (key == 1114113U) {
+                    text_keys.clear();
+                    ui_call(c, 3206512U, ret, 32123248U, 3U, 0U, 0U);
                     return true;
                 }
-            } else {
-                text_keys.clear();
+                if (key == 1114112U) {
+                    text_keys.clear();
+                }
+                ui_call(c, 3463440U, ret, 32020928U, key == 1114112U ? 10U : key, 0U, 0U);
+                return true;
             }
             if (!buddy_callbacks.empty()) {
                 const auto callback = buddy_callbacks.front();
@@ -934,12 +936,12 @@ struct Slus21050Online::Impl {
         }
         if (address == 3291960U) {
             const auto table = c.cpu.read_gpr_u32(16U);
-            const std::uint32_t count = c.memory.read_u16_le(table + 6U);
-            if (count - 5U <= 1U) {
-                for (std::uint32_t row = 2U; row < count; ++row) {
-                    const auto base = table + row * 8U;
-                    c.memory.write_u32_le(base + 8U, c.memory.read_u32_le(base + 16U));
-                    c.memory.write_u32_le(base + 12U, c.memory.read_u32_le(base + 20U));
+            const auto count = c.memory.read_u16_le(table + 6U);
+            if (count == 5U || count == 6U) {
+                // Drop row 2 by moving the following rows up one slot.
+                for (std::uint32_t row = 2U; row + 1U < count; ++row) {
+                    c.memory.write_u32_le(table + row * 8U + 8U, c.memory.read_u32_le(table + row * 8U + 16U));
+                    c.memory.write_u32_le(table + row * 8U + 12U, c.memory.read_u32_le(table + row * 8U + 20U));
                 }
                 c.memory.write_u16_le(table + 6U, static_cast<std::uint16_t>(count - 1U));
             }
@@ -963,7 +965,7 @@ struct Slus21050Online::Impl {
                 c.cpu.write_gpr_u64(3U, v1 + 1U);
             }
             c.cpu.set_pc(3292784U);
-            c.cpu.write_gpr_u64(1U, c.cpu.read_gpr_u32(3U) <= 5U ? 1U : 0U);
+            c.cpu.write_gpr_u64(1U, c.cpu.read_gpr_u32(3U) <= 5U);
             return true;
         }
         if (address == 3412316U) {
@@ -1065,23 +1067,22 @@ struct Slus21050Online::Impl {
         }
         update();
         const auto ret = c.cpu.read_gpr_u32(31U);
-        if (configuration_open && !configuration_message_sent &&
-            c.memory.read_u32_le(32048164U) == 5U && !pad(c.memory, 92U)) {
-            if (error_shown || !pad(c.memory, 68U)) {
-                if (state == State::Online) {
-                    ui_return = ret;
-                    page_message = 1U;
-                } else {
-                    client.disconnect();
-                    peers.reset();
-                    state = State::Idle;
-                    presence_requested = false;
-                    ui_return = ret;
-                    page_message = 3U;
-                }
-                ui_call(c, 3323184U, 727040U, 32020712U, 0U, 0U, 0U);
-                return true;
+        if (!configuration_open || configuration_message_sent || c.memory.read_u32_le(32048164U) != 5U) {
+            c.cpu.set_pc(ret);
+            return true;
+        }
+        const bool cancelled = pad(c.memory, 92U) || (error_shown && pad(c.memory, 68U));
+        if (cancelled || state == State::Online) {
+            if (cancelled) {
+                client.disconnect();
+                peers.reset();
+                state = State::Idle;
+                presence_requested = false;
             }
+            ui_return = ret;
+            page_message = cancelled ? 3U : 1U;
+            ui_call(c, 3323184U, 727040U, 32020712U, 0U, 0U, 0U);
+            return true;
         }
         if (state == State::Failed && !error_shown) {
             error_shown = true;
@@ -1231,7 +1232,7 @@ struct Slus21050Online::Impl {
                 }
                 if (rejoin_stage == RejoinStage::Connecting && blocked_join.has_value()) {
                     auto& ref = refs[blocked_join->ref];
-                    if (ref.used && ref.connected && ref.persona != 0U) {
+                    if (ref.used && ref.connected && ref.persona) {
                         publish_self(ref, 0U);
                         publish_lobby(ref);
                     }
@@ -1273,7 +1274,7 @@ struct Slus21050Online::Impl {
                 for (auto& ref : refs) {
                     if (ref.used && ref.connected) {
                         reply(ref, 0x40746963U, std::string{}, 0U);
-                        if (changed && ref.persona != 0U) {
+                        if (changed && ref.persona) {
                             publish_self(ref, room.has_value() ? number(*room, "id") : 0U);
                         }
                     }
@@ -1285,7 +1286,7 @@ struct Slus21050Online::Impl {
                                   encode_tag_string(text(event.payload, "text")) + "\nF=" +
                                   text(event.payload, "attributes") + "\nU=\n";
                 for (auto& ref : refs) {
-                    if (ref.used && ref.connected && ref.persona != 0U) {
+                    if (ref.used && ref.connected && ref.persona) {
                         reply(ref, 0x2B6D7367U, body, 0U);
                     }
                 }
@@ -1302,7 +1303,7 @@ struct Slus21050Online::Impl {
                      text(*value, "mods") != blocked_join->digest ||
                      text(*value, "name") != blocked_join->name)) {
                     fail_rejoin("The host changed during admission. Choose the lobby again.");
-                    break;
+                    continue;
                 }
                 peers->set_room(net::decode_peer_room(*value));
                 std::vector<std::uint32_t> members;
@@ -1320,7 +1321,7 @@ struct Slus21050Online::Impl {
                 room = *value;
                 const auto body = room_body(*room);
                 for (auto& ref : refs) {
-                    if (ref.used && ref.connected && ref.persona != 0U) {
+                    if (ref.used && ref.connected && ref.persona) {
                         publish_self(ref, number(*room, "id"));
                         reply(ref, 0x2B61676DU, body, 0U);
                         reply(ref, 0x2B6D676DU, body, 0U);
@@ -1335,7 +1336,7 @@ struct Slus21050Online::Impl {
             case net::MatchEvent::Kind::Left: {
                 if (room.has_value()) {
                     for (auto& ref : refs) {
-                        if (ref.used && ref.connected && ref.persona != 0U) {
+                        if (ref.used && ref.connected && ref.persona) {
                             reply(ref, 0x2B61676DU,
                                   "IDENT=" + std::to_string(number(*room, "id")) + "\n", 0U);
                             publish_self(ref, 0U);
@@ -1373,25 +1374,21 @@ struct Slus21050Online::Impl {
             }
             if (target == nullptr) {
                 fail_rejoin("The host lobby is no longer available. Choose a lobby again.");
-                continue;
-            }
-            if (text(*target, "mods") != blocked_join->digest ||
-                applied_mod_identity != blocked_join->digest ||
-                number(*target, "host") != blocked_join->host ||
-                text(*target, "host_name") != blocked_join->host_name ||
-                text(*target, "name") != blocked_join->name) {
+            } else if (text(*target, "mods") != blocked_join->digest ||
+                       applied_mod_identity != blocked_join->digest ||
+                       number(*target, "host") != blocked_join->host ||
+                       text(*target, "host_name") != blocked_join->host_name ||
+                       text(*target, "name") != blocked_join->name) {
                 fail_rejoin("The host or its mods changed. Choose the lobby again to review them.");
-                continue;
-            }
-            if (target->find("started") == nullptr || !target->find("started")->is_bool() ||
-                target->find("started")->as_bool() ||
-                number(*target, "count") >= number(*target, "capacity")) {
+            } else if (target->find("started") == nullptr || !target->find("started")->is_bool() ||
+                       target->find("started")->as_bool() ||
+                       number(*target, "count") >= number(*target, "capacity")) {
                 fail_rejoin("The lobby is full or its race has started. Choose a lobby again.");
-                continue;
+            } else {
+                discovered_rooms[blocked_join->name] = blocked_join->room;
+                discovered_room_details[blocked_join->room] = *target;
+                rejoin_stage = rejoin_prepare_only ? RejoinStage::Failed : RejoinStage::Joining;
             }
-            discovered_rooms[blocked_join->name] = blocked_join->room;
-            discovered_room_details[blocked_join->room] = *target;
-            rejoin_stage = rejoin_prepare_only ? RejoinStage::Failed : RejoinStage::Joining;
             continue;
         }
         if (const auto found = buddy_requests.find(request_id); found != buddy_requests.end()) {
@@ -1508,6 +1505,7 @@ struct Slus21050Online::Impl {
                 fail_rejoin("Applied mods no longer match the host. Refresh Mods and choose the lobby again.");
             } else {
                 net::MatchRequest search;
+                search.kind = net::MatchRequest::Kind::List;
                 search.mode = net::OnlineMode::Original;
                 search.request_id = next_request++;
                 rejoin_list_request = search.request_id;
@@ -1531,7 +1529,7 @@ struct Slus21050Online::Impl {
             if (state != State::Failed && now < item.second.deadline) {
                 return false;
             }
-            rejoin_timed_out = rejoin_timed_out || rejoin_join_request == item.first;
+            rejoin_timed_out = rejoin_timed_out || item.first == rejoin_join_request;
             auto& ref = refs[item.second.ref];
             if (ref.used && ref.connected) {
                 reply(ref, item.second.command, "ERROR=Native service timed out\n", 0x74696D65U);
@@ -1563,6 +1561,13 @@ struct Slus21050Online::Impl {
 
     std::uint32_t self_address() const {
         return player;
+    }
+
+    // The 10.254.x.y address the game's peer code uses for this player.
+    // RECOVERY: the helper's name is not recorded; the release object only shows that this
+    // value came back from an inlined call.
+    std::uint32_t self_virtual_address() const {
+        return (self_address() & 65535U) + 184418304U;
     }
 
     void publish_self(Ref& ref, std::uint32_t game) {
@@ -1609,13 +1614,11 @@ struct Slus21050Online::Impl {
 
     void send(Ref& ref, std::uint32_t kind, std::string_view body) {
         const auto data = parse_fields(body);
-        if (packet_diagnostic) {
-            std::clog << "Native online: request " << tag_text(kind) << " fields=";
-            for (const auto& item : data) {
-                std::clog << ' ' << item.first;
-            }
-            std::clog << '\n';
+        std::clog << "Native online: request " << tag_text(kind) << " fields=";
+        for (const auto& item : data) {
+            std::clog << item.first << ',';
         }
+        std::clog << '\n';
         if (kind == tag("DISC")) {
             cancel(ref);
             ref.persona = false;
@@ -1638,8 +1641,9 @@ struct Slus21050Online::Impl {
             reply(ref, kind, "SKEY=native-session\n", 0U);
             return;
         }
-        if (kind == tag("news") && data.contains("NAME") && !data.at("NAME").empty() &&
-            data.at("NAME").find_first_not_of("0123456789") != std::string::npos) {
+        if (kind == tag("news") &&
+            (!data.contains("NAME") || data.at("NAME").empty() ||
+             data.at("NAME").find_first_not_of("0123456789") != std::string::npos)) {
             reply(ref, kind, "NEWS_URL=https://uwucammie.com/burn3/news/\nCOUNT=1\n", 0U);
             return;
         }
@@ -1701,15 +1705,15 @@ struct Slus21050Online::Impl {
             return;
         }
         if (kind == tag("gjoi")) {
-            if (room.has_value() && data.contains("NAME") && data.at("NAME") == text(*room, "name") &&
-                admitted_rejoin_matches(static_cast<std::size_t>(&ref - refs.data()))) {
-                complete_admitted_rejoin();
+            if (room.has_value() && data.contains("NAME") && data.at("NAME") == text(*room, "name")) {
+                if (admitted_rejoin_matches(static_cast<std::size_t>(&ref - refs.data()))) {
+                    complete_admitted_rejoin();
+                }
                 reply(ref, kind, room_body(*room), 0U);
                 return;
             }
             net::MatchRequest join;
             join.kind = net::MatchRequest::Kind::Join;
-            join.mode = net::OnlineMode::Original;
             join.room = integer(data, "IDENT");
             if (join.room == 0U && data.contains("NAME") &&
                 discovered_rooms.contains(data.at("NAME"))) {
@@ -1723,9 +1727,8 @@ struct Slus21050Online::Impl {
                     mod_mismatch_pending = false;
                     if (last_guest_join.has_value() && data.contains("NAME") &&
                         last_guest_join->name == data.at("NAME") &&
-                        (data.contains("PASS") ? last_guest_join->password == data.at("PASS")
-                                               : last_guest_join->password == "")) {
-                        blocked_join = last_guest_join;
+                        last_guest_join->password == (data.contains("PASS") ? data.at("PASS") : "")) {
+                        blocked_join = *last_guest_join;
                         blocked_join->room = join.room;
                         blocked_join->digest = mods->as_string();
                         blocked_join->host = number(details->second, "host");
@@ -1746,7 +1749,11 @@ struct Slus21050Online::Impl {
             if (data.contains("USERPARAMS")) {
                 join.user_parameters = data.at("USERPARAMS");
             }
-            rejoin_join_request = join.room;
+            if (rejoin_stage == RejoinStage::Admitted && blocked_join.has_value() &&
+                join.room == blocked_join->room) {
+                // request() assigns next_request to this join; complete_admitted_rejoin() looks it up.
+                rejoin_join_request = next_request;
+            }
             request(ref, kind, std::move(join));
             return;
         }
@@ -1756,16 +1763,17 @@ struct Slus21050Online::Impl {
             request(ref, kind, std::move(leave));
             return;
         }
-        if (kind == tag("gset") && data.contains("KICK") && room.has_value() &&
-            player == number(*room, "host") && data.contains("NAME") &&
-            data.at("NAME") == text(*room, "name") && !data.at("KICK").empty() &&
-            data.at("KICK").size() <= 15U) {
+        if (kind == tag("gset") && data.contains("KICK")) {
             unsigned matches = 0U;
             std::uint32_t target = 0U;
-            for (const auto& member : room->find("players")->as_array()) {
-                if (text(member, "name") == data.at("KICK")) {
-                    target = number(member, "id");
-                    ++matches;
+            if (room.has_value() && number(*room, "host") == player && data.contains("NAME") &&
+                data.at("NAME") == text(*room, "name") && !data.at("KICK").empty() &&
+                data.at("KICK").size() <= 15U) {
+                for (const auto& member : room->find("players")->as_array()) {
+                    if (text(member, "name") == data.at("KICK")) {
+                        target = number(member, "id");
+                        ++matches;
+                    }
                 }
             }
             if (matches != 1U || target == 0U || player == target) {
@@ -1807,7 +1815,7 @@ struct Slus21050Online::Impl {
             return;
         }
         if (kind == tag("room")) {
-            reply(ref, kind, room.has_value() ? "COUNT=1\n" : "COUNT=0\n", 0U);
+            reply(ref, kind, lobby.has_value() ? "COUNT=1\n" : "COUNT=0\n", 0U);
             publish_lobby(ref);
             return;
         }
@@ -1826,8 +1834,8 @@ struct Slus21050Online::Impl {
             return false;
         }
         const auto count = m.read_u32_le(31664904U);
-        std::vector<std::uint32_t> initialized{player};
         ready = m.read_u32_le(31664984U) == player && count == readiness_roster.size() && count <= 8U;
+        std::vector<std::uint32_t> initialized{player};
         if (ready) {
             for (std::uint32_t i = 0U; i < count; ++i) {
                 const Address slot = m.read_u32_le(31664872U + i * 4U);
@@ -1846,7 +1854,7 @@ struct Slus21050Online::Impl {
         std::sort(initialized.begin(), initialized.end());
         ready = ready && initialized == readiness_roster;
         const auto now = std::chrono::steady_clock::now();
-        if (advertised_ready != ready || readiness_advertisement <= now) {
+        if (advertised_ready != ready || now >= readiness_advertisement) {
             std::vector<std::uint8_t> bytes{'B', '3', 'R', 'D', static_cast<std::uint8_t>(ready),
                                             static_cast<std::uint8_t>(readiness_roster.size())};
             for (const auto id : readiness_roster) {
@@ -1947,17 +1955,17 @@ struct Slus21050Online::Impl {
                 }
                 m.write_u32_le(a0 + 280U, 0U);
                 m.write_u8(a0 + 290U, static_cast<std::uint8_t>(c.cpu.read_gpr_u32(9U)));
-                buddy_initialized = true;
-                publish_presence(m);
             }
+            buddy_initialized = true;
+            publish_presence(m);
             return 1;
         }
         if (address == 3541232U || address == 3540928U) {
             presence_requested = false;
             if (address == 3541232U) {
                 buddy_initialized = false;
-                clear_buddies();
             }
+            clear_buddies();
             publish_presence(m);
             return 0;
         }
@@ -1993,19 +2001,11 @@ struct Slus21050Online::Impl {
                     return 6U;
                 }
                 const auto flags = number(*entry, "flags");
-                if ((flags & 512U) != 0U) {
-                    return 1U;
-                }
-                if ((flags & 262148U) != 0U) {
-                    return 5U;
-                }
-                if ((flags & 524288U) != 0U) {
-                    return 2U;
-                }
-                if (number(*entry, "status") == 0U) {
-                    return 3U;
-                }
-                return 4U;
+                return (flags & 512U) != 0U      ? 1U
+                       : (flags & 262148U) != 0U ? 5U
+                       : (flags & 524288U) != 0U ? 2U
+                       : number(*entry, "status") == 0U ? 3U
+                                                        : 4U;
             };
             if (rank(left) == rank(right)) {
                 return left.compare(right);
@@ -2020,7 +2020,7 @@ struct Slus21050Online::Impl {
         }
         if (address == 3536496U) {
             const unsigned mask = 262144U;
-            return std::any_of(buddies.begin(), buddies.end(), [mask](const content::JsonValue& item) {
+            return std::any_of(buddies.begin(), buddies.end(), [&mask](const content::JsonValue& item) {
                 return (number(item, "flags") & mask) != 0U;
             });
         }
@@ -2140,7 +2140,10 @@ struct Slus21050Online::Impl {
                     for (std::uint32_t i = 0U; i < a2; ++i) {
                         bytes.push_back(m.read_u8(a1 + i));
                     }
-                    return peers->send(id, bytes, net::PeerChannel::Datagram) ? 1 : 0;
+                    if (peers->send(id, bytes, net::PeerChannel::Datagram)) {
+                        return 1;
+                    }
+                    break;
                 }
                 return 0;
             }
@@ -2217,13 +2220,19 @@ struct Slus21050Online::Impl {
             if (address == 2289664U) {
                 connect();
                 if (state == State::Online) {
-                    write_text(m, 31704636U, virtual_address_text(player));
+                    write_text(m, 31704636U, virtual_address_text(self_address()));
                 }
             }
-            if (static_cast<unsigned>(state) - 1U <= 2U) {
-                return static_cast<std::int64_t>(state);
+            switch (state) {
+            case State::Connecting:
+                return 1;
+            case State::Online:
+                return 2;
+            case State::Failed:
+                return 3;
+            default:
+                return 0;
             }
-            return 0;
         }
         if (address == 4202744U) {
             open = true;
@@ -2234,8 +2243,8 @@ struct Slus21050Online::Impl {
                 if (a2 > 256U || !ram(m, a1, 256U)) {
                     return -1;
                 }
-                for (std::size_t i = 0U; i != 256U; ++i) {
-                    m.write_u8(a1 + static_cast<Address>(i), 0U);
+                for (Address i = 0U; i != 256U; ++i) {
+                    m.write_u8(a1 + i, 0U);
                 }
                 write_text(m, a1, "Native PC");
             }
@@ -2288,64 +2297,66 @@ struct Slus21050Online::Impl {
                 return state == State::Online;
             }
             if (a0 == 1668247150U) {
-                if (state != State::Online || state == State::Failed) {
-                    return state == State::Failed ? -1 : 0;
+                if (state != State::Online) {
+                    if (state == State::Failed) {
+                        return tag("-err");
+                    }
+                    return tag("~con");
                 }
-                return 0;
+                return tag("+onl");
             }
             if (a0 == 1886156135U || a0 == 1650617956U) {
-                return 0;
+                return 1;
             }
             if (a0 == 1937010544U) {
                 return state == State::Idle;
             }
             if ((a0 == 1752134516U || a0 == 1633969266U) && state == State::Online) {
-                return (player & 65535U) + 184418304U;
+                return self_virtual_address();
             }
             return 0;
         }
         if (address == 4208416U) {
-            return static_cast<std::uint32_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
-                                                  std::chrono::steady_clock::now() - epoch)
-                                                  .count());
+            const auto elapsed = static_cast<std::uint32_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - epoch)
+                    .count());
+            return elapsed;
         }
         if (address == 4205256U) {
             for (std::size_t i = 0U; i != refs.size(); ++i) {
-                if (refs[i].used) {
-                    continue;
+                if (!refs[i].used) {
+                    refs[i] = Ref{};
+                    refs[i].used = true;
+                    const Address p = 729088U + static_cast<Address>(i) * 8960U;
+                    for (Address j = 0U; j != 256U; ++j) {
+                        m.write_u8(p + j, 0U);
+                    }
+                    m.write_u32_le(p + 20U, 8192U);
+                    m.write_u32_le(p + 24U, p + 256U);
+                    return p;
                 }
-                refs[i] = Ref{};
-                refs[i].used = true;
-                const Address p = 729088U + static_cast<Address>(i) * 8960U;
-                for (Address j = 0U; j != 256U; ++j) {
-                    m.write_u8(p + j, 0U);
-                }
-                m.write_u32_le(p + 20U, 8192U);
-                m.write_u32_le(p + 24U, p + 256U);
-                return p;
             }
             return 0;
         }
         if (a0 <= 729087U) {
             return -1;
         }
-        const auto offset = a0 - 729088U;
-        if (offset % 8960U != 0U || offset / 8960U >= refs.size()) {
+        if ((a0 - 729088U) % 8960U != 0U || (a0 - 729088U) / 8960U >= refs.size()) {
             return -1;
         }
-        auto& ref = refs[offset / 8960U];
+        auto& ref = refs[(a0 - 729088U) / 8960U];
         if (!ref.used) {
             return -1;
         }
         if (address == 4205576U) {
             cancel(ref);
-            ref.persona = 0U;
+            ref.persona = false;
             ref = Ref{};
             return 0;
         }
         if (address == 4205704U) {
             cancel(ref);
-            ref.persona = 0U;
+            ref.persona = false;
             connect();
             ref.connected = true;
             ref.replies.clear();
@@ -2354,7 +2365,7 @@ struct Slus21050Online::Impl {
         }
         if (address == 4206032U || address == 4206440U) {
             cancel(ref);
-            ref.persona = 0U;
+            ref.persona = false;
             ref.connected = false;
             ref.replies.clear();
             return 0;
@@ -2364,19 +2375,19 @@ struct Slus21050Online::Impl {
                 return 1;
             }
             if (a1 == 1937006964U) {
-                if (ref.connected && state == State::Online) {
-                    return 2;
+                if (!ref.connected || state != State::Online) {
+                    if (state == State::Failed) {
+                        return -1;
+                    }
+                    return 0;
                 }
-                if (state == State::Failed) {
-                    return -1;
-                }
-                return 0;
+                return 2;
             }
             if (a1 == 1768060262U || a1 == 1868723558U) {
                 return 8192;
             }
             if (a1 == 1818322034U || a1 == 1633969266U) {
-                return (player & 65535U) + 184418304U;
+                return self_virtual_address();
             }
             if (a1 == 1819308660U || a1 == 1886351988U) {
                 return 3658;
@@ -2387,25 +2398,26 @@ struct Slus21050Online::Impl {
             return 0;
         }
         if (address == 4206992U) {
-            const auto length = static_cast<int>(f);
-            if (state != State::Online || length > 8192) {
+            if (state != State::Online || static_cast<int>(f) > 8192) {
                 return -1;
             }
             const std::string body =
-                a2 != 0U ? read_text(m, a2, length >= 0 ? std::max<std::size_t>(f, 1U) : 8192U) : std::string{};
+                a2 != 0U ? read_text(m, a2, static_cast<int>(f) >= 0 ? static_cast<std::size_t>(std::max(f, 1U)) : 8192U)
+                         : std::string{};
             send(ref, a1, body);
             return static_cast<std::int64_t>(body.size() + 1U);
         }
         if (address == 4207352U || address == 4207808U) {
+            // 4207352 peeks at the next reply; 4207808 copies it out and consumes it.
             if ((a1 != 0U && !ram(m, a1, 4U)) || (a2 != 0U && !ram(m, a2, 4U)) || ref.replies.empty()) {
-                return 0;
-            }
-            const bool copy_text = address == 4207808U;
-            if ((address == 4207352U && a3 != 0U && !ram(m, a3, 4U)) ||
-                (copy_text && a3 != 0U && f != 0U && !ram(m, a3, f))) {
-                return 0;
+                return -1;
             }
             const auto& item = ref.replies.front();
+            const auto length = item.text.size() + 1U;
+            if ((address == 4207352U && a3 != 0U && !ram(m, a3, 4U)) ||
+                (address == 4207808U && a3 != 0U && f != 0U && !ram(m, a3, std::min<std::size_t>(length, f)))) {
+                return -1;
+            }
             write_text(m, a0 + 256U, item.text);
             if (a1 != 0U) {
                 m.write_u32_le(a1, item.kind);
@@ -2417,18 +2429,18 @@ struct Slus21050Online::Impl {
                 if (a3 != 0U) {
                     m.write_u32_le(a3, a0 + 256U);
                 }
-            } else if (a3 != 0U) {
-                for (std::size_t i = 0U; i < f; ++i) {
-                    m.write_u8(a3 + static_cast<Address>(i), m.read_u8(a0 + 256U + static_cast<Address>(i)));
+                return static_cast<std::int64_t>(length);
+            }
+            if (a3 != 0U) {
+                for (std::size_t i = 0U; i < std::min<std::size_t>(length, f); ++i) {
+                    m.write_u8(a3 + static_cast<Address>(i), m.read_u8(a0 + static_cast<Address>(i) + 256U));
                 }
             }
-            const auto length = item.text.size() + 1U;
             ref.replies.pop_front();
             return static_cast<std::int64_t>(length);
         }
-        return 0;
+        return -1;
     }
-    explicit Impl(net::MatchmakingConfig value) : config(std::move(value)) {}
 };
 
 Slus21050Online::Slus21050Online(net::MatchmakingConfig config)
@@ -2478,36 +2490,38 @@ void Slus21050Online::set_applied_mods(std::shared_ptr<const content::ModManager
 
 std::optional<std::string> Slus21050Online::request_mod_sync_rejoin(std::uint32_t room,
                                                                    std::string_view digest) {
-        if (!impl_->revision_registered || !impl_->blocked_join.has_value() || impl_->blocked_join->room != room ||
-        impl_->blocked_join->digest != digest) {
+    auto& d = *impl_;
+    if (!d.revision_registered || !d.blocked_join.has_value() || d.blocked_join->room != room ||
+        d.blocked_join->digest != digest) {
         return "The original lobby request is no longer available. Choose the lobby again.";
     }
-    if (impl_->rejoin_stage != Impl::RejoinStage::None && impl_->rejoin_stage != Impl::RejoinStage::Refused) {
+    if (d.rejoin_stage != Impl::RejoinStage::None && d.rejoin_stage != Impl::RejoinStage::Failed) {
         return "A lobby rejoin is already in progress.";
     }
-    if (!impl_->mod_sync_selection_resolver) {
+    if (!d.mod_sync_selection_resolver) {
         return "The current car selection cannot be validated. Choose the lobby again.";
     }
-    const auto ref = impl_->blocked_join->ref;
-    if (!impl_->refs[ref].used || impl_->refs[ref].persona == 0U) {
+    auto& ref = d.refs[d.blocked_join->ref];
+    if (!ref.used || !ref.persona) {
         return "The original online session closed. Sign in and choose the lobby again.";
     }
-    if (impl_->room.has_value()) {
+    if (d.room.has_value()) {
         return "Leave the current lobby before rejoining this host.";
     }
-    impl_->rejoin_error.reset();
-    impl_->rejoin_prepare_only = false;
-    impl_->rejoin_prepared = false;
-    impl_->rejoin_prepared_announced = false;
-    impl_->rejoin_stage = Impl::RejoinStage::Connecting;
-    impl_->rejoin_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
-    impl_->refs[ref].connected = true;
-    impl_->connect();
-    impl_->presence_requested = true;
-    if (impl_->state == Impl::State::Failed) {
-        impl_->fail_rejoin("Online reconnection failed. Choose the lobby again.");
+    d.rejoin_error.reset();
+    d.rejoin_prepare_only = false;
+    d.rejoin_prepared = false;
+    d.rejoin_prepared_announced = false;
+    d.rejoin_stage = Impl::RejoinStage::Connecting;
+    d.rejoin_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    ref.connected = true;
+    d.connect();
+    d.presence_requested = true;
+    if (d.state == Impl::State::Failed) {
+        d.fail_rejoin("Online reconnection failed. Choose the lobby again.");
+        return std::exchange(d.rejoin_error, std::nullopt);
     }
-    return consume_mod_sync_error();
+    return std::nullopt;
 }
 
 std::optional<std::string> Slus21050Online::prepare_mod_sync_rejoin(std::uint32_t room,
@@ -2533,12 +2547,11 @@ bool Slus21050Online::text_entry_focused(const guest::EeMemory& memory) const {
 
 void Slus21050Online::handle_text_input(const platform::TextInputEvent& event,
                                         const guest::EeMemory& memory) {
-    auto& d = *impl_;
-    if (!d.text_entry_focused(memory)) {
-        d.text_keys.clear();
+    if (!text_entry_focused(memory)) {
+        impl_->text_keys.clear();
         return;
     }
-    auto& keys = d.text_keys;
+    auto& keys = impl_->text_keys;
     if (keys.size() > 511U) {
         return;
     }
@@ -2549,39 +2562,37 @@ void Slus21050Online::handle_text_input(const platform::TextInputEvent& event,
         return;
     }
     std::vector<std::uint32_t> decoded;
-    for (std::size_t i = 0U; i < event.text.size(); ++i) {
-        const auto first = static_cast<unsigned char>(event.text[i]);
+    for (std::size_t i = 0U; i < event.text.size();) {
+        const auto first = static_cast<unsigned char>(event.text[i++]);
         std::uint32_t value = 0U;
         unsigned count = 0U;
         std::uint32_t minimum = 0U;
         if (first < 0x80U) {
             value = first;
-        } else if (first - 0xC2U <= 29U) {
+        } else if (first >= 0xC2U && first <= 0xDFU) {
             value = first & 31U;
             count = 1U;
             minimum = 128U;
-        } else if (first - 0xE0U <= 15U) {
+        } else if (first >= 0xE0U && first <= 0xEFU) {
             value = first & 15U;
             count = 2U;
             minimum = 2048U;
-        } else if (first - 0xF0U <= 4U) {
+        } else if (first >= 0xF0U && first <= 0xF4U) {
             value = first & 7U;
             count = 3U;
             minimum = 65536U;
         } else {
             return;
         }
-        if (count + i >= event.text.size() && count != 0U) {
+        if (i + count > event.text.size()) {
             return;
         }
-        while (count != 0U) {
-            ++i;
-            const auto next = static_cast<unsigned char>(event.text[i]);
+        while (count-- != 0U) {
+            const auto next = static_cast<unsigned char>(event.text[i++]);
             if ((next & 0xC0U) != 0x80U) {
                 return;
             }
             value = (value << 6U) | (next & 63U);
-            --count;
         }
         if (value < minimum || value > 1114111U || value - 0xD800U <= 2047U) {
             return;
@@ -2590,7 +2601,8 @@ void Slus21050Online::handle_text_input(const platform::TextInputEvent& event,
             continue;
         }
         if (value > 65535U) {
-            decoded.push_back(((value - 0x10000U) >> 10U) | 0xD800U);
+            value -= 0x10000U;
+            decoded.push_back((value >> 10U) | 0xD800U);
             decoded.push_back((value & 1023U) | 0xDC00U);
         } else {
             decoded.push_back(value);
@@ -2613,13 +2625,13 @@ bool Slus21050Online::register_functions(NativeFunctionDispatcher& dispatcher,
         if (!signature_matches(memory, signature)) {
             return false;
         }
-        if (dispatcher.lookup(hook_address(signature.begin)) != nullptr) {
+        if (dispatcher.lookup(hook_address(signature)) != nullptr) {
             return false;
         }
     }
     std::vector<Address> addresses;
     for (const auto& signature : signatures) {
-        addresses.push_back(hook_address(signature.begin));
+        addresses.push_back(hook_address(signature));
     }
     for (const auto address : {0x0034A4A4U, 0x003532E4U, 0x000B1800U, 0x000B1810U, 0x00323B38U, 0x00323E6CU, 0x0035F4D0U, 0x0035F520U, 0x0035F570U, 0x0035F5C0U, 0x0035F610U, 0x0035F670U, 0x0035F700U, 0x0035FD80U, 0x0035FEF0U, 0x0035F900U, 0x0035F970U, 0x0035F9E0U, 0x0035FA40U, 0x0035FAA0U, 0x0035FB00U, 0x0035FB60U, 0x00360020U, 0x003600D0U, 0x00360460U, 0x003604C0U, 0x00360560U, 0x00360620U, 0x00360670U, 0x003606D0U, 0x003606E0U, 0x003607C0U, 0x003608F0U, 0x003609A0U, 0x0035F190U, 0x0035F1E0U}) {
         if (dispatcher.lookup(address) != nullptr) {

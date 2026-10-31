@@ -1,5 +1,6 @@
 #pragma once
 #include "takedown/platform/input_bindings.hpp"
+#include "takedown/ui/control_style.hpp"
 #include <optional>
 #include <set>
 #include <string>
@@ -14,15 +15,25 @@ namespace takedown::ui {
 class ControlsEditor {
   public:
     // Rows before the per-action rows: player, edit input, gamepad,
-    // keyboard and mouse, set up controller, bind all actions.
+    // keyboard and mouse, set up controller, bind all actions, and the two
+    // layout resets (ui/control_style.hpp).
     static constexpr std::size_t kSetupRow = 4;
     static constexpr std::size_t kBindAllRow = 5;
-    static constexpr std::size_t kFirstControlRow = 6;
+    static constexpr std::size_t kPlayStation2LayoutRow = 6;
+    static constexpr std::size_t kXboxLayoutRow = 7;
+    static constexpr std::size_t kFirstControlRow = 8;
 
     // `mappings_path` keeps layouts made with SET UP CONTROLLER; empty keeps
     // them for this run only.
     explicit ControlsEditor(std::filesystem::path path, std::filesystem::path mappings_path = {});
     [[nodiscard]] const platform::InputBindings& bindings() const { return bindings_; }
+    // The layout chosen (first-run question or a reset), nothing before that.
+    [[nodiscard]] std::optional<ControlStyle> style() const { return style_; }
+    // The bindings the game reads now: in a menu, the layout's menu buttons.
+    [[nodiscard]] platform::InputBindings game_bindings(bool menu) const;
+    // The first-run answer: the layout's gamepad buttons replace stock ones
+    // (edited gamepad bindings are kept); the choice is saved either way.
+    void choose_style(ControlStyle style);
     [[nodiscard]] std::vector<std::pair<std::string, std::string>> rows() const;
     [[nodiscard]] bool capturing() const { return capture_.has_value() || layout_.has_value(); }
     [[nodiscard]] bool blocks_game_input() const { return capturing() || swallow_release_; }
@@ -58,8 +69,10 @@ class ControlsEditor {
     void advance_layout();
     void advance_guided();
     [[nodiscard]] const platform::ConnectedController* chosen_controller() const;
+    void reset_to_style(ControlStyle style);
     std::filesystem::path path_;
     std::filesystem::path mappings_path_;
+    std::optional<ControlStyle> style_;
     platform::InputBindings bindings_;
     std::vector<platform::ConnectedController> controllers_;
     std::set<std::uint32_t> announced_;

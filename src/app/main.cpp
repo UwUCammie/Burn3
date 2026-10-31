@@ -148,6 +148,7 @@
 #include "takedown/save/profile_slots.hpp"
 #include "takedown/save/save_card_device.hpp"
 #include "takedown/save/save_data.hpp"
+#include "takedown/ui/control_style.hpp"
 #include "takedown/ui/controls_editor.hpp"
 #include "takedown/ui/developer_unlock.hpp"
 #include "takedown/ui/host_prompt.hpp"
@@ -4758,6 +4759,25 @@ int run_boot_entry(int argc, char** argv) {
     ui::ControlsEditor controls_session{
         platform::input_bindings_path_for(config::default_settings_path()),
         platform::gamepad_mappings_path_for(config::default_settings_path())};
+    // The first-run question (PlayStation 2 or Xbox buttons), asked once on
+    // the front end while no layout is saved. Scripted runs skip it unless
+    // TAKEDOWN_CONTROL_STYLE_PROMPT=1, which also asks when one is saved.
+    ui::ControlStylePrompt control_style_prompt;
+    bool control_style_prompt_pending = !controls_session.style().has_value();
+    if (const char* const setting = std::getenv("TAKEDOWN_CONTROL_STYLE_PROMPT");
+        setting != nullptr && *setting != '\0') {
+        control_style_prompt_pending = std::string_view(setting) != "0";
+    } else if (std::getenv("TAKEDOWN_NAV_SCRIPT") != nullptr || std::getenv("TAKEDOWN_MENU_MOUSE_SCRIPT") != nullptr) {
+        control_style_prompt_pending = false;
+    }
+    std::uint64_t control_style_prompt_last_poll = ~std::uint64_t{0};
+    // The game gets no input while the question is open, nor after it until
+    // every button is let go (else the confirming press reaches the menu).
+    bool control_style_blocks_input = false;
+    bool control_style_click_held = true;
+    // Whether the bindings last given to the window were the menu ones
+    // (ControlsEditor::game_bindings); empty when they must be sent again.
+    std::optional<bool> game_bindings_menu;
     Slus21050CameraFov camera_fov;
     std::uint64_t ui_submission_step = ~std::uint64_t{0};
     std::uint64_t panini_warp_serial = 0U;
@@ -5838,6 +5858,53 @@ int run_boot_entry(int argc, char** argv) {
                                       host_window != nullptr ? host_window->raw_input_state() : platform::RawInputState{});
         }
         return page_result.active;
+    };
+    // One retail poll of the controller layout question: opens it once over the
+    // first front-end menu, feeds it and takes the choice. True while it is open (the
+    // game then sees no input).
+    const auto control_style_poll = [&](const std::uint64_t poll, const platform::HostControllerState& pad,
+                                        const std::optional<runtime::MenuMouseInput>& mouse) -> bool {
+        // Over the front-end menus: the menu video loops behind them (the boot
+        // prompts come before the intro movies); without host movies, after
+        // the first 20 seconds.
+        const bool front_end = host_movie_player.active() ? host_movie_player.looping() : poll > 1200U;
+        if (control_style_prompt_pending && guest_input_replay == nullptr && memory.read_u32_le(0x01e90424U) == 5U &&
+            front_end && !settings_page.active() && !runtime::read_menu_mouse_screen(memory).lists.empty()) {
+            control_style_prompt_pending = false;
+            control_style_prompt.open();
+            game_bindings_menu.reset();
+        }
+        if (!control_style_prompt.is_open()) {
+            if (control_style_blocks_input) {
+                const bool held = pad.dpad_up || pad.dpad_right || pad.dpad_down || pad.dpad_left || pad.start ||
+                                  pad.select || pad.cross || pad.circle || pad.square || pad.triangle ||
+                                  pad.left_shoulder || pad.right_shoulder || pad.left_trigger || pad.right_trigger ||
+                                  (mouse.has_value() && mouse->buttons != 0U);
+                control_style_blocks_input = held;
+            }
+            return control_style_blocks_input;
+        }
+        control_style_blocks_input = true;
+        if (poll == control_style_prompt_last_poll) {
+            return true;
+        }
+        control_style_prompt_last_poll = poll;
+        ui::ControlStylePrompt::Input input;
+        input.left = pad.dpad_left || pad.left_shoulder || pad.left_stick_x < -16384;
+        input.right = pad.dpad_right || pad.right_shoulder || pad.left_stick_x > 16384;
+        input.confirm = pad.cross || pad.start;
+        const bool click_down = mouse.has_value() && (mouse->buttons & 1U) != 0U;
+        if (mouse.has_value() && mouse->inside) {
+            input.pointer = std::array<float, 2>{mouse->x * 640.0f, mouse->y * 448.0f};
+            input.click = click_down && !control_style_click_held;
+        }
+        control_style_click_held = click_down;
+        if (const auto chosen = control_style_prompt.update(input).chosen; chosen.has_value()) {
+            controls_session.choose_style(*chosen);
+            game_bindings_menu.reset();
+            std::cerr << "Controls: layout chosen: " << ui::control_style_name(*chosen) << '\n';
+        }
+        return true;
     };
     const auto variable_frame_limit_cycles = [&variable_frame_rate, &host_movie_player, &pc_options,
                                               &variable_frame_floor_cycles]() -> std::uint64_t {
@@ -7564,7 +7631,9 @@ int run_boot_entry(int argc, char** argv) {
 
         if (subframe_input_bridge.has_value()) {
             if (host_window != nullptr || parallel_gs_input_reader != nullptr) {
-                subframe_input_bridge->observe(current_host_controller_state(), emulated_ee_cycles);
+                subframe_input_bridge->observe(control_style_blocks_input ? platform::HostControllerState{}
+                                                                          : current_host_controller_state(),
+                                               emulated_ee_cycles);
             }
             if (subframe_input_bridge->pending() != 0U) {
                 runtime::SubframeInputEvent subframe_event{};
@@ -7964,7 +8033,8 @@ int run_boot_entry(int argc, char** argv) {
                 if (save_slot_menu.is_open() || online_mod_prompt_active) {
                     write_virtual_ds2_neutral_sample();
                 } else {
-                    if (subframe_input_bridge.has_value() && subframe_input_bridge->last_applied_state().has_value()) {
+                    if (!control_style_blocks_input && subframe_input_bridge.has_value() &&
+                        subframe_input_bridge->last_applied_state().has_value()) {
                         effective_retail_input = *subframe_input_bridge->last_applied_state();
                     } else {
                         effective_retail_input = current_host_controller_state();
@@ -7984,6 +8054,11 @@ int run_boot_entry(int argc, char** argv) {
                         mouse_input = runtime::MenuMouseInput{
                             pointer.x, pointer.y, pointer.inside, parallel_gs_input_reader->raw_input().mouse_buttons,
                             parallel_gs_input_reader->consume_wheel()};
+                    }
+                    // The controller layout question takes the input while it is open.
+                    if (control_style_poll(virtual_ds2_trace->update_count, effective_retail_input, mouse_input)) {
+                        mouse_input.reset();
+                        effective_retail_input = {};
                     }
                     // The SETTINGS page takes the input itself while it is open; the
                     // game page then sees none.
@@ -8626,8 +8701,8 @@ int run_boot_entry(int argc, char** argv) {
                 const platform::RawJoystickState joystick = host_window != nullptr && layout_device.has_value()
                                                                 ? host_window->joystick_state(*layout_device)
                                                                 : platform::RawJoystickState{};
-                if (controls_session.poll(raw_controls, joystick) && host_window != nullptr) {
-                    host_window->set_input_bindings(controls_session.bindings());
+                if (controls_session.poll(raw_controls, joystick)) {
+                    game_bindings_menu.reset();
                 }
                 if (const auto mapping = controls_session.take_layout_mapping(); mapping.has_value()) {
                     std::string error = "no input window";
@@ -8717,10 +8792,31 @@ int run_boot_entry(int argc, char** argv) {
                 }
             }
 
-            // The SETTINGS page's UI, else the online player count on the main
-            // menu, else the MODS page's.
+            // With the Xbox layout the gamepad uses its menu buttons (A confirms,
+            // B goes back) while the game shows a menu.
+            if (host_window != nullptr) {
+                bool menu = false;
+                if (controls_session.style() == ui::ControlStyle::Xbox) {
+                    menu = memory.read_u32_le(0x01e90424U) == 5U || settings_page.active() ||
+                           control_style_prompt.is_open();
+                    if (!menu) {
+                        const auto screen = runtime::read_menu_mouse_screen(memory);
+                        menu = !screen.lists.empty() || screen.footer;
+                    }
+                }
+                if (game_bindings_menu != menu) {
+                    host_window->set_input_bindings(controls_session.game_bindings(menu));
+                    game_bindings_menu = menu;
+                }
+            }
+            // The controller layout question, else the SETTINGS page's UI, else
+            // the online player count on the main menu, else the MODS page's.
             online_count.update(memory);
             const auto page_host_ui = [&]() -> platform::ParallelGsHostUi {
+                if (control_style_prompt.is_open()) {
+                    return ui::control_style_prompt_ui(settings_ui_directory(), settings_ui_directory(),
+                                                       control_style_prompt);
+                }
                 if (settings_page.active()) {
                     return settings_page.host_ui(settings_ui_directory());
                 }

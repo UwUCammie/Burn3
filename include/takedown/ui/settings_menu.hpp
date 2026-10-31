@@ -24,6 +24,7 @@
 #include <vector>
 
 namespace takedown::ui {
+class ControlStylePrompt;
 
 enum class SettingsTab : std::uint8_t { Audio, Camera, Controls, Gameplay, Video };
 inline constexpr std::size_t kSettingsTabCount = 5U;
@@ -167,5 +168,11 @@ inline constexpr float kDescriptionTop = 352.0f;
 // and fades with it).
 [[nodiscard]] platform::ParallelGsHostUi online_count_badge_ui(const std::string& font_directory, std::uint32_t count,
                                                                float x, float y, float height, float alpha);
+
+// The first-run controller layout question (ui/control_style.hpp), drawn in
+// the SETTINGS page's style over whatever the game shows.
+[[nodiscard]] platform::ParallelGsHostUi control_style_prompt_ui(const std::string& font_directory,
+                                                                 const std::string& art_directory,
+                                                                 const ControlStylePrompt& prompt);
 
 } // namespace takedown::ui

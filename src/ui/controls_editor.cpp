@@ -96,6 +96,36 @@ ControlsEditor::ControlsEditor(std::filesystem::path path, std::filesystem::path
     if (!loaded.diagnostics.empty()) {
         notice_ = loaded.diagnostics.front();
     }
+    if (!path_.empty()) {
+        style_ = load_control_style(control_style_path_for(path_));
+    }
+}
+
+platform::InputBindings ControlsEditor::game_bindings(const bool menu) const {
+    return menu && style_.has_value() ? menu_bindings(bindings_, *style_) : bindings_;
+}
+
+void ControlsEditor::choose_style(const ControlStyle style) {
+    if (gamepad_bindings_are_stock(bindings_)) {
+        bindings_ = with_control_style(bindings_, style);
+        changed_ = true;
+        persist();
+    }
+    style_ = style;
+    if (!path_.empty()) {
+        save_control_style(control_style_path_for(path_), style);
+    }
+}
+
+void ControlsEditor::reset_to_style(const ControlStyle style) {
+    bindings_ = with_control_style(bindings_, style);
+    style_ = style;
+    changed_ = true;
+    if (persist() && !path_.empty()) {
+        save_control_style(control_style_path_for(path_), style);
+        notice_ = style == ControlStyle::Xbox ? "Controller buttons set to the Xbox layout. In menus A confirms and B goes back."
+                                              : "Controller buttons set to the PlayStation 2 layout.";
+    }
 }
 
 const platform::ConnectedController* ControlsEditor::chosen_controller() const {
@@ -146,6 +176,8 @@ std::vector<std::pair<std::string, std::string>> ControlsEditor::rows() const {
         {"KEYBOARD & MOUSE", player.keyboard_and_mouse ? "On" : "Off"},
         {"SET UP CONTROLLER", layout_ ? "Setting up..." : setup},
         {"BIND ALL ACTIONS", guided_ ? "Binding..." : controller_ ? "Controller" : "Keyboard & Mouse"},
+        {"RESET TO PLAYSTATION 2 LAYOUT", style_ == ControlStyle::PlayStation2 ? "In use" : "Reset"},
+        {"RESET TO XBOX LAYOUT", style_ == ControlStyle::Xbox ? "In use" : "Reset"},
     };
     for (std::size_t c = 0U; c < platform::kPadControlCount; ++c) {
         std::string value;
@@ -256,11 +288,15 @@ void ControlsEditor::activate(std::size_t row, int direction, const platform::Ra
         guided_ = true;
         capture_ = platform::PadControl::DpadUp;
         armed_ = false;
+    } else if (row == kPlayStation2LayoutRow || row == kXboxLayoutRow) {
+        reset_to_style(row == kXboxLayoutRow ? ControlStyle::Xbox : ControlStyle::PlayStation2);
     } else if (row < kFirstControlRow + platform::kPadControlCount) {
         capture_ = static_cast<platform::PadControl>(row - kFirstControlRow);
         armed_ = false;
     } else if (row == kFirstControlRow + platform::kPadControlCount) {
-        bindings_.players[player_] = platform::default_input_bindings().players[player_];
+        bindings_.players[player_] = (style_.has_value() ? with_control_style(platform::default_input_bindings(), *style_)
+                                                         : platform::default_input_bindings())
+                                         .players[player_];
         changed_ = true;
         persist();
     }
