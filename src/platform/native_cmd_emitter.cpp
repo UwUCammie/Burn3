@@ -5,6 +5,7 @@
 #include "takedown/runtime/slus_21050_car_trusted.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <map>
 #include <tuple>
 #include <chrono>
@@ -46,6 +47,107 @@ std::uint64_t now_ns() {
 
 constexpr std::uint32_t kMaxPending = 768U;
 enum Section { kSecIdentify, kSecMesh, kSecView, kSecProject, kSecCarLaunch, kSecHash, kSecDecide, kSecDefs, kSecEmit, kSecForward, kSecGifTotal, kSecVblank, kSecVbExpire, kSecVbGeom, kSecVbCarMesh, kSecVbEmit, kSecDecCar, kSecDecQueue, kSecMatch, kSecCount };
+
+// nc::match_strip with its vertex search done through a screen grid of the projected mesh (1-pixel cells) instead of a scan of every
+// vertex. Same result for every input: a strip vertex (x, y in [0, 4096) by construction: 16-bit XYZF2 / 16) only matches a mesh
+// vertex less than kMatchTolerance away, so only the cells that range touches are searched, and of the candidates that pass the same
+// tests the same one is taken (the lowest index at or after the order pointer, else the lowest before it). A failing strip (traffic
+// in front of world geometry) cost nverts x n vertex tests per queued launch before; with hundreds per frame that was the graphics
+// thread's main cost in busy scenes.
+constexpr double kMatchTolerance = 0.125;
+constexpr double kMatchUvTolerance = 0.003;
+constexpr std::uint32_t kMatchNeedPercent = 60U;
+constexpr std::uint32_t kIndexMinVertices = 24U; // smaller meshes: the plain scan is as cheap as building the grid
+
+struct ScreenIndex {
+    bool built{false};
+    std::vector<std::uint64_t> keys; // (cell << 32) | vertex index, sorted
+};
+
+inline std::uint64_t screen_cell(std::int64_t cx, std::int64_t cy) noexcept {
+    return (static_cast<std::uint64_t>(cy + 1) << 13U) | static_cast<std::uint64_t>(cx + 1);
+}
+
+void build_screen_index(const nc::ProjectedMesh& pm, ScreenIndex& idx) {
+    idx.keys.clear();
+    const std::uint32_t n = static_cast<std::uint32_t>(pm.sx.size());
+    for (std::uint32_t j = 0; j != n; ++j) {
+        const double x = static_cast<double>(pm.sx[j]), y = static_cast<double>(pm.sy[j]);
+        // only vertices a strip vertex can reach (NaN fails these tests, as it fails the match test)
+        if (!(x > -kMatchTolerance && x < 4096.0 + kMatchTolerance && y > -kMatchTolerance && y < 4096.0 + kMatchTolerance)) {
+            continue;
+        }
+        const auto cx = static_cast<std::int64_t>(std::floor(x)), cy = static_cast<std::int64_t>(std::floor(y));
+        idx.keys.push_back((screen_cell(cx, cy) << 32U) | j);
+    }
+    std::sort(idx.keys.begin(), idx.keys.end());
+    idx.built = true;
+}
+
+nc::MatchResult match_strip_indexed(const nc::ProjectedMesh& pm, ScreenIndex& idx, const float* uv, const nc::StripView& strip) {
+    const std::uint32_t n = static_cast<std::uint32_t>(pm.sx.size());
+    if (n < kIndexMinVertices) {
+        return nc::match_strip(pm, uv, strip, kMatchTolerance, kMatchUvTolerance, kMatchNeedPercent);
+    }
+    nc::MatchResult r;
+    r.checked = strip.nverts;
+    if (strip.nverts < 2U) {
+        return r;
+    }
+    if (!idx.built) {
+        build_screen_index(pm, idx);
+    }
+    const std::uint32_t need = std::max<std::uint32_t>(2U, ((strip.nverts * kMatchNeedPercent + 99U) / 100U));
+    const std::uint32_t allow_miss = strip.nverts - need;
+    std::uint32_t ptr = 0;
+    std::uint32_t misses = 0;
+    for (std::uint32_t i = 0; i != strip.nverts; ++i) {
+        const double ox = strip.x(i), oy = strip.y(i);
+        double ou = 0, ov = 0;
+        if (uv != nullptr) {
+            const float q = strip.qq(i);
+            if (q != 0.0F) {
+                ou = static_cast<double>(strip.s(i)) / q;
+                ov = static_cast<double>(strip.t(i)) / q;
+            }
+        }
+        std::uint32_t best_hi = ~0U, best_lo = ~0U; // lowest passing index >= ptr / < ptr
+        const auto x0 = static_cast<std::int64_t>(std::floor(ox - kMatchTolerance)), x1 = static_cast<std::int64_t>(std::floor(ox + kMatchTolerance));
+        const auto y0 = static_cast<std::int64_t>(std::floor(oy - kMatchTolerance)), y1 = static_cast<std::int64_t>(std::floor(oy + kMatchTolerance));
+        for (std::int64_t cy = y0; cy <= y1; ++cy) {
+            for (std::int64_t cx = x0; cx <= x1; ++cx) {
+                const std::uint64_t cell = screen_cell(cx, cy);
+                for (auto it = std::lower_bound(idx.keys.begin(), idx.keys.end(), cell << 32U); it != idx.keys.end() && (*it >> 32U) == cell; ++it) {
+                    const auto j = static_cast<std::uint32_t>(*it);
+                    if ((j >= ptr ? j >= best_hi : j >= best_lo)) {
+                        continue;
+                    }
+                    if (!(std::fabs(static_cast<double>(pm.sx[j]) - ox) < kMatchTolerance && std::fabs(static_cast<double>(pm.sy[j]) - oy) < kMatchTolerance)) {
+                        continue;
+                    }
+                    if (uv != nullptr) {
+                        const double du = std::fabs(static_cast<double>(uv[2U * j]) - ou), dv = std::fabs(static_cast<double>(uv[2U * j + 1U]) - ov);
+                        const double tol = kMatchUvTolerance + 1e-5 * std::max(std::fabs(ou), std::fabs(ov));
+                        if (!(du < tol && dv < tol)) {
+                            continue;
+                        }
+                    }
+                    (j >= ptr ? best_hi : best_lo) = j;
+                }
+            }
+        }
+        if (best_hi != ~0U) {
+            ptr = best_hi + 1U;
+            ++r.explained;
+        } else if (best_lo != ~0U) {
+            ++r.explained;
+        } else if (++misses > allow_miss) {
+            return r;
+        }
+    }
+    r.accepted = r.explained >= need;
+    return r;
+}
 
 } // namespace
 
@@ -438,6 +540,7 @@ struct NativeCmdEmitter::Impl {
         float y0{};
         std::vector<nc::PropInstance> inst;
         std::vector<nc::ProjectedMesh> proj; // one per instance (props) or one (world)
+        std::vector<ScreenIndex> pidx;       // per proj, built on its first full match (match_strip_indexed)
         std::uint16_t entry{0};
         int scr{-1};                          // TAKEDOWN_NATIVE_CMD_SCRAMBLE: the register scrambled before this launch (-1 none)
         std::uint32_t dm_tail[24 * 4]{};     // TAKEDOWN_NATIVE_CMD_TRAIN: qw 1000..1023
@@ -506,6 +609,35 @@ struct NativeCmdEmitter::Impl {
     std::uint32_t next_view_id{1};
     bool in_emit{false};
     std::uint64_t launch_counter{};
+    // Which launch each PATH1 packet comes from. XGKICKs happen inside a launch (counted by EeMemory's xgkick_packets between
+    // before_vu1_launch and after_vu1_launch), a replaced launch sends its one packet, and the GIF FIFO delivers PATH1 packets in that
+    // order: so the launch at the front of `owed` made the packet now arriving. A strip is then matched against its own launch only, a
+    // strip from a launch nobody queued (traffic, debris, effects: most strips in busy scenes) is not held or matched at all, and queued
+    // launches older than the front can get no more strips (culled launches kick nothing) and are dropped. Before, every strip was
+    // tried against up to 128 stale queue entries. TAKEDOWN_NATIVE_CMD_TAGGED=0 restores that; a packet the accounting did not expect
+    // turns tagging off for the rest of the session.
+    struct Owed {
+        std::uint64_t launch{};
+        std::uint64_t packets{};
+        bool queued{false};
+    };
+    std::deque<Owed> owed;
+    bool tagged{env_flag("TAKEDOWN_NATIVE_CMD_TAGGED", true)};
+    std::uint64_t kick_base{};
+    std::uint64_t queued_launch{~0ULL};
+    std::uint64_t tag_underflows{};
+    bool producer_queued() const noexcept { return !owed.empty() && owed.front().queued; }
+    // queued launches before `first` can receive no strip any more
+    void expire_before(std::uint64_t first) {
+        std::size_t drop = 0;
+        while (drop != queue.size() && queue[drop]->launch < first) {
+            ++drop;
+        }
+        if (drop != 0U) {
+            st.skipped_entries += drop;
+            erase_prefix(drop);
+        }
+    }
     std::uint64_t tsc_start{}, ns_start{};
 
     std::vector<ProbeEntry> probes;
@@ -548,6 +680,48 @@ struct NativeCmdEmitter::Impl {
         cb.clear();
     }
 
+    // The program table holds whole-image hashes, but micro memory holds several programs, and some modes load other code after the
+    // known ones (Crash events: instructions 683..891 differ). An image whose hash is not in the table is taken as a known program when
+    // it holds that program's code unchanged: every instruction its entries can reach (0, 4 and the draw entry; following branches,
+    // BAL links and the constants written to its jump registers -- the draw entries jump back into the program's own loop) lies in
+    // instructions 0..end-1 of its image. Without this, Crash events drew every car (traffic included) and most of the world through
+    // the GS path. The table was computed from the program images by that reachability walk; TAKEDOWN_NATIVE_CMD_CODE_ID=0 turns it off.
+    struct CodeId {
+        std::uint64_t image;   // the program's image in nc::kPrograms
+        std::uint32_t end;     // instructions 0..end-1 hold all of its code
+        std::uint64_t code;    // FNV-1a of those bytes
+    };
+    static constexpr CodeId kCodeIds[] = {
+        {0x59e3769eddeb1139ULL, 683U, 0xaa01036acba5b324ULL}, // p10: instructions 0..682
+        {0xd97899d60f3b5654ULL, 613U, 0x90b1dcb66499f30eULL}, // p11: instructions 0..612
+        {0x5b236e64bcb56d57ULL, 804U, 0x792eac321f44a463ULL}, // p3: instructions 0..803
+        {0xcd4cffe7f78f5fd5ULL, 683U, 0xaa01036acba5b324ULL}, // pfe: instructions 0..682
+        {0x353b67ba772484f1ULL, 670U, 0x1c18b5addf2729d4ULL}, // p5_car: instructions 0..669
+    };
+    static std::uint64_t fnv1a(const std::uint8_t* p, std::size_t n) noexcept {
+        std::uint64_t h = 1469598103934665603ULL;
+        for (std::size_t i = 0; i != n; ++i) {
+            h = (h ^ p[i]) * 1099511628211ULL;
+        }
+        return h;
+    }
+    static const nc::ProgramInfo* program_for_image(std::span<const std::byte> micro, std::uint64_t full) noexcept {
+        if (const nc::ProgramInfo* info = nc::find_program(full); info != nullptr) {
+            return info;
+        }
+        static const bool by_code = env_flag("TAKEDOWN_NATIVE_CMD_CODE_ID", true);
+        if (!by_code || micro.size() < 16384U) {
+            return nullptr;
+        }
+        const auto* bytes = reinterpret_cast<const std::uint8_t*>(micro.data());
+        for (const CodeId& c : kCodeIds) {
+            if (fnv1a(bytes, static_cast<std::size_t>(c.end) * 8U) == c.code) {
+                return nc::find_program(c.image);
+            }
+        }
+        return nullptr;
+    }
+
     const nc::ProgramInfo* identify(std::span<const std::byte> micro) {
         if (micro.size() < 16384U) {
             return nullptr;
@@ -561,7 +735,7 @@ struct NativeCmdEmitter::Impl {
                     if (full != e.full) {
                         ++st.probe_mismatch;
                         e.full = full;
-                        e.info = nc::find_program(full);
+                        e.info = program_for_image(micro, full);
                     }
                 }
                 return e.info;
@@ -571,7 +745,7 @@ struct NativeCmdEmitter::Impl {
         if (probes.size() >= 64U) {
             probes.erase(probes.begin());
         }
-        probes.push_back({probe, full, nc::find_program(full), 0});
+        probes.push_back({probe, full, program_for_image(micro, full), 0});
         return probes.back().info;
     }
 
@@ -1092,6 +1266,7 @@ struct NativeCmdEmitter::Impl {
         lap(kSecView, lc);
         const nc::ViewParams& view = p->view->params;
         p->proj.resize(1);
+        p->pidx.clear();
         if (info->decoder == nc::Decoder::kProp) {
             ++st.launches_prop;
             nc::PropInstance inst[18];
@@ -1116,6 +1291,10 @@ struct NativeCmdEmitter::Impl {
             }
         }
         lap(kSecProject, lc);
+        if (tagged) {
+            expire_before(owed.empty() ? launch_counter : owed.front().launch);
+        }
+        queued_launch = launch_counter;
         queue.push_back(std::move(p));
         if (queue.size() > kMaxPending) {
             ++st.pending_dropped;
@@ -1172,7 +1351,10 @@ struct NativeCmdEmitter::Impl {
                 continue;
             }
             const SecTimer match_timer(*this, kSecMatch);
-            const nc::MatchResult m = nc::match_strip(pm, uv, sv);
+            if (e.pidx.size() != e.proj.size()) {
+                e.pidx.assign(e.proj.size(), ScreenIndex{});
+            }
+            const nc::MatchResult m = match_strip_indexed(pm, e.pidx[k], uv, sv);
             if (m.accepted) {
                 matched_instance = k;
                 return true;
@@ -1267,7 +1449,17 @@ struct NativeCmdEmitter::Impl {
         }
         // 3. a queued world / prop launch
         const SecTimer queue_timer(*this, kSecDecQueue);
-        const std::size_t limit = std::min<std::size_t>(queue.size(), cfg.window);
+        std::size_t limit = std::min<std::size_t>(queue.size(), cfg.window);
+        if (tagged) {
+            if (!producer_queued()) {
+                return d;
+            }
+            expire_before(owed.front().launch);
+            if (queue.empty() || queue.front()->launch != owed.front().launch) {
+                return d;
+            }
+            limit = 1U;
+        }
         for (std::size_t qi = 0; qi != limit; ++qi) {
             Pending& e = *queue[qi];
             std::uint32_t k = 0;
@@ -2065,6 +2257,12 @@ struct NativeCmdEmitter::Impl {
 
     void end_of_tag() {
         if (cur_tag.eop) {
+            if (owed.empty()) {
+                ++tag_underflows;
+                tagged = false;
+            } else if (--owed.front().packets == 0U) {
+                owed.pop_front();
+            }
             // packet complete: retire the entry the packet belonged to
             if (pkt_entry != nullptr) {
                 Pending* e = pkt_entry;
@@ -2095,7 +2293,13 @@ struct NativeCmdEmitter::Impl {
     }
 
     bool is_candidate(const nc::Tags& t) const {
-        return t.strip_shape && t.nloop >= 2U && t.nloop <= nc::kMaxStripVertices && (!queue.empty() || !car_strips.empty() || pkt_entry != nullptr);
+        if (!(t.strip_shape && t.nloop >= 2U && t.nloop <= nc::kMaxStripVertices)) {
+            return false;
+        }
+        if (tagged) {
+            return !car_strips.empty() || pkt_entry != nullptr || producer_queued();
+        }
+        return !queue.empty() || !car_strips.empty() || pkt_entry != nullptr;
     }
 
     void path1_quadword(const guest::GsQuadword& q) {
@@ -2303,6 +2507,7 @@ std::optional<guest::Vu1LaunchReplacement> NativeCmdEmitter::before_vu1_launch(c
     const std::uint64_t t0 = m.cfg.timing ? now_ns() : 0U;
     ++stats_.launches;
     ++m.launch_counter;
+    m.kick_base = memory.vu1_activity().xgkick_packets;
     std::uint64_t lc = m.tsc();
     const nc::ProgramInfo* info = nullptr;
     bool car_done = false;
@@ -2375,10 +2580,20 @@ std::optional<guest::Vu1LaunchReplacement> NativeCmdEmitter::before_vu1_launch(c
     if (m.cfg.timing) {
         stats_.ns_launch += now_ns() - t0;
     }
+    if (r.has_value() && !r->packet.empty()) {
+        m.owed.push_back({m.launch_counter, 1U, false});
+    }
     return r;
 }
 
 void NativeCmdEmitter::after_vu1_launch(const guest::EeMemory& memory, const guest::Vu1Launch& launch) {
+    {
+        Impl& m = *impl_;
+        const std::uint64_t kicks = memory.vu1_activity().xgkick_packets - m.kick_base;
+        if (kicks != 0U) {
+            m.owed.push_back({m.launch_counter, kicks, m.queued_launch == m.launch_counter});
+        }
+    }
     if (impl_->chk_on) {
         impl_->chk_after(launch);
     }
@@ -2455,6 +2670,8 @@ void NativeCmdEmitter::log_stats(const char* tag) const {
                  static_cast<unsigned long long>(s.ns_launch), static_cast<unsigned long long>(s.ns_stream));
     {
         const auto& t = impl_->ts;
+        std::fprintf(stderr, "[NATIVECMD] %s tagged=%d tag-underflows=%llu owed=%zu queue=%zu\n", tag, impl_->tagged ? 1 : 0,
+                     static_cast<unsigned long long>(impl_->tag_underflows), impl_->owed.size(), impl_->queue.size());
         std::fprintf(stderr, "[NATIVECMD] %s trust=%d reset-replayed=%llu: launches=%llu declined=%llu offscreen-launches=%llu instances-offscreen=%llu draws=%llu tokens=%llu lost=%llu tris kept/total=%llu/%llu stale-camera=%llu\n", tag, impl_->trust_on ? 1 : 0, static_cast<unsigned long long>(impl_->reset_replayed),
                      static_cast<unsigned long long>(t.launches), static_cast<unsigned long long>(t.declined), static_cast<unsigned long long>(t.offscreen),
                      static_cast<unsigned long long>(t.instances_off), static_cast<unsigned long long>(t.draws), static_cast<unsigned long long>(t.tokens_matched),

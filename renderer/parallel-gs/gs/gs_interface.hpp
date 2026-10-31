@@ -828,6 +828,13 @@ private:
 		uint32_t count = 0;            // far-plane primitives this frame
 		uint32_t last_noncandidate = 0; // far-plane primitives before the last other one
 		uint32_t threshold = 0;        // last_noncandidate of the previous frame
+		// The same split counted in runs of far-plane primitives (separated by other primitives): the
+		// number of runs is the same every frame where the number of primitives in them is not (labels
+		// that appear one by one before a full-screen effect: the crash tally).
+		uint32_t runs = 0;             // runs of far-plane primitives this frame
+		bool in_run = false;           // the last primitive was a far-plane one
+		uint32_t last_noncandidate_runs = 0; // runs before the last other primitive
+		uint32_t threshold_runs = 0;   // last_noncandidate_runs of the previous frame
 	};
 	// After this many VSyncs without a published frame the UI is taken down (a video,
 	// a loading screen or another picture that is not drawn through the target).

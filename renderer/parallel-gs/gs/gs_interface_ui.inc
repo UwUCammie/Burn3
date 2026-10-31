@@ -218,7 +218,11 @@ bool GSInterface::takedown_ui_capture(const VertexPosition *pos, const VertexAtt
 					return false;
 				auto order = takedown_ui.order.find(page);
 				if (order != takedown_ui.order.end())
+				{
+					const uint32_t runs = order->second.last_noncandidate_runs;
 					order->second = { 0, 0, order->second.last_noncandidate };
+					order->second.threshold_runs = runs;
+				}
 				if (takedown_ui.copied)
 					return false;
 				takedown_ui.pending.clear();
@@ -250,6 +254,9 @@ bool GSInterface::takedown_ui_capture(const VertexPosition *pos, const VertexAtt
 		auto &order = takedown_ui.order[uint32_t(frame.FBP)];
 		order.count = 0;
 		order.last_noncandidate = 0;
+		order.runs = 0;
+		order.in_run = false;
+		order.last_noncandidate_runs = 0;
 	}
 
 	if (frame.FBW != 10 || frame.PSM != PSMCT32)
@@ -265,16 +272,35 @@ bool GSInterface::takedown_ui_capture(const VertexPosition *pos, const VertexAtt
 		takedown_ui.last_order_fbp = uint32_t(frame.FBP);
 	}
 	auto &order = *takedown_ui.last_order;
+	// Far-plane primitives drawn before the frame's last other primitive belong to the
+	// world picture (effects drawn after them cover them too: the crash tally's labels
+	// under its full-screen tint); the frame's last other primitive is known only
+	// afterwards, so the previous frame's split is used. It is kept as a number of runs
+	// of far-plane primitives: counted in primitives it moved with every label that
+	// appeared, and labels flickered between the picture and the layer.
+	// TAKEDOWN_UI_SPLIT_BY_COUNT=1: the release's split by primitive count.
+	static const bool split_by_count = [] {
+		const char *v = getenv("TAKEDOWN_UI_SPLIT_BY_COUNT");
+		return v && *v && *v != '0';
+	}();
 	if (!candidate)
 	{
 		// World drawing after primitives already taken as UI: those were part of
 		// the world (more far-plane pieces than last frame) and show over it.
-		if (order.count > std::max(order.threshold, order.last_noncandidate))
+		if (split_by_count ? order.count > std::max(order.threshold, order.last_noncandidate)
+		                   : order.runs > std::max(order.threshold_runs, order.last_noncandidate_runs))
 			takedown_ui.stats.late_world++;
 		order.last_noncandidate = order.count;
+		order.last_noncandidate_runs = order.runs;
+		order.in_run = false;
 		return false;
 	}
-	if (order.count++ < order.threshold)
+	if (!order.in_run)
+	{
+		order.in_run = true;
+		order.runs++;
+	}
+	if (split_by_count ? order.count++ < order.threshold : (order.count++, order.runs <= order.threshold_runs))
 		return false;
 
 	const auto reject = [this]() {
