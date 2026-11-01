@@ -16,6 +16,9 @@
 #include "takedown/engine/world/view_frustum.hpp"
 #include "takedown/runtime/guest_call.hpp"
 #include "takedown/runtime/game/hot_leaves.hpp"
+#include "takedown/runtime/game/n3.hpp"
+
+#include <vector>
 #include "takedown/runtime/guest_memory.hpp"
 #include "takedown/runtime/slus_21050_camera_fov.hpp"
 #include "takedown/runtime/slus_21050_engine_function_table.hpp"
@@ -2936,7 +2939,15 @@ constexpr std::array kFunctions{
 
 } // namespace
 
-std::span<const EngineFunction> render_engine_functions() { return kFunctions; }
+std::span<const EngineFunction> render_engine_functions() {
+    static const std::vector<EngineFunction> functions = [] {
+        std::vector<EngineFunction> all(kFunctions.begin(), kFunctions.end());
+        const auto added = n3_engine_functions();
+        all.insert(all.end(), added.begin(), added.end());
+        return all;
+    }();
+    return functions;
+}
 
 void set_slus_21050_chase_camera_real_time_easing(const bool enabled) noexcept {
     chase_camera_real_time_easing.store(enabled, std::memory_order_relaxed);

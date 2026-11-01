@@ -550,6 +550,18 @@ target_sources(
     src/ui/car_select.cpp
 )
 
+# The n3 engine functions: n3_table.cpp plus one source per N3(<address>) line in the n3 lists.
+file(GLOB TAKEDOWN_N3_LISTS CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/game/n3_list*.inc")
+set(TAKEDOWN_N3_SOURCES src/runtime/game/n3_table.cpp)
+foreach(n3_list IN LISTS TAKEDOWN_N3_LISTS)
+    file(STRINGS "${n3_list}" n3_lines REGEX "^N3\\([0-9a-f]+\\)")
+    foreach(n3_line IN LISTS n3_lines)
+        string(REGEX REPLACE "^N3\\(([0-9a-f]+)\\).*" "\\1" n3_address "${n3_line}")
+        list(APPEND TAKEDOWN_N3_SOURCES src/runtime/game/n3/${n3_address}.cpp)
+    endforeach()
+endforeach()
+target_sources(takedown_core PRIVATE ${TAKEDOWN_N3_SOURCES})
+
 target_include_directories(
     takedown_core
     PUBLIC

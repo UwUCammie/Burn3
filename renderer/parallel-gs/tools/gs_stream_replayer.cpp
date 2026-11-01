@@ -285,6 +285,10 @@ struct InputBridge
 				else if (e.key.scancode == SDL_SCANCODE_ESCAPE)
 					writer->text_cancel();
 			}
+			// Escape belongs to the game (Back in menus, pause in races). Granite's
+			// SDL platform would end the application on it, so it stops here.
+			if (e.key.scancode == SDL_SCANCODE_ESCAPE)
+				keep = false;
 			break;
 		case SDL_EVENT_TEXT_INPUT:
 			if (e.text.text)
@@ -2251,7 +2255,8 @@ struct StreamApplication : Granite::Application, Granite::EventHandler
 			device.unmap_host_buffer(*buffer, MEMORY_ACCESS_READ_BIT);
 		}
 	}
-	uint64_t re_current_cv() const { return native_scene_image ? native_shown_cv : parser.get_vsync_count(); }
+	// RE_BY_VSYNC=1: number captures by stream vsync even while the native scene keeps an older picture.
+	uint64_t re_current_cv() const { static const bool by_vs = getenv("RE_BY_VSYNC") != nullptr; return native_scene_image && !by_vs ? native_shown_cv : parser.get_vsync_count(); }
 
 	void render_frame(double, double) override
 	{

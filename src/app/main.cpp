@@ -4893,6 +4893,19 @@ int run_boot_entry(int argc, char** argv) {
                                         env_u64("TAKEDOWN_GRAPHICS_ASYNC_MIN_QW", 1U));
     }
     std::optional<std::uint64_t> variable_frame_target{};
+    // A Crash event's replay re-runs the player's inputs tick by tick, so it only matches what was played when
+    // every tick lasts the retail 1/60 s. While one runs (the game's mode object at 0x0051ba88 is the Crash
+    // mode's 0x0051ad00) the variable frame rate steps aside: the game's own timer code runs and VBlanks come
+    // every retail period, paced to the host clock below. Off by default (TAKEDOWN_CRASH_FIXED_TICKS=1 turns it
+    // on) until it is safe in every Crash event: Crash event 3 stopped on an iWakeupThread syscall from the
+    // retail timer path in a player's run.
+    const bool crash_fixed_ticks_enabled = [] {
+        const char* const value = std::getenv("TAKEDOWN_CRASH_FIXED_TICKS");
+        return value != nullptr && std::string_view(value) == "1";
+    }();
+    bool crash_fixed_ticks = false;
+    std::uint64_t crash_pacing_anchor_cycle = 0U;
+    std::uint64_t crash_pacing_anchor_nanoseconds = 0U;
     std::optional<std::uint64_t> variable_frame_hook_step{};
     std::uint64_t variable_frame_host_wait_nanoseconds = 0U;
     std::vector<audio::RwaSpu2KeyOn> recent_rwa_key_ons{};
@@ -8486,7 +8499,7 @@ int run_boot_entry(int argc, char** argv) {
             memory.read_u32_le(0x004e2838U) != memory.read_u32_le(0x004e283cU) && memory.read_u8(0x004e2830U) == 0U &&
             !timed_graphics_scheduler_work_pending() && (memory.intc_status() & 4U) == 0U &&
             emulated_ee_cycles < next_vblank_start) {
-            if (variable_frame_clock.has_value()) {
+            if (variable_frame_clock.has_value() && !crash_fixed_ticks) {
                 variable_frame_clock->set_minimum_frame_cycles(variable_frame_limit_cycles());
                 const std::uint64_t retail_frame_cycles = 294912000U / variable_frame_rate->planner().retail_rate();
                 const std::uint64_t target = variable_frame_clock->frame_target(
@@ -8527,7 +8540,19 @@ int run_boot_entry(int argc, char** argv) {
         bool reached_host_capture_boundary = false;
         bool variable_frame_busy_vblank = false;
         while (emulated_ee_cycles >= next_vblank_start) {
-            if (variable_frame_clock.has_value()) {
+            if (variable_frame_clock.has_value() && crash_fixed_ticks) {
+                // Retail VBlanks, each one due 1/60 s of host time after the last (EE cycles to nanoseconds:
+                // 15625 / 4608). A stall of more than a quarter second is dropped rather than raced through.
+                const std::uint64_t due = crash_pacing_anchor_nanoseconds +
+                                          (next_vblank_start - crash_pacing_anchor_cycle) * 15625U / 4608U;
+                const std::uint64_t now = host_steady_now_nanoseconds();
+                if (due > now) {
+                    wait_for_host_time(due, platform::HostWaitSite::FramePacingDeadline);
+                } else if (now - due > 250'000'000U) {
+                    crash_pacing_anchor_cycle = next_vblank_start;
+                    crash_pacing_anchor_nanoseconds = now;
+                }
+            } else if (variable_frame_clock.has_value()) {
                 if (variable_frame_target.has_value() && next_vblank_start >= *variable_frame_target) {
                     const auto deadline = variable_frame_clock->host_deadline_nanoseconds(next_vblank_start);
                     if (deadline.has_value()) {
@@ -8914,6 +8939,18 @@ int run_boot_entry(int argc, char** argv) {
                 reached_host_frame_step_boundary = true;
             }
             next_vblank_start += 4915200U;
+            if (variable_frame_rate.has_value()) {
+                const bool crash_now = crash_fixed_ticks_enabled && memory.read_u32_le(0x0051ba88U) == 0x0051ad00U;
+                if (crash_now != crash_fixed_ticks) {
+                    crash_fixed_ticks = crash_now;
+                    set_slus_21050_chase_camera_real_time_easing(!crash_now);
+                    crash_pacing_anchor_cycle = next_vblank_start;
+                    crash_pacing_anchor_nanoseconds = host_steady_now_nanoseconds();
+                    variable_frame_target.reset();
+                    std::cout << "Frame rate: " << (crash_now ? "Crash event, retail ticks" : "variable again") << '\n'
+                              << std::flush;
+                }
+            }
             if (reached_host_frame_step_boundary || reached_host_capture_boundary) {
                 break;
             }
@@ -9294,7 +9331,7 @@ int run_boot_entry(int argc, char** argv) {
             vif_packet_ring_flush_claim_tracker.requires_pre_instruction(ui_draw_execution_context, dispatch_pc)) {
             vif_packet_ring_flush_claim_tracker.observe_pre_instruction(state, memory, ui_draw_execution_context);
         }
-        if (variable_frame_rate.has_value() && scalar_burst_hooks.marked(dispatch_pc) &&
+        if (variable_frame_rate.has_value() && !crash_fixed_ticks && scalar_burst_hooks.marked(dispatch_pc) &&
             (!variable_frame_hook_step.has_value() || *variable_frame_hook_step != committed_steps)) {
             const auto frame_rate_hook = variable_frame_rate->on_dispatch(state, memory, emulated_ee_cycles);
             if (frame_rate_hook == runtime::Slus21050FrameRateHookResult::Replaced) {

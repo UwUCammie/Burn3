@@ -950,13 +950,11 @@ struct Slus21050Online::Impl {
             return true;
         }
         if (address == 3292724U) {
-            if (c.cpu.read_gpr_u32(5U) == 36U) {
-                c.cpu.write_gpr_u64(29U, c.cpu.read_gpr_u32(29U) + 32U);
-                c.cpu.set_pc(c.cpu.read_gpr_u32(31U));
-            } else {
-                c.cpu.write_gpr_u64(3U, 36U);
-                c.cpu.set_pc(3292728U);
-            }
+            // Buddies (command 36) goes on to the game's buddy page. The frontend has already closed the online
+            // menu when this runs and waits for this page to open the next screen, so returning early here
+            // leaves a black screen.
+            c.cpu.write_gpr_u64(3U, 36U);
+            c.cpu.set_pc(3292728U);
             return true;
         }
         if (address == 3292780U) {

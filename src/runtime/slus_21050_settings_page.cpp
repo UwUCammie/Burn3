@@ -5,6 +5,7 @@
 #include "takedown/ui/controls_editor.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdlib>
 #include <utility>
@@ -36,6 +37,41 @@ constexpr std::uint32_t kAaTypeRow = 200U;
 constexpr std::uint32_t kSmaaRow = 201U;
 constexpr std::uint32_t kFsrModeRow = 202U;
 constexpr std::uint32_t kSectionBase = 0xFFFF0000U;
+
+// The profile's options block (audio, camera, gameplay bytes among them). The menu pages under SETTINGS
+// (message handlers 0x0045c140 in the front end, 0x00322ea0 in the pause menu) copy it to their object at
+// +0x10 when they open and copy it back when they get Back (command 3), which undid every change made on
+// this page. The objects (listed by base address; their vtable is at +0xc) are globals constructed at boot.
+// Whichever still holds the block as it was when this page opened gets the edited block before Back is
+// sent, so Back keeps the changes.
+constexpr guest::GuestAddress kProfileOptions = 0x004F5040U;
+constexpr std::uint32_t kProfileOptionsBytes = 64U;
+constexpr std::uint32_t kSnapshotOffset = 0x10U;
+constexpr std::array<guest::GuestAddress, 6> kSnapshotOwners{0x01E94F24U, 0x01E96508U, 0x01E9F994U,
+                                                             0x01EA2998U, 0x01EA2A68U, 0x01EA2C68U};
+std::array<std::uint8_t, kProfileOptionsBytes> g_options_at_open{};
+
+std::array<std::uint8_t, kProfileOptionsBytes> read_block(const guest::EeMemory& memory, const guest::GuestAddress at) {
+    std::array<std::uint8_t, kProfileOptionsBytes> block{};
+    for (std::uint32_t i = 0U; i < kProfileOptionsBytes; ++i) {
+        block[i] = memory.read_u8(at + i);
+    }
+    return block;
+}
+
+void keep_options_on_back(guest::EeMemory& memory) {
+    const auto now = read_block(memory, kProfileOptions);
+    if (now == g_options_at_open) {
+        return;
+    }
+    for (const guest::GuestAddress owner : kSnapshotOwners) {
+        if (read_block(memory, owner + kSnapshotOffset) == g_options_at_open) {
+            for (std::uint32_t i = 0U; i < kProfileOptionsBytes; ++i) {
+                memory.write_u8(owner + kSnapshotOffset + i, now[i]);
+            }
+        }
+    }
+}
 
 // Retail sounds (the frontend sound bank).
 constexpr std::uint32_t kChangeSound = 75U;
@@ -293,6 +329,7 @@ SettingsPageResult Slus21050SettingsPage::update(guest::EeMemory& memory, Slus21
     if (active && !active_) {
         menu_.open(last_tab_);
         last_poll_.reset();
+        g_options_at_open = read_block(memory, kProfileOptions);
     }
     active_ = active;
     result.active = active;
@@ -413,6 +450,7 @@ SettingsPageResult Slus21050SettingsPage::update(guest::EeMemory& memory, Slus21
         break;
     }
     if (frame.close) {
+        keep_options_on_back(memory);
         page.settings_back();
     }
     return result;
