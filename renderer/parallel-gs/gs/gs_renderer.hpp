@@ -21,6 +21,8 @@
 #include <atomic>
 #include <condition_variable>
 #include <thread>
+#include <string>
+#include <vector>
 
 namespace ParallelGS
 {
@@ -249,6 +251,10 @@ enum class SuperSampling
 
 struct GSOptions;
 class PageTracker;
+
+// Takedown: the device features the GS renderer cannot run without that this
+// device lacks, by name (empty when it has them all).
+std::vector<std::string> missing_gs_requirements(Vulkan::Device &device);
 
 class GSRenderer
 {

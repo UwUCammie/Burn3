@@ -850,25 +850,74 @@ GSRenderer::GSRenderer(PageTracker &tracker_)
 	});
 }
 
+std::vector<std::string> missing_gs_requirements(Vulkan::Device &device)
+{
+	// Descriptor indexing is a hard requirement, but timeline semaphore could be elided if really needed.
+	// Wave-ops is critical.
+	constexpr VkSubgroupFeatureFlags required_subgroup_flags =
+			VK_SUBGROUP_FEATURE_ARITHMETIC_BIT |
+			VK_SUBGROUP_FEATURE_SHUFFLE_BIT |
+			VK_SUBGROUP_FEATURE_VOTE_BIT |
+			VK_SUBGROUP_FEATURE_BALLOT_BIT |
+			VK_SUBGROUP_FEATURE_BASIC_BIT;
+
+	const auto &ext = device.get_device_features();
+	std::vector<std::string> missing;
+	if (!ext.vk12_features.descriptorIndexing)
+		missing.emplace_back("descriptorIndexing");
+	if (!ext.vk12_features.timelineSemaphore)
+		missing.emplace_back("timelineSemaphore");
+	if (!ext.vk12_features.bufferDeviceAddress)
+		missing.emplace_back("bufferDeviceAddress");
+	if (!ext.vk12_features.storageBuffer8BitAccess)
+		missing.emplace_back("storageBuffer8BitAccess");
+	if (!ext.vk11_features.storageBuffer16BitAccess)
+		missing.emplace_back("storageBuffer16BitAccess");
+	if (!ext.enabled_features.shaderInt16)
+		missing.emplace_back("shaderInt16");
+	if (!ext.vk12_features.scalarBlockLayout)
+		missing.emplace_back("scalarBlockLayout");
+	if ((ext.vk11_props.subgroupSupportedOperations & required_subgroup_flags) != required_subgroup_flags)
+		missing.emplace_back("Arithmetic / Shuffle / Vote / Ballot / Basic subgroup operations");
+	if (!device.supports_subgroup_size_log2(true, 2, 6))
+		missing.emplace_back("SubgroupSize control for [4, 64] invocations per subgroup");
+	if (device.get_gpu_properties().limits.maxComputeSharedMemorySize < 32 * 1024)
+		missing.emplace_back("32 KiB shared memory");
+	return missing;
+}
+
 bool GSRenderer::init(Vulkan::Device *device_, const GSOptions &options)
 {
 	drain_compilation_tasks();
 
+	// Takedown: checked before any shader is made: some drivers crash compiling
+	// the GS shaders on a device that lacks these.
+	{
+		const auto missing = missing_gs_requirements(*device_);
+		if (!missing.empty())
+		{
+			LOGE("Minimum requirements for parallel-gs are not met.\n");
+			for (auto &name : missing)
+				LOGE("  - %s\n", name.c_str());
+			return false;
+		}
+	}
+
 	// Takedown: step lines (as in the release renderer) to locate startup failures.
-	// Takedown: AMD's own driver crashes on GCN cards (Polaris/Vega, e.g. RX 580)
-	// while compiling the sampler feedback shader, so that pass is left out
-	// there (GSInterface then runs with disable_sampler_feedback, an upstream
-	// mode). GCN only runs wave64: a fixed 64-wide subgroup on an AMD driver.
-	// PGS_SAMPLER_FEEDBACK=0/1 overrides, as in the release renderer.
+	// Takedown: AMD's own driver crashes while compiling the sampler feedback
+	// shader, on GCN cards (RX 580: in vkCreateShaderModule) and on RDNA2
+	// (RX 6600, driver 2.0.353: in vkCreateComputePipelines). The pass is left
+	// out on AMD's drivers (GSInterface then runs with disable_sampler_feedback,
+	// an upstream mode); RADV is not affected. A recorded race replays
+	// pixel-identical either way. PGS_SAMPLER_FEEDBACK=0/1 overrides, as in the
+	// release renderer.
 	{
 		const auto &features = device_->get_device_features();
 		const bool amd_driver = features.driver_id == VK_DRIVER_ID_AMD_PROPRIETARY ||
 		                        features.driver_id == VK_DRIVER_ID_AMD_OPEN_SOURCE;
-		const bool wave64_only = features.vk13_props.minSubgroupSize == 64 &&
-		                         features.vk13_props.maxSubgroupSize == 64;
-		sampler_feedback_supported = !(amd_driver && wave64_only);
+		sampler_feedback_supported = !amd_driver;
 		if (!sampler_feedback_supported)
-			LOGI("Sampler feedback disabled for AMD GCN on the AMD driver.\n");
+			LOGI("Sampler feedback disabled on the AMD driver.\n");
 		if (const char *env = getenv("PGS_SAMPLER_FEEDBACK"))
 		{
 			sampler_feedback_supported = strtol(env, nullptr, 0) != 0;
@@ -890,40 +939,6 @@ bool GSRenderer::init(Vulkan::Device *device_, const GSOptions &options)
 
 	LOGI("GS init: first submit.\n");
 	flush_submit(0);
-	// Descriptor indexing is a hard requirement, but timeline semaphore could be elided if really needed.
-	// Wave-ops is critical.
-	constexpr VkSubgroupFeatureFlags required_subgroup_flags =
-			VK_SUBGROUP_FEATURE_ARITHMETIC_BIT |
-			VK_SUBGROUP_FEATURE_SHUFFLE_BIT |
-			VK_SUBGROUP_FEATURE_VOTE_BIT |
-			VK_SUBGROUP_FEATURE_BALLOT_BIT |
-			VK_SUBGROUP_FEATURE_BASIC_BIT;
-
-	const auto &ext = device_->get_device_features();
-	if (!ext.vk12_features.descriptorIndexing ||
-	    !ext.vk12_features.timelineSemaphore ||
-	    !ext.vk12_features.bufferDeviceAddress ||
-	    !ext.vk12_features.storageBuffer8BitAccess ||
-	    !ext.vk11_features.storageBuffer16BitAccess ||
-	    !ext.enabled_features.shaderInt16 ||
-	    !ext.vk12_features.scalarBlockLayout ||
-	    (ext.vk11_props.subgroupSupportedOperations & required_subgroup_flags) != required_subgroup_flags ||
-	    !device_->supports_subgroup_size_log2(true, 2, 6) ||
-	    device_->get_gpu_properties().limits.maxComputeSharedMemorySize < 32 * 1024)
-	{
-		LOGE("Minimum requirements for parallel-gs are not met.\n");
-		LOGE("  - descriptorIndexing\n");
-		LOGE("  - timelineSemaphore\n");
-		LOGE("  - bufferDeviceAddress\n");
-		LOGE("  - storageBuffer8BitAccess\n");
-		LOGE("  - storageBuffer16BitAccess\n");
-		LOGE("  - shaderInt16\n");
-		LOGE("  - scalarBlockLayout\n");
-		LOGE("  - Arithmetic / Shuffle / Vote / Ballot / Basic subgroup operations\n");
-		LOGE("  - SubgroupSize control for [4, 64] invocations per subgroup\n");
-		LOGE("  - 32 KiB shared memory\n");
-		return false;
-	}
 
 	buffers = {};
 	device = device_;

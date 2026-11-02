@@ -25,6 +25,36 @@ right   name=menu-corner  tex=6ea782fa602ce4d6 texels=0,0,32,32 area=600,355,640
 # The lines either side of the highlighted menu item reach the screen edges.
 pin     name=menu-marker  tex=5cc8b38661dc624b
 
+# The takedowns counter (top left: panel, label, number) stays on the left
+# edge, also while a takedown cam's bars cover it and while it slides back in
+# from the top edge after the cam. The number is matched by where it starts,
+# so a wider (two-digit) number moves with it.
+left    name=hud-takedowns-panel tex=2773e574a70bd410 area=0,0,200,60 when=3f7903c13f585625
+left    name=hud-takedowns-label tex=38cf308a66a06426 texels=0,23,230,219 text=1 area=0,0,150,46 min_size=100,0 when=3f7903c13f585625
+left    name=hud-takedowns-count tex=38cf308a66a06426 origin=100,0,165,40 min_size=10,28 max_size=70,45 when=3f7903c13f585625
+left    name=hud-takedowns-count-in tex=38cf308a66a06426 origin=100,0,165,0 min_size=10,10 max_size=70,45 when=3f7903c13f585625
+# Takedown cam (bars 4357c5866e06aa4a, the thin bar piece: the title screen
+# draws its top panel with the same texture) and crash cam (skull
+# 172357bc3753484b): the title (icon, name, points; its font and icons only)
+# goes to the top left corner like the HUD.
+# It is drawn letter by letter in the same font as the HUD, and its letters
+# fly in large, so every piece is matched by where it starts and the title
+# moves as one. The score panel in the middle stays in the block (its text
+# is one line ending above the title's). In the crash cam IMPACT TIME (icon,
+# or the R1 button, and its label) goes to the top right corner; the icon is
+# drawn a little before the skull.
+centre  name=crash-cam-score    tex=2773e574a70bd410 origin=200,0,440,60 when=172357bc3753484b
+centre  name=takedown-cam-score tex=2773e574a70bd410 origin=200,0,440,60 when=4357c5866e06aa4a when_texels=0,0,40,4
+centre  name=hud-score-text tex=38cf308a66a06426 area=260,0,372,44 text=1 when=2773e574a70bd410
+right   name=crash-impact-icon   tex=5f8261e46c6e4335
+right   name=crash-impact-button tex=75a6d9da114b2750 when=172357bc3753484b
+right   name=crash-impact-label  tex=38cf308a66a06426 origin=430,15,640,45 max_size=210,45 when=5f8261e46c6e4335
+right   name=crash-impact-label-r1 tex=38cf308a66a06426 origin=430,15,640,45 max_size=210,45 when=75a6d9da114b2750
+left    name=crash-cam-title     tex=38cf308a66a06426 origin=0,0,430,100 max_size=520,200 when=172357bc3753484b
+left    name=crash-cam-skull     tex=172357bc3753484b origin=0,0,430,100 when=172357bc3753484b
+left    name=takedown-cam-title  tex=38cf308a66a06426 origin=0,0,430,100 max_size=520,200 when=4357c5866e06aa4a when_texels=0,0,40,4
+left    name=takedown-cam-icon   texels=0,0,128,128 origin=0,0,430,40 max_size=130,100 when=4357c5866e06aa4a when_texels=0,0,40,4
+
 # Race HUD (while the boost bar's frame, 3f7903c13f585625, is drawn; the panels
 # 2773e574a70bd410 also frame the results and Burnout Points screens): each corner stays
 # in its corner with everything in it (POS, LAP, boost bar and its stars and

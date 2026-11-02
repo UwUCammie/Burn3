@@ -160,6 +160,8 @@
 #include <array>
 #include <charconv>
 #include <chrono>
+#include <cstdio>
+#include <ctime>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -185,6 +187,10 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+#ifdef _WIN32
+#include <process.h>
+#endif
 
 #include <fcntl.h>
 #include <io.h>
@@ -257,6 +263,68 @@ void move_user_files_from_app_data(const std::filesystem::path& config_directory
         const std::filesystem::path old_directory = std::filesystem::path(local) / "Takedown";
         move_into_config(old_directory / "game-session.bin", config_directory / "game-session.bin");
         std::filesystem::remove(old_directory, error);
+    }
+}
+
+// Stutter profiler for players' own races, off unless config/profiler.txt exists in the install and
+// tools/stutterprof.exe is there: each run writes the host time of every displayed frame (steady_clock
+// nanoseconds, 8 bytes each) to profiles/<date-time>/frames.bin and starts the sampler on this process, which
+// records what every busy thread is doing. tools/perf/stutter_report.py lines the two up.
+std::FILE* g_profile_frames = nullptr;
+std::uint64_t g_profile_frame_count = 0U;
+
+void start_stutter_profile(const std::filesystem::path& install, const char* game_exe) {
+    std::error_code error;
+    const std::filesystem::path sampler = install / "tools" / "stutterprof.exe";
+    if (!std::filesystem::exists(install / "config" / "profiler.txt", error) ||
+        !std::filesystem::exists(sampler, error)) {
+        return;
+    }
+    const std::time_t now = std::time(nullptr);
+    std::tm local{};
+#ifdef _WIN32
+    localtime_s(&local, &now);
+#else
+    localtime_r(&now, &local);
+#endif
+    char name[32];
+    std::strftime(name, sizeof name, "%Y%m%d-%H%M%S", &local);
+    const std::filesystem::path directory = install / "profiles" / name;
+    std::filesystem::create_directories(directory, error);
+    if (error) {
+        return;
+    }
+    if (std::FILE* const info = std::fopen((directory / "info.txt").string().c_str(), "w"); info != nullptr) {
+        std::fprintf(info, "exe=%s\n", game_exe);
+        std::fclose(info);
+    }
+    g_profile_frames = std::fopen((directory / "frames.bin").string().c_str(), "wb");
+    if (g_profile_frames == nullptr) {
+        return;
+    }
+    std::setvbuf(g_profile_frames, nullptr, _IOFBF, 1U << 16U);
+#ifdef _WIN32
+    // _wspawnl joins its arguments with spaces, so paths with spaces are quoted here.
+    const std::wstring program = sampler.wstring();
+    const std::wstring quoted_program = L"\"" + program + L"\"";
+    const std::wstring pid = std::to_wstring(_getpid());
+    const std::wstring quoted_directory = L"\"" + directory.wstring() + L"\"";
+    _wspawnl(_P_NOWAIT, program.c_str(), quoted_program.c_str(), pid.c_str(), quoted_directory.c_str(), nullptr);
+#endif
+    std::cout << "Stutter profiler: recording to " << directory.string() << '\n' << std::flush;
+}
+
+void note_profile_frame() {
+    if (g_profile_frames == nullptr) {
+        return;
+    }
+    const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                         std::chrono::steady_clock::now().time_since_epoch())
+                         .count();
+    const auto value = static_cast<std::uint64_t>(now);
+    std::fwrite(&value, sizeof value, 1U, g_profile_frames);
+    if (++g_profile_frame_count % 600U == 0U) {
+        std::fflush(g_profile_frames);
     }
 }
 
@@ -4043,6 +4111,7 @@ int run_boot_entry(int argc, char** argv) {
     }
 
     move_user_files_from_app_data(takedown::config::default_settings_path().parent_path());
+    start_stutter_profile(takedown::config::default_settings_path().parent_path().parent_path(), argv[0]);
     const takedown::config::LoadedSettings loaded_settings =
         takedown::config::load_settings_file(takedown::config::default_settings_path());
     for (const auto& diagnostic : loaded_settings.diagnostics) {
@@ -4934,11 +5003,11 @@ int run_boot_entry(int argc, char** argv) {
     }
     std::optional<std::uint64_t> variable_frame_target{};
     // A Crash event's replay re-runs the player's inputs tick by tick, so it only matches what was played when
-    // every tick lasts the retail 1/60 s. While one runs (the game's mode object at 0x0051ba88 is the Crash
-    // mode's 0x0051ad00) the variable frame rate steps aside: the game's own timer code runs and VBlanks come
-    // every retail period, paced to the host clock below. Off by default (TAKEDOWN_CRASH_FIXED_TICKS=1 turns it
-    // on) until it is safe in every Crash event: Crash event 3 stopped on an iWakeupThread syscall from the
-    // retail timer path in a player's run.
+    // every tick lasts the retail 1/60 s. While one runs (the gameplay object at 0x0051ba88 is 0x0051ad00, as
+    // in every event, and the event type at 0x0051a9a4 is 0x1a: Crash; a race is 0x13) the variable frame rate
+    // steps aside: the game's own timer code runs and VBlanks come every retail period, paced to the host clock
+    // below. Off unless TAKEDOWN_CRASH_FIXED_TICKS=1: no event is held to 60, and 0x1a also matched a Road Rage
+    // event. Exact replays at a variable frame rate need the run's tick lengths replayed instead.
     const bool crash_fixed_ticks_enabled = [] {
         const char* const value = std::getenv("TAKEDOWN_CRASH_FIXED_TICKS");
         return value != nullptr && std::string_view(value) == "1";
@@ -8731,6 +8800,7 @@ int run_boot_entry(int argc, char** argv) {
 
             memory.raise_intc_cause(2U);
             ++raised_vblank_starts;
+            note_profile_frame();
 
             if (rwa_iop_shadow.has_value() && (rwa_shadow_mode == 2U || !rwa_shadow_boot_done)) {
                 rwa_iop_shadow->advance_master_clock(next_vblank_start);
@@ -8981,7 +9051,8 @@ int run_boot_entry(int argc, char** argv) {
             }
             next_vblank_start += 4915200U;
             if (variable_frame_rate.has_value()) {
-                const bool crash_now = crash_fixed_ticks_enabled && memory.read_u32_le(0x0051ba88U) == 0x0051ad00U;
+                const bool crash_now = crash_fixed_ticks_enabled && memory.read_u32_le(0x0051ba88U) == 0x0051ad00U &&
+                                       memory.read_u32_le(0x0051a9a4U) == 0x1aU;
                 if (crash_now != crash_fixed_ticks) {
                     crash_fixed_ticks = crash_now;
                     set_slus_21050_chase_camera_real_time_easing(!crash_now);

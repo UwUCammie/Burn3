@@ -702,6 +702,35 @@ struct StreamApplication : Granite::Application, Granite::EventHandler
 
 	bool event_filter_installed = false;
 
+	// Without this the window just never appears: a player cannot tell a
+	// graphics card that is too old from a crash.
+	static void show_unsupported_gpu_message(Device &device)
+	{
+		if (!SDL_WasInit(SDL_INIT_VIDEO))
+			return;
+		const auto missing = ParallelGS::missing_gs_requirements(device);
+		std::string text;
+		if (missing.empty())
+		{
+			text = "The renderer could not start on this graphics card (";
+			text += device.get_gpu_properties().deviceName;
+			text += ").\n\nThe details are in the renderer log in the .launcher\\logs folder.";
+		}
+		else
+		{
+			text = "Takedown Recomp cannot run on this graphics card:\n";
+			text += device.get_gpu_properties().deviceName;
+			text += "\n\nIt is missing Vulkan features the renderer needs:\n";
+			for (auto &name : missing)
+				text += "  - " + name + "\n";
+			text += "\nIf this computer has another graphics card (for example NVIDIA or AMD), "
+			        "run the game on that one. Updating the graphics driver can also help.";
+		}
+		SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR,
+		                         missing.empty() ? "Renderer could not start" : "Graphics card not supported",
+		                         text.c_str(), nullptr);
+	}
+
 	void on_device_created(const DeviceCreatedEvent &e)
 	{
 		// SDL is initialized by now (the platform starts after the app is created).
@@ -721,8 +750,9 @@ struct StreamApplication : Granite::Application, Granite::EventHandler
 
 		if (!iface->init(&e.get_device(), opts))
 		{
-			request_shutdown();
 			LOGE("Failed to init GSInterface.\n");
+			show_unsupported_gpu_message(e.get_device());
+			request_shutdown();
 			return;
 		}
 		iface->takedown_ui_watch(kTitleScreenLogo);
@@ -2491,6 +2521,20 @@ struct StreamApplication : Granite::Application, Granite::EventHandler
 			auto placements = TakedownRenderer::place_ui(elements, picture.width / picture.height,
 			                                             TakedownRenderer::builtin_ui_rules(),
 			                                             dump_layout_next ? &matched : nullptr);
+			// A video's tiles stay together in the 4:3 block whatever a rule says: a
+			// rule meant for the HUD must never pull a tile out of the picture.
+			const float block_scale = (4.0f / 3.0f) / (picture.width / picture.height);
+			if (block_scale < 1.0f)
+			{
+				const TakedownRenderer::UiPlacement block{ block_scale,
+				                                           (1.0f - block_scale) * TakedownRenderer::kUiPictureWidth * 0.5f,
+				                                           false };
+				for (size_t b = 0; b < ui_layout.video.size() && b < ui_layout.owner.size(); b++)
+					if (ui_layout.video[b])
+						for (uint32_t index : ui_layout.owner[b])
+							if (index < game_elements)
+								placements[index] = block;
+			}
 			const auto t2 = std::chrono::steady_clock::now();
 			ui_placements.assign(placements.begin(), placements.begin() + ptrdiff_t(game_elements));
 			host_placements.assign(placements.begin() + ptrdiff_t(game_elements), placements.end());
@@ -2570,8 +2614,11 @@ struct StreamApplication : Granite::Application, Granite::EventHandler
 			}
 			if (burst_left && !dump_directory.empty())
 			{
+				// The layout log names each UI item's texture key and rectangles,
+				// which is what a placement rule matches.
 				burst_left--;
 				dump_requested = true;
+				dump_layout_next = true;
 			}
 		}
 
