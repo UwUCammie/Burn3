@@ -651,36 +651,15 @@ bool save_settings_file(const std::filesystem::path& path, const AppSettings& se
     return true;
 }
 
+// The settings live with the game: config/ in the install folder (the launcher's folder, which it starts the
+// game in), next to saves/. controls.ini and the other files kept beside settings.ini follow it.
 std::filesystem::path default_settings_path() {
-    if (const char* const config_home = std::getenv("XDG_CONFIG_HOME"); config_home != nullptr && *config_home != '\0') {
-        return std::filesystem::path(config_home) / "takedown-recomp" / "settings.ini";
-    }
-
-    std::optional<std::filesystem::path> home_path;
-    if (const char* const home = std::getenv("HOME"); home != nullptr && *home != '\0') {
-        home_path = std::filesystem::path(home) / ".config" / "takedown-recomp" / "settings.ini";
-    }
-
-    if (const char* const app_data = std::getenv("APPDATA"); app_data != nullptr && *app_data != '\0') {
-        const std::filesystem::path roaming = std::filesystem::path(app_data) / "takedown-recomp" / "settings.ini";
-        // Keep using an older ~/.config file until a roaming one exists.
-        std::error_code exists_error;
-        if (home_path && !std::filesystem::exists(roaming, exists_error) &&
-            std::filesystem::exists(*home_path, exists_error)) {
-            return *home_path;
-        }
-        return roaming;
-    }
-    if (home_path) {
-        return *home_path;
-    }
-
     std::error_code error;
-    const std::filesystem::path temporary = std::filesystem::temp_directory_path(error);
+    const std::filesystem::path install = std::filesystem::current_path(error);
     if (error) {
-        return "takedown-recomp-settings.ini";
+        return std::filesystem::path("config") / "settings.ini";
     }
-    return temporary / "takedown-recomp" / "settings.ini";
+    return install / "config" / "settings.ini";
 }
 
 } // namespace takedown::config

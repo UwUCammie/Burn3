@@ -10,7 +10,7 @@ N3(002638c0)
 N3(002fa490)
 N3(002fa770)
 N3(003d7340)
-N3(0025d430)
+// N3(0025d430)  PushRingBufferEntryBurst: off since 0.1.10, crash sparks ran slower than the original code.
 N3(0019d5e0)
 N3(0010ea48)
 N3(004269f0)

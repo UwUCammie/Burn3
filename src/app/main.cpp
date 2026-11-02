@@ -221,6 +221,45 @@ void print_native_model_statistics(const runtime::slus_21050::ModelLive& native_
 
 namespace {
 
+// Moves one file to the install's config folder unless a file of that name is already there. Rename first; a copy
+// and delete when the two are on different drives.
+void move_into_config(const std::filesystem::path& from, const std::filesystem::path& to) {
+    std::error_code error;
+    if (!std::filesystem::is_regular_file(from, error) || std::filesystem::exists(to, error)) {
+        return;
+    }
+    std::filesystem::create_directories(to.parent_path(), error);
+    std::filesystem::rename(from, to, error);
+    if (error && std::filesystem::copy_file(from, to, error)) {
+        std::filesystem::remove(from, error);
+    }
+}
+
+// Earlier versions kept the settings, controls and controller style in %APPDATA%\takedown-recomp and the online
+// sign-in in %LOCALAPPDATA%\Takedown. They now live in config/ in the install folder; this moves them there once and
+// removes the old folders when they are empty.
+void move_user_files_from_app_data(const std::filesystem::path& config_directory) {
+    std::error_code error;
+    if (const char* const app_data = std::getenv("APPDATA"); app_data != nullptr && *app_data != '\0') {
+        const std::filesystem::path old_directory = std::filesystem::path(app_data) / "takedown-recomp";
+        if (std::filesystem::is_directory(old_directory, error)) {
+            std::vector<std::filesystem::path> files;
+            for (const auto& entry : std::filesystem::directory_iterator(old_directory, error)) {
+                files.push_back(entry.path());
+            }
+            for (const auto& file : files) {
+                move_into_config(file, config_directory / file.filename());
+            }
+            std::filesystem::remove(old_directory, error);
+        }
+    }
+    if (const char* const local = std::getenv("LOCALAPPDATA"); local != nullptr && *local != '\0') {
+        const std::filesystem::path old_directory = std::filesystem::path(local) / "Takedown";
+        move_into_config(old_directory / "game-session.bin", config_directory / "game-session.bin");
+        std::filesystem::remove(old_directory, error);
+    }
+}
+
 using takedown::guest::GuestAddress;
 
 // The FEMain source producer owns the primary GS command stream itself; the
@@ -4003,6 +4042,7 @@ int run_boot_entry(int argc, char** argv) {
         memory.gs_capture().set_raw_passthrough_only(true);
     }
 
+    move_user_files_from_app_data(takedown::config::default_settings_path().parent_path());
     const takedown::config::LoadedSettings loaded_settings =
         takedown::config::load_settings_file(takedown::config::default_settings_path());
     for (const auto& diagnostic : loaded_settings.diagnostics) {
@@ -6066,6 +6106,7 @@ int run_boot_entry(int argc, char** argv) {
     takedown::net::MatchmakingConfig online_config;
     online_config.host = "play.uwucammie.com";
     online_config.game_root = std::filesystem::path(argv[2]).parent_path();
+    online_config.session_cache = takedown::config::default_settings_path().parent_path() / "game-session.bin";
     online_config.mods_directory = *takedown::content::select_mods_directory(
         online_config.game_root, mods_directory_override.has_value() ? mods_directory_override : loaded_settings.settings.mods_directory, true);
     online_config.mods_enabled = loaded_settings.settings.mods_enabled && !mods_disabled_option;
@@ -14227,6 +14268,7 @@ void apply_release_defaults() {
 #endif
     }
 }
+
 
 } // namespace
 
