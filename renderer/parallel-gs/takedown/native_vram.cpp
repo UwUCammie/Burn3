@@ -582,6 +582,11 @@ Vulkan::ImageHandle NativeVram::decode(Vulkan::CommandBuffer &cmd, const Texture
 	cmd.set_program(decode);
 	cmd.set_storage_buffer(0, 0, *vram_);
 	std::memcpy(cmd.allocate_constant_data(0, 1, sizeof(t.palette)), t.palette.data(), sizeof(t.palette));
+	// Colours to read from this copy instead (a CLUT loaded from exact draws' bytes), ~0u for none.
+	if (t.palette_from_vram)
+		std::memcpy(cmd.allocate_constant_data(0, 3, sizeof(t.palette_source)), t.palette_source.data(), sizeof(t.palette_source));
+	else
+		std::memset(cmd.allocate_constant_data(0, 3, sizeof(t.palette_source)), 0xff, sizeof(t.palette_source));
 	for (uint32_t l = 0; l < t.levels; l++)
 	{
 		const auto &level = t.level[l];

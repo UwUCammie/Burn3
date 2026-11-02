@@ -448,6 +448,10 @@ public:
 		uint32_t width = 0, height = 0, levels = 1;
 		TakedownNativeMemory::Level level[7];
 		std::array<uint32_t, 256> palette;  // palette formats: the 256 colours (RGBA8)
+		// Colours whose CLUT entry was loaded from bytes an exact draw wrote (TakedownNativeMemory::clut_sources):
+		// read from the GPU copy at this byte address instead (bit 0 set: a 16-bit entry); ~0u: `palette` has it.
+		std::array<uint32_t, 256> palette_source;
+		bool palette_from_vram = false;
 		std::vector<TakedownExactPageRef> pages;
 	};
 	// The native batch kind: a registered mesh drawn with its own matrices, in
@@ -1015,8 +1019,10 @@ private:
 	// A page's state for the exact path (bytes when the model needs them).
 	TakedownExactPageRef takedown_exact_page(uint32_t page);
 	void takedown_resolve_texture_state(TakedownSceneBatch &b, const TextureDescriptor &desc);
+	// clut_from_vram: also when only its CLUT came from exact draws (then decoded from the GPU copy too).
 	std::shared_ptr<const TakedownVramTexture> takedown_vram_texture(
-	    const TextureDescriptor &desc, const std::shared_ptr<const std::array<uint16_t, 512>> &clut);
+	    const TextureDescriptor &desc, const std::shared_ptr<const std::array<uint16_t, 512>> &clut,
+	    bool clut_from_vram = false);
 	// TAKEDOWN_DEV_EXACT_CHECK=<vsync>: each exact sprite of that vsync runs on the
 	// CPU reference from GS memory before it, compared with GS memory after it.
 	struct

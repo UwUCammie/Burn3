@@ -14,6 +14,7 @@
 #include "takedown/runtime/slus_21050_engine_functions.hpp"
 
 #include <array>
+#include <cstring>
 #include <bit>
 #include <cstdint>
 #include <utility>
@@ -117,28 +118,52 @@ inline void store_quad(guest::EeMemory& memory, const GuestAddress address, cons
 class DryMemory {
 public:
     explicit DryMemory(const guest::EeMemory& memory) noexcept : memory_(memory) {}
+
     [[nodiscard]] std::uint8_t read_u8(const GuestAddress address) const {
-        for (auto it = writes_.rbegin(); it != writes_.rend(); ++it) {
-            if (it->first == address) return it->second;
+        if (const Line* line = find(address & ~15U); line != nullptr && (line->mask >> (address & 15U) & 1U) != 0U) {
+            return line->bytes[address & 15U];
         }
         return memory_.read_u8(address);
     }
     [[nodiscard]] std::uint16_t read_u16_le(const GuestAddress a) const {
+        if (lines_.empty()) return memory_.read_u16_le(a);
         return static_cast<std::uint16_t>(read_u8(a) | (read_u8(a + 1U) << 8U));
     }
     [[nodiscard]] std::uint32_t read_u32_le(const GuestAddress a) const {
-        if (writes_.empty()) return memory_.read_u32_le(a);
-        return static_cast<std::uint32_t>(read_u16_le(a)) | (static_cast<std::uint32_t>(read_u16_le(a + 2U)) << 16U);
+        if (lines_.empty()) return memory_.read_u32_le(a);
+        const std::uint32_t offset = a & 15U;
+        if (offset <= 12U) {
+            const Line* line = find(a & ~15U);
+            if (line == nullptr) return memory_.read_u32_le(a);
+            if (((line->mask >> offset) & 0xFU) == 0xFU) {
+                std::uint32_t value;
+                std::memcpy(&value, line->bytes.data() + offset, 4U);
+                return value;
+            }
+        }
+        return static_cast<std::uint32_t>(read_u8(a)) | (static_cast<std::uint32_t>(read_u8(a + 1U)) << 8U) |
+               (static_cast<std::uint32_t>(read_u8(a + 2U)) << 16U) | (static_cast<std::uint32_t>(read_u8(a + 3U)) << 24U);
     }
     [[nodiscard]] std::uint64_t read_u64_le(const GuestAddress a) const {
         return static_cast<std::uint64_t>(read_u32_le(a)) | (static_cast<std::uint64_t>(read_u32_le(a + 4U)) << 32U);
     }
-    void write_u8(const GuestAddress a, const std::uint8_t v) { writes_.emplace_back(a, v); }
+    void write_u8(const GuestAddress a, const std::uint8_t v) {
+        Line& line = slot(a & ~15U);
+        line.bytes[a & 15U] = v;
+        line.mask = static_cast<std::uint16_t>(line.mask | (1U << (a & 15U)));
+    }
     void write_u16_le(const GuestAddress a, const std::uint16_t v) {
         write_u8(a, static_cast<std::uint8_t>(v)); write_u8(a + 1U, static_cast<std::uint8_t>(v >> 8U));
     }
     void write_u32_le(const GuestAddress a, const std::uint32_t v) {
-        write_u16_le(a, static_cast<std::uint16_t>(v)); write_u16_le(a + 2U, static_cast<std::uint16_t>(v >> 16U));
+        const std::uint32_t offset = a & 15U;
+        if (offset > 12U) {
+            for (std::uint32_t i = 0U; i < 4U; ++i) write_u8(a + i, static_cast<std::uint8_t>(v >> (8U * i)));
+            return;
+        }
+        Line& line = slot(a & ~15U);
+        std::memcpy(line.bytes.data() + offset, &v, 4U);
+        line.mask = static_cast<std::uint16_t>(line.mask | (0xFU << offset));
     }
     void write_u64_le(const GuestAddress a, const std::uint64_t v) {
         write_u32_le(a, static_cast<std::uint32_t>(v)); write_u32_le(a + 4U, static_cast<std::uint32_t>(v >> 32U));
@@ -152,9 +177,72 @@ public:
     }
     // Copying a DryMemory gives an independent view with the same writes so far (a dry run inside a dry run).
 
+    // Whether every write lies in plain memory (main RAM at its direct addresses, or the scratchpad), where writing
+    // the bytes back one by one has the same effect as the run's own stores.
+    [[nodiscard]] bool writes_plain_memory() const noexcept {
+        for (const Line& line : lines_) {
+            const bool ram = line.base < 0x02000000U;
+            const bool scratchpad = line.base >= 0x70000000U && line.base < 0x70004000U;
+            if (!ram && !scratchpad) return false;
+        }
+        return true;
+    }
+    // Applies the run's writes to guest memory (see writes_plain_memory).
+    void commit(guest::EeMemory& memory) const {
+        for (const Line& line : lines_) {
+            if (line.mask == 0xFFFFU) {
+                std::uint64_t low;
+                std::uint64_t high;
+                std::memcpy(&low, line.bytes.data(), 8U);
+                std::memcpy(&high, line.bytes.data() + 8U, 8U);
+                memory.write_u64_le(line.base, low);
+                memory.write_u64_le(line.base + 8U, high);
+                continue;
+            }
+            for (std::uint32_t i = 0U; i < 16U; ++i) {
+                if ((line.mask >> i & 1U) != 0U) memory.write_u8(line.base + i, line.bytes[i]);
+            }
+        }
+    }
+
 private:
+    // The run's writes as 16-byte lines (bytes + a mask of the bytes written), found through a small
+    // open-addressing index keyed by the line address: a read costs one probe, not a scan of every write.
+    struct Line {
+        GuestAddress base{};
+        std::uint16_t mask{};
+        std::array<std::uint8_t, 16> bytes{};
+    };
+    static std::uint32_t hash(const GuestAddress base) noexcept { return (base >> 4U) * 0x9E3779B1U; }
+    [[nodiscard]] const Line* find(const GuestAddress base) const noexcept {
+        if (lines_.empty()) return nullptr;
+        const std::uint32_t bits = static_cast<std::uint32_t>(index_.size() - 1U);
+        for (std::uint32_t i = hash(base) & bits;; i = (i + 1U) & bits) {
+            const std::int32_t at = index_[i];
+            if (at < 0) return nullptr;
+            if (lines_[static_cast<std::size_t>(at)].base == base) return &lines_[static_cast<std::size_t>(at)];
+        }
+    }
+    Line& slot(const GuestAddress base) {
+        if (const Line* line = find(base); line != nullptr) return const_cast<Line&>(*line);
+        if ((lines_.size() + 1U) * 2U > index_.size()) {
+            index_.assign(index_.empty() ? 64U : index_.size() * 2U, -1);
+            for (std::size_t n = 0U; n < lines_.size(); ++n) place(lines_[n].base, static_cast<std::int32_t>(n));
+        }
+        lines_.push_back(Line{base, 0U, {}});
+        place(base, static_cast<std::int32_t>(lines_.size() - 1U));
+        return lines_.back();
+    }
+    void place(const GuestAddress base, const std::int32_t at) noexcept {
+        const std::uint32_t bits = static_cast<std::uint32_t>(index_.size() - 1U);
+        std::uint32_t i = hash(base) & bits;
+        while (index_[i] >= 0) i = (i + 1U) & bits;
+        index_[i] = at;
+    }
+
     const guest::EeMemory& memory_;
-    std::vector<std::pair<GuestAddress, std::uint8_t>> writes_;
+    std::vector<Line> lines_;
+    std::vector<std::int32_t> index_;
 };
 
 // Quadword helpers for either memory type.

@@ -448,5 +448,5 @@ n3::Run draw_slot_vu0_launch(Context& context) {
 } // namespace
 } // namespace takedown::runtime
 
-N3_ENTRY(0026a7e0, 1608U, 0x5dfd4eeacc15a955ULL, "DrawSlotVu0Launch", takedown::runtime::kCeiling,
+N3_ENTRY_LIVE_WORK(0026a7e0, 1608U, 0x5dfd4eeacc15a955ULL, "DrawSlotVu0Launch", takedown::runtime::kCeiling,
          takedown::runtime::draw_slot_vu0_launch, EngineReturn::Nothing)

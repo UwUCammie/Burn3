@@ -44,6 +44,14 @@ public:
 	const std::array<uint16_t, 512> &clut() const { return clut_buffer; }
 	// A hash of the CLUT buffer's contents: equal when it holds the same colours.
 	uint64_t clut_version() const { return clut_serial; }
+	// Per CLUT halfword: the GS memory byte address it was loaded from when a draw the exact path executes
+	// (NativeScene's GPU copy of GS memory) wrote some of those bytes last, else kNoClutSource. This memory does
+	// not hold what such draws wrote: the GPU copy does (the sun flare's CLUT is the picture's alpha around the
+	// sun, copied there by an exact sprite each frame). clut_source_pages: the pages those loads read.
+	static constexpr uint32_t kNoClutSource = ~0u;
+	const std::array<uint32_t, 512> &clut_sources() const { return clut_source; }
+	const std::vector<uint32_t> &clut_source_pages() const { return clut_pages; }
+	bool clut_from_exact() const { return !clut_pages.empty(); }
 
 	// A draw wrote this rectangle of a buffer (GS pixels, inclusive), except the
 	// bytes FBMSK keeps (pass 0 for a Z buffer). `owner` names the target
@@ -190,6 +198,12 @@ private:
 	}
 	std::array<uint16_t, 512> clut_buffer = {};
 	uint64_t clut_serial = 0;
+	std::array<uint32_t, 512> clut_source = [] {
+		std::array<uint32_t, 512> a;
+		a.fill(kNoClutSource);
+		return a;
+	}();
+	std::vector<uint32_t> clut_pages;
 	// Per 256-byte block: which bytes of its words a draw wrote since they were
 	// last uploaded (bit n: byte n), and a write counter.
 	std::vector<uint8_t> rendered;

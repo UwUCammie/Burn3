@@ -8,6 +8,9 @@ layout(local_size_x = 8, local_size_y = 8) in;
 layout(std430, set = 0, binding = 0) readonly buffer Vram { uint vram[]; };
 layout(std140, set = 0, binding = 1) uniform Palette { uvec4 palette[64]; };
 layout(rgba8, set = 0, binding = 2) writeonly uniform image2D Level;
+// Palette colours to read from this memory instead (a CLUT loaded from bytes an exact draw wrote): the byte
+// address of the entry, bit 0 set for a 16-bit one; ~0u: palette[] has the colour.
+layout(std140, set = 0, binding = 3) uniform PaletteSource { uvec4 palette_source[64]; };
 
 layout(push_constant) uniform Constants
 {
@@ -17,8 +20,19 @@ layout(push_constant) uniform Constants
 } c;
 
 #define TEX_LOAD(w) vram[(w)]
-#define PALETTE(i) palette[(i) >> 2u][(i) & 3u]
+uint palette_entry(uint i);
+#define PALETTE(i) palette_entry(i)
 #include "takedown_vram.h"
+
+uint palette_entry(uint i)
+{
+	uint source = palette_source[i >> 2u][i & 3u];
+	if (source == 0xffffffffu)
+		return palette[i >> 2u][i & 3u];
+	if ((source & 1u) == 0u)
+		return vram[(source & VRAM_MASK) >> 2u];
+	return unpack16(tex_half((source & VRAM_MASK) >> 1u), (c.texa & 1u) != 0u, (c.texa >> 8u) & 0xffu, (c.texa >> 16u) & 0xffu);
+}
 
 void main()
 {

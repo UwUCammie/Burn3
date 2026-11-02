@@ -17,8 +17,13 @@
 
 #include "takedown/runtime/game/n3_support.hpp"
 
+#include <array>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <optional>
+#include <thread>
 #include <type_traits>
 
 namespace takedown::runtime::n3 {
@@ -111,28 +116,100 @@ template <class Context>
     return Call<std::remove_cvref_t<decltype(context.memory)>>{context};
 }
 
-// The runtime's entry: the body on the real CPU and memory, then the original's return (pc = ra).
+// The last admitted dry run (call_cost) on this thread: its final CPU and writes. When the runtime then calls the
+// same function on the very same CPU and unchanged guest memory (the usual prepare -> dispatch), the live entry
+// applies this outcome instead of running the body a second time. The CPU is compared byte for byte with a copy
+// taken before the dry run; memory is vouched for by EeMemory's main-RAM mutation generation (every tracked RAM write
+// anywhere advances it, see capture_main_ram_mutation). Anything else (another call in between, a write, memory
+// other than plain RAM or the scratchpad) runs the body live as before. TAKEDOWN_N3_COMMIT=0 always runs it live.
+struct DryOutcome {
+    bool valid{};
+    std::thread::id thread{};
+    GuestAddress entry{};
+    std::uint32_t retired{};
+    std::uint64_t generation{};
+    std::array<std::byte, sizeof(guest::R5900State)> input{};
+    std::optional<guest::R5900State> cpu;
+    std::optional<DryMemory> memory;
+};
+// One per process: natives run on the EE emulation thread. The thread is recorded so another thread's call can
+// never take it.
+inline DryOutcome dry_outcome;
+
+[[nodiscard]] inline bool dry_commit_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("TAKEDOWN_N3_COMMIT");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
+// The main-RAM mutation generation (0 when the memory has none).
+[[nodiscard]] inline std::uint64_t main_ram_generation(guest::EeMemory& memory) noexcept {
+    const std::uint64_t* const generation = memory.ee_aot_memory_view().mutation_generation;
+    return generation != nullptr ? *generation : 0U;
+}
+
+[[nodiscard]] inline bool take_dry_outcome(NativeFunctionContext& context, std::uint32_t& retired) {
+    DryOutcome& outcome = dry_outcome;
+    if (!outcome.valid) return false;
+    outcome.valid = false;
+    if (outcome.entry != context.entry_address || outcome.thread != std::this_thread::get_id() ||
+        std::memcmp(outcome.input.data(), &context.cpu, sizeof(guest::R5900State)) != 0 ||
+        main_ram_generation(context.memory) != outcome.generation) {
+        return false;
+    }
+    outcome.memory->commit(context.memory);
+    context.cpu = *outcome.cpu;
+    retired = outcome.retired;
+    return true;
+}
+
+// The runtime's entry: the body on the real CPU and memory (or the admitted dry run's outcome), then the original's
+// return (pc = ra).
 template <auto Impl>
 NativeFunctionExecution live(NativeFunctionContext& context) {
-    const Run run = Impl(context);
-    if (run.declined) {
-        // The dry run (call_cost) admitted this call, and the live run takes the same path, so this cannot happen.
-        std::fprintf(stderr, "n3: native 0x%08x declined after its call_cost admitted it\n", context.entry_address);
-        std::abort();
+    std::uint32_t retired = 0U;
+    if (!take_dry_outcome(context, retired)) {
+        const Run run = Impl(context);
+        if (run.declined) {
+            // The dry run (call_cost) admitted this call, and the live run takes the same path, so this cannot happen.
+            std::fprintf(stderr, "n3: native 0x%08x declined after its call_cost admitted it\n", context.entry_address);
+            std::abort();
+        }
+        retired = run.retired;
     }
     context.cpu.set_pc(context.cpu.read_gpr_u32(31U));
-    return {.retired_instructions = run.retired, .ee_cycles = run.retired};
+    return {.retired_instructions = retired, .ee_cycles = retired};
 }
 
 // call_cost of a body that can decline (or call other natives): the body on a copy of the CPU and a DryMemory.
 // Returns its exact count, or 0 (the original runs) when it declines or retires more than Ceiling.
-template <auto DryImpl, std::uint32_t Ceiling>
+template <auto DryImpl, std::uint32_t Ceiling, bool Commit = true>
 std::uint32_t dry_cost(const NativeFunctionPrepareContext& context) {
+    DryOutcome& outcome = dry_outcome;
+    outcome.valid = false;
     guest::R5900State cpu = context.cpu;
     DryMemory memory{context.memory};
     DryMachine machine{cpu, memory, context.entry_address};
     const Run run = DryImpl(machine);
-    return (run.declined || run.retired > Ceiling) ? 0U : run.retired;
+    if (run.declined || run.retired > Ceiling) return 0U;
+    if (Commit && dry_commit_enabled() && memory.writes_plain_memory()) {
+        // ee_aot_memory_view only refreshes pointers to the memory's own state; it changes no guest-visible state.
+        const std::uint64_t generation = main_ram_generation(const_cast<guest::EeMemory&>(context.memory));
+        if (generation != 0U && generation != ~std::uint64_t{0U}) {
+            outcome.entry = context.entry_address;
+            outcome.thread = std::this_thread::get_id();
+            outcome.retired = run.retired;
+            outcome.generation = generation;
+            std::memcpy(outcome.input.data(), &context.cpu, sizeof(guest::R5900State));
+            outcome.cpu.emplace(cpu);
+            outcome.memory.reset();
+            outcome.memory.emplace(std::move(memory));
+            outcome.valid = true;
+        }
+    }
+    return run.retired;
 }
 
 } // namespace takedown::runtime::n3
@@ -185,4 +262,14 @@ std::uint32_t dry_cost(const NativeFunctionPrepareContext& context) {
     namespace takedown::runtime {                                                                                     \
     extern constinit const EngineFunction n3_##addr{0x##addr##U, bytes, hash, name, cost,                             \
                                                     n3::live<&impl<NativeFunctionContext>>, returns};                 \
+    }
+
+// N3_ENTRY for a body whose dry run deliberately leaves out live-only work (a VU0 microprogram, a DMA kick...): its
+// dry run still gives the count, but its outcome is never committed, so the live entry always runs the body.
+#define N3_ENTRY_LIVE_WORK(addr, bytes, hash, name, ceiling, impl, returns)                                           \
+    N3_BODY_PLAIN(addr, impl)                                                                                         \
+    namespace takedown::runtime {                                                                                     \
+    extern constinit const EngineFunction n3_##addr{0x##addr##U, bytes, hash, name, ceiling,                          \
+                                                    n3::live<&impl<NativeFunctionContext>>, returns, {}, 1e-4, 1e-6,  \
+                                                    {}, n3::dry_cost<&impl<n3::DryMachine>, ceiling, false>};        \
     }

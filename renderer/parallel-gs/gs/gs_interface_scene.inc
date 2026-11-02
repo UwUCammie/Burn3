@@ -1771,10 +1771,21 @@ void GSInterface::takedown_resolve_texture_state(TakedownSceneBatch &b, const Te
 		}
 		b.vram_texture = scene.exact_pending ? nullptr : memo.vram_texture;
 	}
+	// A palette texture whose CLUT was loaded from bytes only the GPU copy of GS memory holds (the sun flare reads
+	// the picture's alpha that way): decoded from that copy, with those colours read there.
+	// TAKEDOWN_NO_EXACT_CLUT=1 turns it off (comparisons).
+	static const bool no_exact_clut = getenv("TAKEDOWN_NO_EXACT_CLUT") != nullptr;
+	if (!no_exact_clut && !scene.exact_pending && is_palette_format(uint32_t(desc.tex0.desc.PSM)) &&
+	    takedown_memory.clut_from_exact())
+	{
+		auto t = takedown_vram_texture(b.native_texture, b.native_clut, true);
+		if (t && t->palette_from_vram && t->exact_only)
+			b.vram_texture = std::move(t);
+	}
 }
 
 std::shared_ptr<const GSInterface::TakedownVramTexture> GSInterface::takedown_vram_texture(
-    const TextureDescriptor &desc, const std::shared_ptr<const std::array<uint16_t, 512>> &clut)
+    const TextureDescriptor &desc, const std::shared_ptr<const std::array<uint16_t, 512>> &clut, bool clut_from_vram)
 {
 	const auto &tex0 = desc.tex0.desc;
 	const auto &rect = desc.rect;
@@ -1819,11 +1830,41 @@ std::shared_ptr<const GSInterface::TakedownVramTexture> GSInterface::takedown_vr
 		takedown_memory.exact_state(level.base_block, level.buffer_width_64, psm, level.x, level.y, level.width,
 		                            level.height, any_exact, any_other);
 	}
-	if (!any_exact && !any_other)
+	// The colours of a CLUT loaded from exact draws' bytes: where they are in the GPU copy (as palette() picks them).
+	std::array<uint32_t, 256> palette_source;
+	palette_source.fill(~0u);
+	bool palette_from_vram = false;
+	if (clut_from_vram && is_palette_format(psm) && takedown_memory.clut_from_exact())
+	{
+		const auto &sources = takedown_memory.clut_sources();
+		uint32_t cpsm = uint32_t(tex0.CPSM);
+		if (cpsm == PSMCT24)
+			cpsm = PSMCT32;
+		const bool clut16 = cpsm != PSMCT32;
+		constexpr uint32_t none = TakedownNativeMemory::kNoClutSource;
+		for (uint32_t index = 0; index < 256; index++)
+		{
+			uint32_t i = uint32_t(tex0.CSA) * 16 + index;
+			if (psm == PSMT8 || psm == PSMT8H)
+				i = std::min(i >> 4, clut16 ? 31u : 15u) * 16 + (i & 15u);
+			const uint32_t low = sources[i & 511u];
+			if (clut16)
+			{
+				if (low != none)
+					palette_source[index] = low | 1u;
+			}
+			else if (low != none && sources[(i + 256) & 511u] == low + 2u)
+				palette_source[index] = low;
+			palette_from_vram |= palette_source[index] != ~0u;
+		}
+	}
+	if (!any_exact && !any_other && !palette_from_vram)
 		return nullptr;
 	auto t = std::make_shared<TakedownVramTexture>();
 	// Other draws' lanes are better read from their render-scale mirrors, when they can be.
 	t->exact_only = !any_other;
+	t->palette_source = palette_source;
+	t->palette_from_vram = palette_from_vram;
 	t->tex0 = tex0;
 	t->texa = desc.texa.desc;
 	t->width = rect.width;
@@ -1843,6 +1884,10 @@ std::shared_ptr<const GSInterface::TakedownVramTexture> GSInterface::takedown_vr
 		takedown_memory.pages_of_unique(level.base_block, level.buffer_width_64, psm, level.x, level.y, level.width,
 		                                level.height, pages);
 	}
+	if (palette_from_vram)
+		for (uint32_t page : takedown_memory.clut_source_pages())
+			if (std::find(pages.begin(), pages.end(), page) == pages.end())
+				pages.push_back(page);
 	t->pages.reserve(pages.size());
 	for (uint32_t page : pages)
 		t->pages.push_back(takedown_exact_page(page));

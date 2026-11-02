@@ -9802,7 +9802,9 @@ int run_boot_entry(int argc, char** argv) {
                         preflight_blocked = preflight != runtime::NativeFunctionPreflightStatus::Ready;
                     }
                     if (preflight == runtime::NativeFunctionPreflightStatus::Ready) {
-                        native_dispatch = native_function_dispatcher.dispatch(native_preparation, state, memory);
+                        // Nothing runs between prepare() and here (the preflight only reads), so the prepared
+                        // limits still hold: dispatch() would only run a resolver-backed native's resolver again.
+                        native_dispatch = native_function_dispatcher.dispatch_prepared(native_preparation, state, memory);
                     }
                 }
             }

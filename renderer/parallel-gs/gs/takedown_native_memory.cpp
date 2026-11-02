@@ -1006,6 +1006,13 @@ void TakedownNativeMemory::load_clut(const TEX0Bits &tex0, const TEXCLUTBits &te
 		        csa, drawn ? " (from drawn memory)" : "");
 	}
 	auto next = clut_buffer;
+	auto next_source = clut_source;
+	// A CT32 entry's bytes or a CT16 entry's two: which of them an exact draw wrote last.
+	const auto exact_source = [&](uint32_t byte_address, uint32_t bytes) {
+		byte_address &= mask;
+		const uint32_t lanes = bytes == 4 ? 0xfu : (0x3u << (byte_address & 2u));
+		return (block_exact(byte_address / kBlockBytes) & lanes) != 0;
+	};
 	for (uint32_t lane = 0; lane < 256; lane++)
 	{
 		const uint32_t write_coord = lane + csa * 16;
@@ -1042,18 +1049,35 @@ void TakedownNativeMemory::load_clut(const TEX0Bits &tex0, const TEXCLUTBits &te
 		{
 			uint32_t v;
 			std::memcpy(&v, &vram[(e * 4) & mask], 4);
+			const bool exact = exact_source(e * 4, 4);
 			if (write_coord < 512)
+			{
 				next[write_coord] = uint16_t(v);
+				next_source[write_coord] = exact ? (e * 4) & mask : kNoClutSource;
+			}
 			if (write_coord + 256 < 512)
+			{
 				next[write_coord + 256] = uint16_t(v >> 16);
+				next_source[write_coord + 256] = exact ? ((e * 4) & mask) + 2 : kNoClutSource;
+			}
 		}
 		else if (write_coord < 512)
 		{
 			uint16_t v;
 			std::memcpy(&v, &vram[(e * 2) & mask], 2);
 			next[write_coord] = v;
+			next_source[write_coord] = exact_source(e * 2, 2) ? (e * 2) & mask : kNoClutSource;
 		}
 	}
+	clut_source = next_source;
+	clut_pages.clear();
+	for (uint32_t source : clut_source)
+		if (source != kNoClutSource)
+		{
+			const uint32_t page = source / (kBlockBytes * 32u);
+			if (std::find(clut_pages.begin(), clut_pages.end(), page) == clut_pages.end())
+				clut_pages.push_back(page);
+		}
 	if (next != clut_buffer)
 	{
 		clut_buffer = next;

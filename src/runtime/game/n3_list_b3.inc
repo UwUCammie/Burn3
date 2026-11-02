@@ -1,0 +1,13 @@
+// Batch 3 (2026-11-02 night): earlier unlisted files checked by Opus, then the batch 3 chains.
+N3(003bf720)
+N3(001618c0)
+N3(0026ae30)
+N3(00278830)
+N3(0013f090)
+N3(0013e920)
+N3(0013ed50)
+N3(0013eed0)
+N3(00140850)
+N3(00147670)
+N3(0014d280)
+N3(00162e80)

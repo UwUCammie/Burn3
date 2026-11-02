@@ -431,10 +431,19 @@ struct Slus21050Online::Impl {
         std::uint32_t game{};
         bool operator==(const LobbyUser&) const = default;
     };
+    // A reply slot per game request, in the order the game sent them. The game's lobby library takes replies
+    // in request order (one TCP stream on the original server): a reply answered here at once must not overtake
+    // one still waiting for the server, or the library drops it (gget after sviw on the post-race return).
+    struct ReplySlot {
+        std::uint32_t request_id{};  // the server request it waits for; 0 = answered here
+        bool ready{};
+        std::vector<Reply> items;
+    };
     struct Ref {
         bool used{};
         bool connected{};
         std::deque<Reply> replies;
+        std::deque<ReplySlot> slots;
         bool persona{};
         std::map<std::uint32_t, LobbyUser> visible_users;
     };
@@ -491,6 +500,10 @@ struct Slus21050Online::Impl {
     std::chrono::steady_clock::time_point rejoin_deadline{};
     std::optional<std::string> rejoin_error;
     bool discarded_session{};
+    // The game logged in again after a race while the lobby is still marked started (the game never sends
+    // gfin). Until the server reports it finished, the lobby is shown to the game as not racing: a started
+    // lobby makes the game abandon it and drop its online connection.
+    bool race_over{};
     std::map<std::uint32_t, Pending> pending;
     std::uint32_t next_request{1U};
     std::optional<content::JsonValue> room;
@@ -500,6 +513,36 @@ struct Slus21050Online::Impl {
     std::uint16_t game_port{};
     bool packet_diagnostic{std::getenv("TAKEDOWN_ONLINE_PACKET_DIAGNOSTIC") != nullptr};
     std::uint32_t send_diagnostics{};
+    // Race link counts, logged every 10 s while any change: shows when and how the player-to-player link stops.
+    struct LinkStats {
+        std::uint32_t sent{}, unbound{}, no_room{}, no_member{}, send_failed{}, received{}, wrong_port{}, overflow{},
+            delivered{};
+        bool any() const {
+            return sent | unbound | no_room | no_member | send_failed | received | wrong_port | overflow | delivered;
+        }
+    } link_stats;
+    std::chrono::steady_clock::time_point link_stats_at{};
+    // The last result of each online hook: a change is logged, so a status the game polls (connection,
+    // session, lobby) shows when it flips. Hooks returning lengths (sockets, request and reply text) and the clock are left out.
+    std::map<Address, std::int64_t> hook_results;
+    Ref* capture_ref{};           // send(): replies to this ref go into its newest slot
+    std::uint32_t route_request{};  // an answer from the server for this request goes into its slot
+    void note_hook_result(Address address, std::int64_t result, Address caller) {
+        if (address == 2288448U || address == 2288640U || address == 2288736U || address == 2289120U ||
+            address == 4206992U || address == 4207352U || address == 4207808U || address == 4208416U) {
+            return;
+        }
+        const auto [entry, added] = hook_results.try_emplace(address, result);
+        if (!added && entry->second == result) {
+            return;
+        }
+        std::clog << "Native online: hook " << address << " -> " << result;
+        if (!added) {
+            std::clog << " (was " << entry->second << ')';
+        }
+        std::clog << " caller=" << caller << '\n';
+        entry->second = result;
+    }
     std::uint32_t receive_diagnostics{};
     std::uint32_t socket_diagnostics{};
     std::vector<std::uint32_t> readiness_roster;
@@ -611,6 +654,7 @@ struct Slus21050Online::Impl {
         for (auto& ref : refs) {
             ref.connected = false;
             ref.replies.clear();
+            ref.slots.clear();
         }
         rejoin_stage = RejoinStage::None;
         rejoin_prepared = false;
@@ -661,7 +705,9 @@ struct Slus21050Online::Impl {
         const auto item = pending.find(rejoin_join_request);
         if (item != pending.end() && blocked_join.has_value() &&
             item->second.ref == blocked_join->ref && item->second.command == 0x676A6F69U) {
+            route_request = item->first;
             reply(refs[item->second.ref], item->second.command, room_body(*room), 0U);
+            route_request = 0U;
             pending.erase(item);
         }
         retired_rejoin_request = rejoin_join_request;
@@ -1101,14 +1147,14 @@ struct Slus21050Online::Impl {
         if (count > 8U || number(value, "capacity") > 8U) {
             throw std::runtime_error("native room exceeds original roster capacity");
         }
-        const auto system_flags =
-            (number(value, "system_flags") & 0xFFF7FFFFU) | (value.find("started")->as_bool() ? 0x80000U : 0U);
+        const bool started = value.find("started")->as_bool() && !race_over;
+        const auto system_flags = (number(value, "system_flags") & 0xFFF7FFFFU) | (started ? 0x80000U : 0U);
         std::string body =
             "IDENT=" + std::to_string(id) + "\nNAME=" + text(value, "name") + "\nPARAMS=" +
             text(value, "parameters") + "\nROOM=1\nMINSIZE=2\nMAXSIZE=" +
             std::to_string(number(value, "capacity")) + "\nCOUNT=" + std::to_string(count) +
             "\nSYSFLAGS=" + std::to_string(system_flags) + "\nCUSTFLAGS=0\nNUMPART=0\nSEED=" +
-            std::to_string(id) + "\nWHEN=" + (value.find("started")->as_bool() ? "1" : "0") + "\nSELF=" +
+            std::to_string(id) + "\nWHEN=" + (started ? "1" : "0") + "\nSELF=" +
             config.player_name.substr(0U, 15U) + "\nHOST=" +
             text(value, "host_name").substr(0U, 15U) + "\n";
         if (const auto* const key = value.find("key"); key != nullptr) {
@@ -1146,6 +1192,9 @@ struct Slus21050Online::Impl {
         pending.emplace(request.request_id,
                         Pending{static_cast<std::size_t>(&ref - refs.data()), command,
                                 std::chrono::steady_clock::now() + std::chrono::seconds(10)});
+        if (capture_ref == &ref && !ref.slots.empty() && ref.slots.back().request_id == 0U) {
+            ref.slots.back().request_id = request.request_id;
+        }
     }
     void receive_readiness(const net::PeerMessage& message) {
         const auto& bytes = message.bytes;
@@ -1175,6 +1224,7 @@ struct Slus21050Online::Impl {
 
     void update() {
         for (const auto& event : client.poll()) {
+            route_request = 0U;
             if (discarded_session) {
                 break;
             }
@@ -1239,7 +1289,9 @@ struct Slus21050Online::Impl {
                 break;
             }
             case net::MatchEvent::Kind::Disconnected: {
+                std::clog << "Native online: disconnected from the online service\n";
                 state = State::Failed;
+                race_over = false;
                 presence_requested = false;
                 peers.reset();
                 room.reset();
@@ -1317,6 +1369,9 @@ struct Slus21050Online::Impl {
                 const bool was_started = room.has_value() && number(*room, "id") == number(*value, "id") &&
                                          room->find("started")->as_bool();
                 room = *value;
+                if (!room->find("started")->as_bool()) {
+                    race_over = false;
+                }
                 const auto body = room_body(*room);
                 for (auto& ref : refs) {
                     if (ref.used && ref.connected && ref.persona) {
@@ -1332,6 +1387,13 @@ struct Slus21050Online::Impl {
             }
             case net::MatchEvent::Kind::RoomClosed:
             case net::MatchEvent::Kind::Left: {
+                {
+                    const auto* const reason = event.payload.find("reason");
+                    std::clog << "Native online: lobby closed or left ("
+                              << (reason != nullptr && reason->is_string() ? reason->as_string() : std::string{"left"})
+                              << ")\n";
+                }
+                race_over = false;
                 if (room.has_value()) {
                     for (auto& ref : refs) {
                         if (ref.used && ref.connected && ref.persona) {
@@ -1415,6 +1477,7 @@ struct Slus21050Online::Impl {
         }
         const auto operation = found->second;
         pending.erase(found);
+        route_request = request_id;
         auto& ref = refs[operation.ref];
         if (!ref.used || !ref.connected) {
             continue;
@@ -1483,18 +1546,36 @@ struct Slus21050Online::Impl {
                 }
                 if (message.channel != net::PeerChannel::Datagram || message.bytes.size() <= 4U ||
                     message.bytes.size() > 1028U || game_port == 0U) {
+                    ++link_stats.wrong_port;
                     continue;
                 }
                 const unsigned port = (static_cast<unsigned>(message.bytes[2]) << 8U) | message.bytes[3];
                 if (port != game_port) {
+                    ++link_stats.wrong_port;
                     continue;
                 }
                 if (datagrams.size() < 128U) {
+                    ++link_stats.received;
                     datagrams.push_back(std::move(message));
+                } else {
+                    ++link_stats.overflow;
                 }
             }
         }
         const auto now = std::chrono::steady_clock::now();
+        if (now >= link_stats_at) {
+            if (link_stats.any()) {
+                std::clog << "Native online: race link 10s sent=" << link_stats.sent
+                          << " dropped(unbound=" << link_stats.unbound << " no-room=" << link_stats.no_room
+                          << " no-member=" << link_stats.no_member << " failed=" << link_stats.send_failed
+                          << ") received=" << link_stats.received << " delivered=" << link_stats.delivered
+                          << " ignored=" << link_stats.wrong_port << " overflow=" << link_stats.overflow
+                          << " port=" << game_port << " room=" << (room.has_value() ? number(*room, "id") : 0U)
+                          << '\n';
+            }
+            link_stats = {};
+            link_stats_at = now + std::chrono::seconds(10);
+        }
         if (rejoin_stage != RejoinStage::None && now >= rejoin_deadline) {
             fail_rejoin("Rejoining the lobby timed out. Choose the lobby again.");
         }
@@ -1530,7 +1611,9 @@ struct Slus21050Online::Impl {
             rejoin_timed_out = rejoin_timed_out || item.first == rejoin_join_request;
             auto& ref = refs[item.second.ref];
             if (ref.used && ref.connected) {
+                route_request = item.first;
                 reply(ref, item.second.command, "ERROR=Native service timed out\n", 0x74696D65U);
+                route_request = 0U;
             }
             return true;
         });
@@ -1543,7 +1626,33 @@ struct Slus21050Online::Impl {
         if (text.size() > 8191U || ref.replies.size() > 511U) {
             throw std::runtime_error("native online reply queue overflow");
         }
+        if (capture_ref == &ref && !ref.slots.empty()) {
+            ref.slots.back().items.push_back({kind, code, std::move(text)});
+            return;
+        }
+        if (route_request != 0U) {
+            for (auto& slot : ref.slots) {
+                if (slot.request_id == route_request) {
+                    slot.items.push_back({kind, code, std::move(text)});
+                    slot.ready = true;
+                    return;
+                }
+            }
+        }
         ref.replies.push_back({kind, code, std::move(text)});
+    }
+
+    void flush_slots(Ref& ref) {
+        while (!ref.slots.empty()) {
+            auto& slot = ref.slots.front();
+            if (!slot.ready && slot.request_id != 0U && pending.contains(slot.request_id)) {
+                break;
+            }
+            for (auto& item : slot.items) {
+                ref.replies.push_back(std::move(item));
+            }
+            ref.slots.pop_front();
+        }
     }
 
     void publish_lobby(Ref& ref) {
@@ -1611,6 +1720,20 @@ struct Slus21050Online::Impl {
     }
 
     void send(Ref& ref, std::uint32_t kind, std::string_view body) {
+        ref.slots.emplace_back();
+        capture_ref = &ref;
+        try {
+            send_request(ref, kind, body);
+        } catch (...) {
+            capture_ref = nullptr;
+            flush_slots(ref);
+            throw;
+        }
+        capture_ref = nullptr;
+        flush_slots(ref);
+    }
+
+    void send_request(Ref& ref, std::uint32_t kind, std::string_view body) {
         const auto data = parse_fields(body);
         std::clog << "Native online: request " << tag_text(kind) << " fields=";
         for (const auto& item : data) {
@@ -1621,6 +1744,7 @@ struct Slus21050Online::Impl {
             cancel(ref);
             ref.persona = false;
             ref.replies.clear();
+            ref.slots.clear();
             ref.connected = false;
             return;
         }
@@ -1675,6 +1799,18 @@ struct Slus21050Online::Impl {
             return;
         }
         if (kind == tag("pers")) {
+            if (room.has_value() && room->find("started")->as_bool() && !race_over) {
+                race_over = true;
+                std::clog << "Native online: back from the race in lobby " << number(*room, "id") << '\n';
+                if (number(*room, "host") == player && next_request != 0U) {
+                    // Only the host may finish; the server then sends every member the lobby as not started.
+                    // Its answer has no pending entry, so it reaches no game ref.
+                    net::MatchRequest finish;
+                    finish.kind = net::MatchRequest::Kind::Finish;
+                    finish.request_id = next_request++;
+                    client.request(finish);
+                }
+            }
             ref.persona = true;
             ref.visible_users.clear();
             reply(ref, kind,
@@ -1802,11 +1938,15 @@ struct Slus21050Online::Impl {
             return;
         }
         if (kind == tag("gsta") || kind == tag("gfin")) {
+            race_over = false;
             net::MatchRequest start;
             start.kind = kind == tag("gfin") ? net::MatchRequest::Kind::Finish
                                               : net::MatchRequest::Kind::Start;
             request(ref, kind, std::move(start));
             return;
+        }
+        if (kind == tag("gget") && !room.has_value()) {
+            std::clog << "Native online: the game asked for its lobby, but there is none\n";
         }
         if (kind == tag("gget") && room.has_value()) {
             reply(ref, kind, room_body(*room), 0U);
@@ -2093,23 +2233,17 @@ struct Slus21050Online::Impl {
                     return 0;
                 }
                 game_port = static_cast<std::uint16_t>(a1);
-                if (packet_diagnostic) {
-                    std::clog << "Native online: game socket port=" << a1 << '\n';
-                }
+                std::clog << "Native online: game socket port=" << a1 << '\n';
                 datagrams.clear();
                 m.write_u32_le(31706404U, a1);
                 return 0;
             }
             if (address == 2288640U) {
-                if (packet_diagnostic) {
-                    std::clog << "Native online: game socket closed caller=" << c.cpu.read_gpr_u32(31U)
-                              << " tick="
-                              << static_cast<std::uint32_t>(
-                                     std::chrono::duration_cast<std::chrono::milliseconds>(
-                                         std::chrono::steady_clock::now() - epoch)
-                                         .count())
-                              << '\n';
-                }
+                std::clog << "Native online: game socket closed caller=" << c.cpu.read_gpr_u32(31U) << " tick="
+                          << static_cast<std::uint32_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                            std::chrono::steady_clock::now() - epoch)
+                                                            .count())
+                          << '\n';
                 game_port = 0U;
                 datagrams.clear();
                 return 0;
@@ -2121,6 +2255,12 @@ struct Slus21050Online::Impl {
                               << " type="
                               << (a2 > 3U && ram(m, a1, a2) ? static_cast<unsigned>(m.read_u8(a1 + 3U)) : 0U)
                               << '\n';
+                }
+                if (game_port == 0U) {
+                    ++link_stats.unbound;
+                }
+                if (game_port != 0U && (!peers || !room.has_value())) {
+                    ++link_stats.no_room;
                 }
                 if (game_port == 0U || !peers || !room.has_value() || a2 - 1U > 1023U || f == 0U ||
                     f > 65535U || !ram(m, a1, a2)) {
@@ -2139,10 +2279,13 @@ struct Slus21050Online::Impl {
                         bytes.push_back(m.read_u8(a1 + i));
                     }
                     if (peers->send(id, bytes, net::PeerChannel::Datagram)) {
+                        ++link_stats.sent;
                         return 1;
                     }
-                    break;
+                    ++link_stats.send_failed;
+                    return 0;
                 }
+                ++link_stats.no_member;
                 return 0;
             }
             if (game_port == 0U || datagrams.empty() || !ram(m, a1, 4U) || !ram(m, a2, 4U) ||
@@ -2151,6 +2294,7 @@ struct Slus21050Online::Impl {
             }
             auto message = std::move(datagrams.front());
             datagrams.pop_front();
+            ++link_stats.delivered;
             if (packet_diagnostic && receive_diagnostics++ < 128U) {
                 std::clog << "Native online: datagram receive bytes=" << message.bytes.size() - 4U
                           << " sender=" << message.sender << " type="
@@ -2254,15 +2398,12 @@ struct Slus21050Online::Impl {
             return 0;
         }
         if (address == 4204136U || address == 4204232U) {
-            if (packet_diagnostic) {
-                std::clog << "Native online: network lifecycle close=" << address
-                          << " caller=" << c.cpu.read_gpr_u32(31U) << " tick="
-                          << static_cast<std::uint32_t>(
-                                 std::chrono::duration_cast<std::chrono::milliseconds>(
-                                     std::chrono::steady_clock::now() - epoch)
-                                     .count())
-                          << '\n';
-            }
+            std::clog << "Native online: network lifecycle close=" << address << " caller=" << c.cpu.read_gpr_u32(31U)
+                      << " tick="
+                      << static_cast<std::uint32_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                        std::chrono::steady_clock::now() - epoch)
+                                                        .count())
+                      << '\n';
             client.disconnect();
             peers.reset();
             room.reset();
@@ -2276,6 +2417,7 @@ struct Slus21050Online::Impl {
             for (auto& ref : refs) {
                 ref.connected = false;
                 ref.replies.clear();
+                ref.slots.clear();
             }
             datagrams.clear();
             game_port = 0U;
@@ -2358,6 +2500,7 @@ struct Slus21050Online::Impl {
             connect();
             ref.connected = true;
             ref.replies.clear();
+            ref.slots.clear();
             reply(ref, 4294967295U, std::string{}, 4294967295U);
             return 0;
         }
@@ -2366,6 +2509,7 @@ struct Slus21050Online::Impl {
             ref.persona = false;
             ref.connected = false;
             ref.replies.clear();
+            ref.slots.clear();
             return 0;
         }
         if (address == 4206584U) {
@@ -2408,6 +2552,7 @@ struct Slus21050Online::Impl {
         }
         if (address == 4207352U || address == 4207808U) {
             // 4207352 peeks at the next reply; 4207808 copies it out and consumes it.
+            flush_slots(ref);
             if ((a1 != 0U && !ram(m, a1, 4U)) || (a2 != 0U && !ram(m, a2, 4U)) || ref.replies.empty()) {
                 return -1;
             }
@@ -2484,6 +2629,7 @@ void Slus21050Online::set_applied_mods(std::shared_ptr<const content::ModManager
     for (auto& ref : impl_->refs) {
         ref.connected = false;
         ref.replies.clear();
+        ref.slots.clear();
     }
 }
 
@@ -2632,7 +2778,7 @@ bool Slus21050Online::register_functions(NativeFunctionDispatcher& dispatcher,
     for (const auto& signature : signatures) {
         addresses.push_back(hook_address(signature));
     }
-    for (const auto address : {0x0034A4A4U, 0x003532E4U, 0x000B1800U, 0x000B1810U, 0x00323B38U, 0x00323E6CU, 0x0035F4D0U, 0x0035F520U, 0x0035F570U, 0x0035F5C0U, 0x0035F610U, 0x0035F670U, 0x0035F700U, 0x0035FD80U, 0x0035FEF0U, 0x0035F900U, 0x0035F970U, 0x0035F9E0U, 0x0035FA40U, 0x0035FAA0U, 0x0035FB00U, 0x0035FB60U, 0x00360020U, 0x003600D0U, 0x00360460U, 0x003604C0U, 0x00360560U, 0x00360620U, 0x00360670U, 0x003606D0U, 0x003606E0U, 0x003607C0U, 0x003608F0U, 0x003609A0U, 0x0035F190U, 0x0035F1E0U}) {
+    for (const auto address : {0x0034A4A4U, 0x003532E4U, 0x000B1800U, 0x000B1810U, 0x00323B38U, 0x00323E6CU, 0x0035F4D0U, 0x0035F520U, 0x0035F570U, 0x0035F5C0U, 0x0035F610U, 0x0035F670U, 0x0035F700U, 0x0035FD80U, 0x0035FEF0U, 0x0035F900U, 0x0035F970U, 0x0035F9E0U, 0x0035FA40U, 0x0035FAA0U, 0x0035FB00U, 0x0035FB60U, 0x00360020U, 0x003600D0U, 0x00360460U, 0x003604C0U, 0x00360560U, 0x00360620U, 0x00360670U, 0x003606D0U, 0x003606E0U, 0x003607C0U, 0x003608F0U, 0x003609A0U, 0x0035F190U, 0x0035F1E0U, 0x0026DA60U}) {
         if (dispatcher.lookup(address) != nullptr) {
             return false;
         }
@@ -2650,6 +2796,24 @@ bool Slus21050Online::register_functions(NativeFunctionDispatcher& dispatcher,
                 }
                 if (address == 3244652U) {
                     c.cpu.set_pc(3244720U);
+                    return {1U, 1U};
+                }
+                // The frontend's lobby-lost callback (registered with the online object at 0x271884). When an
+                // online race starts the game logs out of the lobby itself (0x30f428); the lobby library turns that
+                // into a 'disc' event, the online object then calls here with -1, and with the online-race flag
+                // (frontend + 0x329B9) set the frontend queues "Disconnected from game server" for the end of the race.
+                // After the race the game logs back in and returns to its room on its own, so that notice is dropped.
+                // Every other call runs the original (its first instruction is addiu $sp, $sp, -0x30).
+                if (address == 0x0026DA60U) {
+                    const auto frontend = c.cpu.read_gpr_u32(5U);
+                    if (static_cast<std::int32_t>(c.cpu.read_gpr_u32(4U)) == -1 && main_ram_range(frontend + 0x329B9U, 1U) &&
+                        c.memory.read_u8(frontend + 0x329B9U) != 0U) {
+                        c.cpu.write_gpr_u64(2U, 1U);
+                        c.cpu.set_pc(c.cpu.read_gpr_u32(31U));
+                        return {1U, 1U};
+                    }
+                    c.cpu.write_gpr_u64(29U, c.cpu.read_gpr_u32(29U) - 0x30U);
+                    c.cpu.set_pc(0x0026DA64U);
                     return {1U, 1U};
                 }
                 std::int64_t result = -1;
@@ -2672,6 +2836,7 @@ bool Slus21050Online::register_functions(NativeFunctionDispatcher& dispatcher,
                 } catch (const std::exception& error) {
                     std::clog << "Native online: " << error.what() << '\n';
                 }
+                impl->note_hook_result(address, result, c.cpu.read_gpr_u32(31U));
                 c.cpu.write_gpr_u64(2U, static_cast<std::uint64_t>(result));
                 c.cpu.set_pc(c.cpu.read_gpr_u32(31U));
                 return {1U, 1U};

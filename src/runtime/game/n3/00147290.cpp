@@ -84,7 +84,6 @@ n3::Run find_nearest_strip_quad(Context& context) {
     auto call = n3::guest_call(context);
     auto& m = call.memory();
     auto& cpu = call.cpu();
-    constexpr bool kCountRun = std::is_same_v<std::remove_cvref_t<decltype(m)>, n3::DryMemory>;
     const Outputs out{call.arg(0), call.arg(1), call.arg(2)};
     const GuestAddress point_address = call.arg(3);
 
@@ -92,9 +91,7 @@ n3::Run find_nearest_strip_quad(Context& context) {
     if (!loadable(m, out.handle, 4U, 4U)) {
         return call.decline();
     }
-    if constexpr (!kCountRun) {
-        m.write_u32_le(out.handle, 0U);
-    }
+    m.write_u32_le(out.handle, 0U);
     // 0x14729c: lq $a3, 0($a3): the quadword at the aligned address
     if (!readable(m, out, point_address & ~15U, 16U, 16U)) {
         return call.decline();
@@ -104,9 +101,7 @@ n3::Run find_nearest_strip_quad(Context& context) {
     if (!loadable(m, out.index, 2U, 2U)) {
         return call.decline();
     }
-    if constexpr (!kCountRun) {
-        m.write_u16_le(out.index, static_cast<std::uint16_t>(0xffffU));
-    }
+    m.write_u16_le(out.index, static_cast<std::uint16_t>(0xffffU));
     // 0x1472a8: lw $v1, -11432($v1): the object count, and the beq against zero
     if (!readable(m, out, kObjectCount, 4U, 4U)) {
         return call.decline();
@@ -244,14 +239,10 @@ n3::Run find_nearest_strip_quad(Context& context) {
                     if (!loadable(m, out.found, 1U, 1U)) {
                         return call.decline();
                     }
-                    if constexpr (!kCountRun) {
-                        m.write_u32_le(out.handle, handle);
-                    }
+                    m.write_u32_le(out.handle, handle);
                     cpu.write_fpr_bits(1U, cpu.read_fpr_bits(0U));
-                    if constexpr (!kCountRun) {
-                        m.write_u16_le(out.index, static_cast<std::uint16_t>(quad));
-                        m.write_u8(out.found, static_cast<std::uint8_t>(0U));
-                    }
+                    m.write_u16_le(out.index, static_cast<std::uint16_t>(quad));
+                    m.write_u8(out.found, static_cast<std::uint8_t>(0U));
                 }
 
                 // 0x1473b8..0x1473bc: next quad; the strip is read again from the handle's +4

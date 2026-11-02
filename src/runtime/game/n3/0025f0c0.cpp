@@ -65,6 +65,7 @@ constexpr GuestAddress kSecondEffectRate = 308U;
 constexpr std::uint32_t kFrameBytes = 1440U;
 constexpr GuestAddress kPositionSlot = 816U;           // the frame quads AppendSampleRecord reads through a1, a2
 constexpr GuestAddress kDirectionSlot = 1184U;
+constexpr GuestAddress kStaleOffsetW = 652U;          // w of the start-offset quad (640..652); never written here
 constexpr std::uint32_t kMostPerPass = 8U;
 
 // Float constants (raw bits).
@@ -406,7 +407,13 @@ n3::Run emit_trail_particles(Context& context) {
                     Vec direction = vadd(heading, vmul_lane(ranges.quarter_spread, colour, 2U));
                     direction = vadd(direction, vmul_lane(ranges.fall, colour, 3U));
                     direction = vsub(direction, vmul_lane(shift, half, 0U));
-                    const Vec position = vadd(at, shift);
+                    Vec position = vadd(at, shift);
+                    // The w lanes AppendSampleRecord copies into the record. The original builds both quads with
+                    // .xyz operations only, so each keeps the w of the register it was last loaded into: the
+                    // position the colour range's (lq 1264($sp), 1.0 here), the direction the start-offset range's
+                    // (sp+1360, whose w is the stale frame word at 652($sp): 640..648 are the only words written).
+                    position.words[3] = ranges.colour_range.words[3];
+                    direction.words[3] = m.read_u32_le(frame + kStaleOffsetW);
 
                     // Colour for the sample: y clamped to 1, x boosted as far as keeps the sum within 1.
                     std::uint32_t base_colour = colour.words[1];

@@ -91,5 +91,5 @@ n3::Run launch_vu0_program_143(Context& context) {
 } // namespace
 } // namespace takedown::runtime
 
-N3_ENTRY(00274bc0, 208U, 0xd148ff828d58921fULL, "LaunchVu0Program143", kSteadyCost, launch_vu0_program_143,
+N3_ENTRY_LIVE_WORK(00274bc0, 208U, 0xd148ff828d58921fULL, "LaunchVu0Program143", kSteadyCost, launch_vu0_program_143,
          EngineReturn::Integer)
