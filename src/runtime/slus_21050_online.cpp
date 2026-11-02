@@ -1303,7 +1303,7 @@ struct Slus21050Online::Impl {
                     fail_rejoin("The host changed during admission. Choose the lobby again.");
                     continue;
                 }
-                peers->set_room(net::decode_peer_room(*value));
+                peers->set_room(net::decode_peer_room(event.payload));
                 std::vector<std::uint32_t> members;
                 for (const auto& member : value->find("players")->as_array()) {
                     members.push_back(number(member, "id"));
@@ -2399,8 +2399,9 @@ struct Slus21050Online::Impl {
             if (state != State::Online || static_cast<int>(f) > 8192) {
                 return -1;
             }
+            // The request text is the fourth argument ($a3), its size the fifth ($t0).
             const std::string body =
-                a2 != 0U ? read_text(m, a2, static_cast<int>(f) >= 0 ? static_cast<std::size_t>(std::max(f, 1U)) : 8192U)
+                a3 != 0U ? read_text(m, a3, static_cast<int>(f) >= 0 ? static_cast<std::size_t>(std::max(f, 1U)) : 8192U)
                          : std::string{};
             send(ref, a1, body);
             return static_cast<std::int64_t>(body.size() + 1U);
