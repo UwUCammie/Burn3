@@ -17,8 +17,8 @@
 //  * With the build flag set (t1 != 0), O+138 = 1 and the four columns of an orientation matrix (VF9, VF8, VF6, and a
 //    zero column) are built from a polynomial sine of the angle f13-scale; they are the microprogram's VF13..VF16.
 //    Without it O+138 = 0 and VF13..VF16 are whatever the dead part of this function's stack frame still holds.
-//  * The VU0 microprogram only runs on guest memory; a dry run (call_cost) skips it, since it cannot change the
-//    instruction count.
+//  * A dry run runs the VU0 microprogram too (n3::run_vu0_micro_any on a snapshot of VU0 data memory), so its
+//    VU0 state and data memory match the live run's.
 //
 // The matrix part works on the VU0 registers exactly as the listing does (signed zeros and the stale stack words
 // the listing reads before it writes them are part of the result); the stack words it passes between its steps are
@@ -423,7 +423,7 @@ n3::Run draw_slot_vu0_launch(Context& context) {
     }
     retired += kReturnCost;
 
-    if constexpr (std::is_same_v<std::remove_cvref_t<decltype(m)>, guest::EeMemory>) {
+    {
         cpu.write_vu0_vector(1U, vf1);
         cpu.write_vu0_vector(2U, vf2);
         cpu.write_vu0_vector(3U, tint);
@@ -435,8 +435,9 @@ n3::Run draw_slot_vu0_launch(Context& context) {
         cpu.write_vu0_vector(15U, columns[2]);
         cpu.write_vu0_vector(16U, columns[3]);
         cpu.set_pc(kVcallmsAddress);
-        const auto launch = guest::run_vu0_micro_call(cpu, m, kMicroEntry);
+        const auto launch = n3::run_vu0_micro_any(cpu, m, kMicroEntry);
         if (launch.status != guest::Vu0MicroRunStatus::Completed) {
+            if constexpr (!std::is_same_v<std::remove_cvref_t<decltype(m)>, guest::EeMemory>) return call.decline();
             // The interpreter stops with a VU0 execution fault at this VCALLMS; a native cannot return that status.
             throw std::runtime_error("DrawSlotVu0Launch: VU0 microprogram 0 did not complete: " +
                                      std::string(guest::to_string(launch.status)));

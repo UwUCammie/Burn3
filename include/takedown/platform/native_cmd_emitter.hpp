@@ -16,6 +16,7 @@
 
 #include "takedown/guest/ee_memory.hpp"
 #include "takedown/guest/gs_capture.hpp"
+#include "takedown/platform/native_car_submit.hpp"
 #include "takedown/platform/native_cmd_decode.hpp"
 #include "takedown/platform/native_cmd_hooks.hpp"
 #include "takedown/platform/native_cmd_protocol.hpp"
@@ -78,6 +79,10 @@ class NativeCmdEmitter final : public guest::Vu1LaunchObserver, public guest::Gs
     void on_vblank() override;
 
     [[nodiscard]] const Stats& stats() const noexcept { return stats_; }
+    // P1: the ring a native DrawCar pushes its submissions into, or nullptr when TAKEDOWN_NATIVE_CAR_SUBMIT is off (or the emitter is not
+    // in token mode with car trust). The submission counters (car_markers, car_lost, car_declined) are in the log_stats() line
+    // "[CARSUBMIT]"; they are kept out of Stats and NativeCmdConfig so the class layouts stay those of the objects that link this one.
+    [[nodiscard]] CarSubmitRing* car_submit_ring() noexcept;
     void log_stats(const char* tag) const;
 
   private:

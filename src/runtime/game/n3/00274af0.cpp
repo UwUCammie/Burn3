@@ -9,9 +9,8 @@
 //
 // Steady path: 28 instructions retired (0x00274af0-0x00274b14 and 0x00274b78-0x00274bbc), no loop, no call. The
 // original's frame saves and reloads sit below the entry $sp, which the check ignores, and the registers they restore
-// are never changed here. A dry run (call_cost) cannot run the microprogram, so it skips the launch; the count does not
-// depend on the launch. A nested dry run (entry address 0: this native called from another native's dry run) declines,
-// since its caller may branch on the VI1 result that a dry run does not compute.
+// are never changed here. A dry run runs the microprogram too (n3::run_vu0_micro_any on a snapshot of VU0 data memory),
+// so a caller's dry run sees the real VI1 result.
 
 #include "takedown/guest/ee_cop2_macro.hpp"
 #include "takedown/guest/vu0_micro_interpreter.hpp"
@@ -64,7 +63,7 @@ n3::Run launch_vu0_program_14a(Context& context) {
     }
     call.set_arg(0U, kStartedTag);  // lui/addiu $a0 leave a0 = 0x004787d0 on every path, the steady one included
 
-    if constexpr (kLive) {
+    {
         cpu.write_vu0_vector(1U, n3::load_quad_any(m, a1 + 0U));    // lqc2 vf1,0(s0)
         cpu.write_vu0_vector(2U, n3::load_quad_any(m, a1 + 16U));   // lqc2 vf2,16(s0)
         cpu.write_vu0_vector(3U, n3::load_quad_any(m, a1 + 32U));   // lqc2 vf3,32(s0)
@@ -76,16 +75,14 @@ n3::Run launch_vu0_program_14a(Context& context) {
         cpu.write_vu0_vector(13U, n3::load_quad_any(m, a0 + 0U));   // lqc2 vf13,0(s1)
         cpu.write_vu0_vector(14U, n3::load_quad_any(m, a0 + 16U));  // lqc2 vf14,16(s1)
         cpu.set_pc(kVcallmsAddress);
-        const auto launch = guest::run_vu0_micro_call(cpu, m, kMicroEntry);
+        const auto launch = n3::run_vu0_micro_any(cpu, m, kMicroEntry);
         if (launch.status != guest::Vu0MicroRunStatus::Completed) {
+            if constexpr (!kLive) return call.decline();
             // The interpreter stops with a VU0 execution fault at this VCALLMS; a native cannot return that status.
             throw std::runtime_error("LaunchVu0Program14A: VU0 microprogram 0x14a did not complete: " +
                                      std::string(guest::to_string(launch.status)));
         }
         call.return_value(ee_cop2::cfc2(cpu, 1U) & 0xffffU);  // cfc2.i v0,vi1 then andi v0,v0,0xffff
-    } else if (context.entry_address == 0U) {
-        // A dry run nested in another native's dry run: the caller may branch on the VI1 result, which a dry run lacks.
-        return call.decline();
     }
     return call.finish(kSteadyCost);
 }

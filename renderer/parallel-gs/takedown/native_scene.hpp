@@ -236,6 +236,11 @@ private:
 		uint64_t bytes = 0, last_frame = 0;
 	};
 	static constexpr uint64_t kNativeMeshBudget = 256ull << 20;
+	// Low video memory mode (Vulkan::LowVram): 32 MiB of meshes, and textures
+	// dropped after one second unused instead of five.
+	static constexpr uint64_t kLowVramNativeMeshBudget = 32ull << 20;
+	uint64_t native_mesh_budget() const;
+	uint64_t native_texture_frames() const;
 	std::unordered_map<uint64_t, NativeMesh> native_meshes_;
 	uint64_t native_mesh_bytes_ = 0;
 	const NativeMesh &native_mesh(Vulkan::Device &device, const ParallelGS::GSInterface::TakedownNativeMesh &mesh);

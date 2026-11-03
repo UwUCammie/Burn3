@@ -47,6 +47,7 @@
 #include "takedown/platform/parallel_gs_input.hpp"
 #include "takedown/platform/parallel_gs_stream.hpp"
 #include "takedown/platform/native_cmd_emitter.hpp" // NS-3
+#include "takedown/platform/native_world_submit.hpp" // P2
 #include "takedown/platform/pcsx2_gs_dump.hpp"
 #include "takedown/platform/pcsx2_gs_savestate.hpp"
 #include "takedown/platform/pcsx2_pine.hpp"
@@ -101,6 +102,9 @@
 #include "takedown/runtime/slus_21050_controllers.hpp"
 #include "takedown/runtime/slus_21050_developer_unlock.hpp"
 #include "takedown/runtime/slus_21050_engine_functions.hpp"
+#include "takedown/runtime/slus_21050_native_draw_car.hpp" // P1
+#include "takedown/runtime/slus_21050_native_world_submit.hpp" // P2
+#include "takedown/runtime/slus_21050_native_props.hpp" // P2
 #include "takedown/runtime/slus_21050_femain_bridge.hpp"
 #include "takedown/runtime/slus_21050_femain_dynamic_callback_probe.hpp"
 #include "takedown/runtime/slus_21050_femain_frame_closure_diagnostic.hpp"
@@ -4475,6 +4479,22 @@ int run_boot_entry(int argc, char** argv) {
         }()};
     runtime::NativeFunctionDispatcher native_function_dispatcher;
     runtime::CompiledBlockDispatcher compiled_block_dispatcher;
+    // P2: the native SubmitWorldObject needs the emitter's rings, which exist only later, but the older packet-exact native registers at the same
+    // address here: with a P2 mode on, keep the older one out (its name is the same) and put the environment back afterwards.
+    const bool p2_world_mode = []() {
+        const char* const a = std::getenv("TAKEDOWN_NATIVE_WORLD_SUBMIT");
+        const char* const b = std::getenv("TAKEDOWN_P2_SHADOW");
+        return (a == nullptr || a[0] != '0') || (b != nullptr && b[0] == '1');   // native world submission is on unless TAKEDOWN_NATIVE_WORLD_SUBMIT=0
+    }();
+    std::optional<std::string> p2_saved_disable;
+    if (p2_world_mode) {
+        if (const char* const old_list = std::getenv("TAKEDOWN_DISABLE_NATIVE_FUNCTIONS"); old_list != nullptr) {
+            p2_saved_disable = old_list;
+        }
+        std::string list = p2_saved_disable.value_or(std::string{});
+        list += list.empty() ? "SubmitWorldObject" : ",SubmitWorldObject";
+        _putenv_s("TAKEDOWN_DISABLE_NATIVE_FUNCTIONS", list.c_str());
+    }
     const bool native_function_revision_matched =
         !interpreter_only &&
         runtime::register_slus_21050_native_functions(native_function_dispatcher, memory,
@@ -4588,6 +4608,13 @@ int run_boot_entry(int argc, char** argv) {
             std::cout << ", " << engine_functions.revision_mismatches << " revision mismatches";
         }
         std::cout << '\n';
+    }
+    if (p2_world_mode) {
+        if (p2_saved_disable.has_value()) {
+            _putenv_s("TAKEDOWN_DISABLE_NATIVE_FUNCTIONS", p2_saved_disable->c_str());
+        } else {
+            _putenv_s("TAKEDOWN_DISABLE_NATIVE_FUNCTIONS", "");
+        }
     }
     runtime::register_native_call_captures_from_environment(native_function_dispatcher, std::cout);
 
@@ -4920,6 +4947,22 @@ int run_boot_entry(int argc, char** argv) {
             } else {
                 std::cerr << "[NATIVECMD] renderer did not announce native command protocol v1: legacy stream\n";
             }
+        }
+    }
+    // P1: native DrawCar. It needs the emitter's car ring, so it registers here (after the emitter exists, before the scalar-burst hook
+    // list is collected from the dispatcher).
+    bool native_draw_car_active = false;
+    if (native_function_revision_matched && !interpreter_only && native_cmd_emitter != nullptr) {
+        native_draw_car_active = runtime::slus_21050::register_native_draw_car(native_function_dispatcher, memory);
+        std::cout << "Native DrawCar: " << (native_draw_car_active ? "registered" : "off") << '\n';
+
+        // P2: world objects and props (order: the older SubmitWorldObject native was kept out above; the n3 natives of 0x0026a7e0 / 0x0026a710 stay)
+        const bool p2_world = runtime::slus_21050::register_native_world_submit(native_function_dispatcher, memory);
+        const bool p2_props = runtime::slus_21050::register_native_props(native_function_dispatcher, memory);
+        std::cout << "Native P2: world submit " << (p2_world ? "registered" : "off") << ", props " << (p2_props ? "registered" : "off") << '\n';
+        for (const guest::GuestAddress a : {0x0026AF50U, 0x0026A610U, 0x0026A1C0U, 0x0026A7E0U, 0x0026A710U}) {
+            const auto* const m = native_function_dispatcher.lookup(a);
+            std::cout << "  hook " << std::hex << a << std::dec << ": " << (m != nullptr ? m->name : "none") << '\n';
         }
     }
     const auto refresh_native_mods_page_state = [&native_mods_page_state, &mods_manager]() {
@@ -8800,6 +8843,9 @@ int run_boot_entry(int argc, char** argv) {
 
             memory.raise_intc_cause(2U);
             ++raised_vblank_starts;
+            if (auto* const p2_ring = takedown::platform::native_world_shadow_ring(); p2_ring != nullptr) {
+                p2_ring->advance_epoch(); // P2 shadow diagnostics: the producer's frame, so a record is paired with launches of its own frame
+            }
             note_profile_frame();
 
             if (rwa_iop_shadow.has_value() && (rwa_shadow_mode == 2U || !rwa_shadow_boot_done)) {
@@ -11660,6 +11706,9 @@ int run_boot_entry(int argc, char** argv) {
               << (interpreter_only ? "disabled" : (native_function_revision_matched ? "SLUS-21050" : "unmatched"))
               << " registered=" << native_function_dispatcher.size() << " calls=" << native_function_calls
               << " retired=" << native_function_retired_instructions << '\n';
+    std::cout << "  " << runtime::slus_21050::native_draw_car_statistics() << '\n';
+    std::cout << "  " << runtime::slus_21050::native_world_submit_statistics() << '\n';
+    std::cout << "  " << runtime::slus_21050::native_props_statistics() << '\n';
     std::cout << "  Native render-state packet: active=" << (native_render_state_packet_active ? 1 : 0)
               << " calls=" << native_function_hits[runtime::slus_21050::kBuildRenderStatePacketAddress] << '\n';
     std::cout << "  Native static object: active=" << (native_static_object_active ? 1 : 0)

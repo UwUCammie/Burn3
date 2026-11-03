@@ -8,9 +8,8 @@
 // 0x0026a7e0, does for its one-time start).
 //
 // Steady path: 28 instructions retired (0x00274bc0-0x00274be4 and 0x00274c48-0x00274c8c). It stores nothing outside the
-// original's frame, which the check ignores. A dry run (call_cost) cannot run the microprogram, so it skips the launch;
-// the count does not depend on the launch. A nested dry run (entry address 0: this native called from another native's
-// dry run) declines, since its caller may branch on the VI1 result that a dry run does not compute.
+// original's frame, which the check ignores. A dry run runs the microprogram too (n3::run_vu0_micro_any on a snapshot
+// of VU0 data memory), so a caller's dry run sees the real VI1 result.
 
 #include "takedown/guest/ee_cop2_macro.hpp"
 #include "takedown/guest/vu0_micro_interpreter.hpp"
@@ -62,7 +61,7 @@ n3::Run launch_vu0_program_143(Context& context) {
         return call.decline();  // the original's lqc2 faults on this address
     }
 
-    if constexpr (kLive) {
+    {
         cpu.write_vu0_vector(7U, n3::load_quad_any(m, a1 + 0U));
         cpu.write_vu0_vector(8U, n3::load_quad_any(m, a1 + 16U));
         cpu.write_vu0_vector(6U, n3::load_quad_any(m, a1 + 32U));
@@ -74,16 +73,14 @@ n3::Run launch_vu0_program_143(Context& context) {
         cpu.write_vu0_vector(11U, n3::load_quad_any(m, a0 + 64U));
         cpu.write_vu0_vector(12U, n3::load_quad_any(m, a0 + 80U));
         cpu.set_pc(kVcallmsAddress);
-        const auto launch = guest::run_vu0_micro_call(cpu, m, kMicroEntry);
+        const auto launch = n3::run_vu0_micro_any(cpu, m, kMicroEntry);
         if (launch.status != guest::Vu0MicroRunStatus::Completed) {
+            if constexpr (!kLive) return call.decline();
             // The interpreter stops with a VU0 execution fault at this VCALLMS; a native cannot return that status.
             throw std::runtime_error("LaunchVu0Program143: VU0 microprogram 0x143 did not complete: " +
                                      std::string(guest::to_string(launch.status)));
         }
         call.return_value(ee_cop2::cfc2(cpu, 1U) & 0xffffU);
-    } else if (context.entry_address == 0U) {
-        // A dry run nested in another native's dry run: the caller may branch on the VI1 result, which a dry run lacks.
-        return call.decline();
     }
     return call.finish(kSteadyCost);
 }

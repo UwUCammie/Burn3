@@ -15,8 +15,8 @@
 // count, so it is straight code), the DMA test 5, the start 13, each wait pass 8 + callees, the tail 35. Only the busy
 // wait is data dependent, and it is bounded by kCeiling. The one-time start (the flag not 0x004839e0) always declines:
 // the busy word is the DMA channel's CHCR at 0x10008000, which the start has just set, so a dry run never sees it clear
-// and the call runs in the original. The VCALLMS runs only on guest memory: a dry run skips it, since its outputs are
-// not read by anything that changes the count.
+// and the call runs in the original. A dry run runs the VCALLMS too (n3::run_vu0_micro_any), so the
+// quads it stores are the real results in a dry run as well.
 
 #include "takedown/guest/ee_cop2_macro.hpp"
 #include "takedown/guest/vu0_micro_interpreter.hpp"
@@ -199,10 +199,11 @@ n3::Run evaluate_curve_segment_vu0(Context& context) {
         cpu.write_vu0_vector(15U + i, n3::load_quad_any(m, kConstantsB + 16U * i));
     }
     cpu.write_vu0_vector(19U, basis);
-    if constexpr (std::is_same_v<std::remove_cvref_t<decltype(m)>, guest::EeMemory>) {
+    {
         cpu.set_pc(kVcallmsAddress);
-        const auto launch = guest::run_vu0_micro_call(cpu, m, kMicroEntry);
+        const auto launch = n3::run_vu0_micro_any(cpu, m, kMicroEntry);
         if (launch.status != guest::Vu0MicroRunStatus::Completed) {
+            if constexpr (!std::is_same_v<std::remove_cvref_t<decltype(m)>, guest::EeMemory>) return call.decline();
             // The interpreter stops with a VU0 execution fault at this VCALLMS; a native cannot return that status.
             throw std::runtime_error("EvaluateCurveSegmentVu0: VU0 microprogram 0 did not complete: " +
                                      std::string(guest::to_string(launch.status)));

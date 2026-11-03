@@ -18,7 +18,7 @@ N3(003517f0)
 N3(0035df60)
 N3(00385090)
 N3(0039ad20)
-// N3(00449150)  SelectSlotAction: hangs the boot fade (vb 331) on a path the captures do not cover
+// N3(00449150)  SelectSlotAction: exact, but it hides the call 0x0022cfe0 (ra 0x00449250) that main.cpp watches to arm the harness virtual pad, so scripted runs stall at boot
 N3(00103cc0)
 N3(002baef0)
 N3(00319360)

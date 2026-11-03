@@ -10,6 +10,7 @@
 #include "takedown/guest/ee_memory.hpp"
 #include "takedown/guest/r5900_state.hpp"
 #include "takedown/guest/vu0_macro_fmac.hpp"
+#include "takedown/guest/vu0_micro_interpreter.hpp"
 #include "takedown/runtime/guest_call.hpp"
 #include "takedown/runtime/slus_21050_engine_functions.hpp"
 
@@ -17,6 +18,7 @@
 #include <cstring>
 #include <bit>
 #include <cstdint>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -187,6 +189,40 @@ public:
         }
         return true;
     }
+    // Runs VU0 microprogram `entry` for a dry run. A microprogram reads and writes only the VU0 registers (on `cpu`,
+    // the dry run's copy) and VU0 data memory, so it runs on the real VU0 data memory with this run's earlier stores
+    // there applied; the bytes it changes become this run's writes and the real VU0 data memory is put back.
+    // Nothing else runs meanwhile, so guest state is unchanged afterwards.
+    guest::Vu0MicroRunResult run_vu0_micro(guest::R5900State& cpu, const std::uint16_t entry) {
+        auto& real = const_cast<guest::EeMemory&>(memory_);
+        std::byte* const data = real.vu0_data_local_bytes();
+        std::array<std::byte, guest::kVu0MemorySize> saved;
+        std::memcpy(saved.data(), data, saved.size());
+        for (const Line& line : lines_) {
+            if (line.base < guest::kVu0DataMemoryStart || line.base - guest::kVu0DataMemoryStart >= guest::kVu0MemorySize) continue;
+            for (std::uint32_t i = 0U; i < 16U; ++i) {
+                if ((line.mask >> i & 1U) != 0U) data[line.base - guest::kVu0DataMemoryStart + i] = std::byte{line.bytes[i]};
+            }
+        }
+        std::array<std::byte, guest::kVu0MemorySize> before;
+        std::memcpy(before.data(), data, before.size());
+        guest::Vu0MicroRunResult result;
+        try {
+            result = guest::run_vu0_micro(cpu, real, entry);
+        } catch (...) {
+            std::memcpy(data, saved.data(), saved.size());
+            throw;
+        }
+        std::array<std::byte, guest::kVu0MemorySize> after;
+        std::memcpy(after.data(), data, after.size());
+        std::memcpy(data, saved.data(), saved.size());
+        for (std::size_t i = 0U; i < after.size(); ++i) {
+            if (after[i] != before[i]) {
+                write_u8(guest::kVu0DataMemoryStart + static_cast<GuestAddress>(i), std::to_integer<std::uint8_t>(after[i]));
+            }
+        }
+        return result;
+    }
     // Applies the run's writes to guest memory (see writes_plain_memory).
     void commit(guest::EeMemory& memory) const {
         for (const Line& line : lines_) {
@@ -255,6 +291,17 @@ Gpr128 load_quad_any(const Memory& memory, const GuestAddress address) {
 template <class Memory>
 void store_quad_any(Memory& memory, const GuestAddress address, const Gpr128& value) {
     memory.write_u128_le(address & ~15U, value.words);
+}
+
+// VCALLMS for a native body: the original's launch on guest memory, DryMemory::run_vu0_micro in a dry run, so a
+// dry run gets the same VI/VF results and a caller's dry run can branch on them.
+template <class Memory>
+guest::Vu0MicroRunResult run_vu0_micro_any(guest::R5900State& cpu, Memory& memory, const std::uint16_t entry) {
+    if constexpr (std::is_same_v<std::remove_cvref_t<Memory>, guest::EeMemory>) {
+        return guest::run_vu0_micro_call(cpu, memory, entry);
+    } else {
+        return memory.run_vu0_micro(cpu, entry);
+    }
 }
 
 } // namespace takedown::runtime::n3

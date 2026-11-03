@@ -1,5 +1,6 @@
 #include <cstdio>
 #include "native_scene.hpp"
+#include "low_vram.hpp"
 #include "shaders/data_structures.h"
 #include "shaders/swizzle_utils.h"
 #include <algorithm>
@@ -391,6 +392,16 @@ const NativeScene::NativeMesh &NativeScene::native_mesh(Vulkan::Device &device,
 	return entry;
 }
 
+uint64_t NativeScene::native_mesh_budget() const
+{
+	return Vulkan::LowVram::active() ? kLowVramNativeMeshBudget : kNativeMeshBudget;
+}
+
+uint64_t NativeScene::native_texture_frames() const
+{
+	return Vulkan::LowVram::active() ? 60 : 300;
+}
+
 // Meshes unused for a few seconds go (looked for every 16th frame, like the textures);
 // over the budget the least recently used go, but never one drawn this frame.
 void NativeScene::trim_native_meshes()
@@ -404,7 +415,7 @@ void NativeScene::trim_native_meshes()
 			}
 			else
 				++it;
-	if (native_mesh_bytes_ <= kNativeMeshBudget)
+	if (native_mesh_bytes_ <= native_mesh_budget())
 		return;
 	std::vector<std::pair<uint64_t, uint64_t>> by_age; // last frame, key
 	for (const auto &entry : native_meshes_)
@@ -413,7 +424,7 @@ void NativeScene::trim_native_meshes()
 	std::sort(by_age.begin(), by_age.end());
 	for (const auto &old : by_age)
 	{
-		if (native_mesh_bytes_ <= kNativeMeshBudget)
+		if (native_mesh_bytes_ <= native_mesh_budget())
 			break;
 		native_mesh_bytes_ -= native_meshes_[old.second].bytes;
 		native_meshes_.erase(old.second);
@@ -2632,7 +2643,7 @@ const Vulkan::Image *NativeScene::render(Vulkan::Device &device, Vulkan::Command
 	if ((frame_serial_ & 15u) == 0)
 		for (auto *cache : { &native_images_, &native_palettes_ })
 			for (auto it = cache->begin(); it != cache->end();)
-				it = frame_serial_ - it->second.last_frame > 300 ? cache->erase(it) : std::next(it);
+				it = frame_serial_ - it->second.last_frame > native_texture_frames() ? cache->erase(it) : std::next(it);
 
 	trim_native_meshes();
 	vram_.end_frame();

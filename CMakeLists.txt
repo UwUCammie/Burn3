@@ -348,6 +348,14 @@ target_sources(
         src/platform/precise_sleep.cpp
         ${TAKEDOWN_PARALLEL_GS_STREAM_SOURCE}
         src/platform/native_cmd_emitter.cpp
+        src/runtime/game/native_car_plan.cpp
+        src/runtime/game/native_car_constants.cpp
+        src/runtime/slus_21050_native_draw_car.cpp
+        src/runtime/game/native_world_mesh.cpp
+        src/runtime/slus_21050_native_world_submit.cpp
+        src/runtime/slus_21050_native_world_submit_core.cpp
+        src/runtime/slus_21050_native_props.cpp
+        src/runtime/slus_21050_native_props_core.cpp
         src/platform/pcsx2_pine.cpp
         src/net/matchmaking.cpp
         src/net/release_credential.cpp
@@ -840,6 +848,10 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     set_property(SOURCE tests/test_vu0_simd_arithmetic.cpp tests/test_vu0_avx2_arithmetic.cpp
         tools/vu0_simd_arithmetic_diff.cpp
         APPEND PROPERTY COMPILE_OPTIONS "-frounding-math")
+    # Native props: the culling core reproduces the VU's chopped float arithmetic exactly; its fast visibility check is
+    # proven against that arithmetic, so neither may be contracted into FMAs or folded with another rounding mode.
+    set_property(SOURCE src/runtime/slus_21050_native_props_core.cpp tests/test_corner_visibility_fast.cpp
+        APPEND PROPERTY COMPILE_OPTIONS "-frounding-math" "-ffp-contract=off")
 endif()
 
 # A profile-generated VU1 descriptor module is another local, game-derived
@@ -3031,4 +3043,12 @@ if(WIN32)
 else()
     find_package(CURL REQUIRED)
     target_link_libraries(takedown_core PUBLIC CURL::libcurl)
+endif()
+
+# Native props: the fast corner visibility check against the exact game arithmetic.
+if(BUILD_TESTING)
+    add_executable(test_corner_visibility_fast tests/test_corner_visibility_fast.cpp)
+    target_link_libraries(test_corner_visibility_fast PRIVATE takedown_core)
+    takedown_enable_warnings(test_corner_visibility_fast)
+    add_test(NAME test_corner_visibility_fast COMMAND test_corner_visibility_fast)
 endif()

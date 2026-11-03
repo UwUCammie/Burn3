@@ -3,6 +3,9 @@
 // SPDX-FileContributor: Runar Heyer
 // SPDX-License-Identifier: LGPL-3.0+
 
+#include "gpu_diag.hpp"
+#include "low_vram.hpp"
+#include "environment.hpp"
 #include "gs_renderer.hpp"
 #include "logging.hpp"
 #include "gs_interface.hpp"
@@ -932,6 +935,68 @@ bool GSRenderer::init(Vulkan::Device *device_, const GSOptions &options)
 	LOGI("GS init: creating shader programs.\n");
 	Vulkan::ResourceLayout layout;
 	shaders = Shaders<>(*device_, layout, resolver);
+
+	// Takedown (diagnostics): TAKEDOWN_GS_UPSTREAM_UBERSHADER=1 uses upstream's
+	// ubershader binaries, still in the bank, instead of the Takedown edit
+	// appended after them (which only adds the 64-sample paths; at 16 samples
+	// or fewer both do the same work).
+	if (Util::get_environment_bool("TAKEDOWN_GS_UPSTREAM_UBERSHADER", false))
+	{
+		static const struct { unsigned color, depth, reflection, offset, words; } upstream[] = {
+			{ 0, 0, 2436, 48641, 69986 - 48641 },
+			{ 1, 0, 2784, 69986, 92598 - 69986 },
+			{ 0, 1, 3132, 92598, 114167 - 92598 },
+			{ 1, 1, 3480, 114167, 136952 - 114167 },
+		};
+		for (auto &u : upstream)
+		{
+			layout.unserialize(reflection_bank + u.reflection, 348);
+			shaders.ubershader[u.color][u.depth] =
+			    device_->request_program(spirv_bank + u.offset, size_t(u.words) * sizeof(uint32_t), &layout);
+		}
+		LOGI("GS: upstream ubershader (TAKEDOWN_GS_UPSTREAM_UBERSHADER).\n");
+	}
+
+	// Takedown (diagnostics): GS shader names for [GPU-DIAG] lines and post-mortems.
+	{
+		const auto name_program = [](Vulkan::Program *program, const char *name) {
+			if (!program)
+				return;
+			for (auto stage : { Vulkan::ShaderStage::Compute, Vulkan::ShaderStage::Fragment, Vulkan::ShaderStage::Vertex })
+				if (auto *shader = program->get_shader(stage))
+					Vulkan::GpuDiag::name_shader(shader->get_hash(), std::string("GS ") + name);
+		};
+		const auto name_shader = [](Vulkan::Shader *shader, const char *name) {
+			if (shader)
+				Vulkan::GpuDiag::name_shader(shader->get_hash(), std::string("GS ") + name);
+		};
+		name_program(shaders.binning, "binning");
+		name_program(shaders.upload[0], "upload[0]");
+		name_program(shaders.upload[1], "upload[1]");
+		name_program(shaders.clut_write, "clut_write");
+		name_program(shaders.vram_copy, "vram_copy");
+		name_program(shaders.triangle_setup, "triangle_setup");
+		name_program(shaders.single_sample_heuristic, "single_sample_heuristic");
+		name_program(shaders.ubershader[0][0], "ubershader[0][0]");
+		name_program(shaders.ubershader[1][0], "ubershader[1][0]");
+		name_program(shaders.ubershader[0][1], "ubershader[0][1]");
+		name_program(shaders.ubershader[1][1], "ubershader[1][1]");
+		name_program(shaders.extwrite, "extwrite");
+		name_program(shaders.qword_clear, "qword_clear");
+		name_program(shaders.sampler_feedback, "sampler_feedback");
+		name_shader(shaders.quad, "quad");
+		name_shader(shaders.sample_circuit[0], "sample_circuit[0]");
+		name_shader(shaders.sample_circuit[1], "sample_circuit[1]");
+		name_shader(shaders.blit_circuit, "blit_circuit");
+		name_shader(shaders.weave, "weave");
+		name_shader(shaders.sharpen_frag, "sharpen_frag");
+		name_shader(shaders.upscale_frag, "upscale_frag");
+		name_shader(shaders.blit, "blit");
+		name_shader(shaders.ui_frag[0][0], "ui_frag[0][0]");
+		name_shader(shaders.ui_frag[1][0], "ui_frag[1][0]");
+		name_shader(shaders.ui_frag[0][1], "ui_frag[0][1]");
+		name_shader(shaders.ui_frag[1][1], "ui_frag[1][1]");
+	}
 	blit_quad = device_->request_program(shaders.quad, shaders.blit_circuit);
 	sample_quad[0] = device_->request_program(shaders.quad, shaders.sample_circuit[0]);
 	sample_quad[1] = device_->request_program(shaders.quad, shaders.sample_circuit[1]);
@@ -969,6 +1034,20 @@ bool GSRenderer::init(Vulkan::Device *device_, const GSOptions &options)
 			max_allocated_image_memory_per_flush =
 					std::max<VkDeviceSize>(max_allocated_image_memory_per_flush, budgets[i].budget_size / 20);
 		}
+	}
+
+	// Takedown: TAKEDOWN_GS_IMAGE_SLAB_MB caps the image slab (and the image
+	// memory one flush may allocate, at 3/20 of it); low video memory mode (iGPUs
+	// whose device-local heap is only the BIOS carve-out, 256 MiB on many APUs)
+	// caps it at 24 MiB. A smaller slab only means more frequent flushes.
+	unsigned slab_mb = Util::get_environment_uint("TAKEDOWN_GS_IMAGE_SLAB_MB", 0);
+	if (slab_mb == 0 && Vulkan::LowVram::enabled(*device))
+		slab_mb = 24;
+	if (slab_mb)
+	{
+		max_image_slab_size = std::min<VkDeviceSize>(max_image_slab_size, VkDeviceSize(slab_mb) * 1024 * 1024);
+		max_allocated_image_memory_per_flush =
+		    std::min<VkDeviceSize>(max_allocated_image_memory_per_flush, max_image_slab_size * 3 / 20);
 	}
 
 	LOGI("Using image slab size of %llu MiB.\n",

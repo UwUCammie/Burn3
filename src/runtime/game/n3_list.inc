@@ -33,3 +33,7 @@ N3(0015ac00)
 #include "n3_list_b4.inc"
 #include "n3_list_b5.inc"
 #include "n3_list_b6.inc"
+#include "n3_list_b7.inc"
+#include "n3_list_b8.inc"
+#include "n3_list_b9.inc"
+#include "n3_list_fix.inc"

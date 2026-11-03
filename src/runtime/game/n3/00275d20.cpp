@@ -10,10 +10,8 @@
 // VF2 then becomes Q0, and VF4..VF6 hold the x, y and z words of Q1..Q3 with w = 0.
 //
 // Only the steady path is native. The first call of a run (gp-22808 not yet 0x004787d0) starts the DMA channel and
-// busy-waits through 00103d20 and 001042f0, so it declines, as 00274bc0 does. A nested dry run (entry address 0)
-// declines too: its caller may branch on the VI1 result, which a dry run does not compute. The listing's frame copies
-// are not reproduced, and only a live run touches VU0. A dry run retires the same 72 instructions without the
-// microprogram.
+// busy-waits through 00103d20 and 001042f0, so it declines, as 00274bc0 does. The listing's frame copies are not
+// reproduced. A dry run runs the microprogram too (n3::run_vu0_micro_any), so a caller's dry run sees the real result.
 
 #include "takedown/guest/ee_cop2_macro.hpp"
 #include "takedown/guest/vu0_micro_interpreter.hpp"
@@ -108,13 +106,16 @@ std::uint32_t load_vu0_inputs(guest::R5900State& cpu, const Inputs& in) {
 
 // VCALLMS 0xc, run as the interpreter runs it. A fault at the launch cannot be returned as a status, so it throws, as
 // 00274bc0 does.
-void launch_microprogram(guest::R5900State& cpu, guest::EeMemory& memory) {
+template <class Memory>
+bool launch_microprogram(guest::R5900State& cpu, Memory& memory) {
     cpu.set_pc(kVcallmsAddress);
-    const auto launch = guest::run_vu0_micro_call(cpu, memory, kMicroEntry);
+    const auto launch = n3::run_vu0_micro_any(cpu, memory, kMicroEntry);
     if (launch.status != guest::Vu0MicroRunStatus::Completed) {
+        if constexpr (!std::is_same_v<std::remove_cvref_t<Memory>, guest::EeMemory>) return false;
         throw std::runtime_error("LaunchVu0Program12: VU0 microprogram 0xc did not complete: " +
                                  std::string(guest::to_string(launch.status)));
     }
+    return true;
 }
 
 template <class Context>
@@ -122,7 +123,7 @@ n3::Run launch_vu0_program_12(Context& context) {
     auto call = n3::guest_call(context);
     auto& cpu = call.cpu();
     auto& m = call.memory();
-    constexpr bool kLive = std::is_same_v<std::remove_cvref_t<decltype(m)>, guest::EeMemory>;
+    [[maybe_unused]] constexpr bool kLive = std::is_same_v<std::remove_cvref_t<decltype(m)>, guest::EeMemory>;
 
     const GuestAddress gp = cpu.read_gpr_u32(n3::kGlobalPointer);
     if (m.read_u32_le(gp + kStartedFlagOffset) != kStartedTag) {
@@ -141,7 +142,7 @@ n3::Run launch_vu0_program_12(Context& context) {
         return call.decline();  // the original's lq, lqc2, sqc2 or sq would fault on one of these addresses
     }
 
-    if constexpr (kLive) {
+    {
         const Inputs in{
             .q0 = n3::load_quad_any(m, q0_address),
             .q1 = n3::load_quad_any(m, q1_address),
@@ -150,16 +151,13 @@ n3::Run launch_vu0_program_12(Context& context) {
             .stale = n3::load_quad_any(m, frame + kStaleOffset),
         };
         const std::uint32_t f0 = load_vu0_inputs(cpu, in);
-        launch_microprogram(cpu, m);
+        if (!launch_microprogram(cpu, m)) return call.decline();
         const std::uint32_t vi1 = ee_cop2::cfc2(cpu, 1U);
         const Vec4 vf8 = cpu.read_vu0_vector(8U);
         n3::store_quad_any(m, output, vf8);
         cpu.write_fpr_bits(0U, f0);
         // qmfc2 $v0, $vf8 wrote all of v0; the sltu after it replaced only the low doubleword with the result.
         cpu.write_gpr(2U, Vec4{{vi1 != 0U ? 1U : 0U, 0U, vf8.words[2], vf8.words[3]}});
-    } else if (context.entry_address == 0U) {
-        // A dry run nested in another native's dry run: its caller may branch on VI1, which a dry run does not compute.
-        return call.decline();
     }
     return call.finish(kSteadyCost);
 }

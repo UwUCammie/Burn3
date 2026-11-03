@@ -504,6 +504,14 @@ struct Slus21050Online::Impl {
     // gfin). Until the server reports it finished, the lobby is shown to the game as not racing: a started
     // lobby makes the game abandon it and drop its online connection.
     bool race_over{};
+    // The game's lobby page keeps the player rows it built before the race, which point into the lobby entry
+    // the game freed when it logged out for the race. It rebuilds them only when the lobby's player count
+    // changes, and the count after the race is the same. So, back from the race, the lobby is shown with this
+    // player alone until the page has rebuilt its rows for one player (its count at frontend 0x1E32AE0 +
+    // 0x3297C, the rows' fill counter in 0x26f4c0), or the deadline, then with everyone: two count changes,
+    // two rebuilds from the current entry.
+    bool roster_rebuild{};
+    std::chrono::steady_clock::time_point roster_rebuild_deadline{};
     std::map<std::uint32_t, Pending> pending;
     std::uint32_t next_request{1U};
     std::optional<content::JsonValue> room;
@@ -512,6 +520,7 @@ struct Slus21050Online::Impl {
     std::map<std::uint32_t, content::JsonValue> discovered_room_details;
     std::uint16_t game_port{};
     bool packet_diagnostic{std::getenv("TAKEDOWN_ONLINE_PACKET_DIAGNOSTIC") != nullptr};
+    bool reply_trace{std::getenv("TAKEDOWN_ONLINE_REPLY_TRACE") != nullptr};
     std::uint32_t send_diagnostics{};
     // Race link counts, logged every 10 s while any change: shows when and how the player-to-player link stops.
     struct LinkStats {
@@ -1148,11 +1157,18 @@ struct Slus21050Online::Impl {
             throw std::runtime_error("native room exceeds original roster capacity");
         }
         const bool started = value.find("started")->as_bool() && !race_over;
+        bool alone = false;
+        if (roster_rebuild && room.has_value() && id == number(*room, "id") && players != nullptr &&
+            players->is_array()) {
+            for (const auto& member : players->as_array()) {
+                alone = alone || number(member, "id") == player;
+            }
+        }
         const auto system_flags = (number(value, "system_flags") & 0xFFF7FFFFU) | (started ? 0x80000U : 0U);
         std::string body =
             "IDENT=" + std::to_string(id) + "\nNAME=" + text(value, "name") + "\nPARAMS=" +
             text(value, "parameters") + "\nROOM=1\nMINSIZE=2\nMAXSIZE=" +
-            std::to_string(number(value, "capacity")) + "\nCOUNT=" + std::to_string(count) +
+            std::to_string(number(value, "capacity")) + "\nCOUNT=" + std::to_string(alone ? 1U : count) +
             "\nSYSFLAGS=" + std::to_string(system_flags) + "\nCUSTFLAGS=0\nNUMPART=0\nSEED=" +
             std::to_string(id) + "\nWHEN=" + (started ? "1" : "0") + "\nSELF=" +
             config.player_name.substr(0U, 15U) + "\nHOST=" +
@@ -1167,6 +1183,9 @@ struct Slus21050Online::Impl {
             unsigned i = 0U;
             for (const auto& player : players->as_array()) {
                 const auto player_id = number(player, "id");
+                if (alone && player_id != this->player) {
+                    continue;
+                }
                 const auto name = text(player, "name").substr(0U, 15U);
                 const auto suffix = std::to_string(i++);
                 const auto address = virtual_address_text(player_id);
@@ -1222,7 +1241,24 @@ struct Slus21050Online::Impl {
         }
     }
 
+    void publish_room() {
+        route_request = 0U;
+        const auto body = room_body(*room);
+        for (auto& ref : refs) {
+            if (ref.used && ref.connected && ref.persona) {
+                reply(ref, 0x2B61676DU, body, 0U);
+                reply(ref, 0x2B6D676DU, body, 0U);
+            }
+        }
+    }
+
     void update() {
+        if (roster_rebuild && std::chrono::steady_clock::now() >= roster_rebuild_deadline) {
+            roster_rebuild = false;
+            if (room.has_value()) {
+                publish_room();
+            }
+        }
         for (const auto& event : client.poll()) {
             route_request = 0U;
             if (discarded_session) {
@@ -1292,6 +1328,7 @@ struct Slus21050Online::Impl {
                 std::clog << "Native online: disconnected from the online service\n";
                 state = State::Failed;
                 race_over = false;
+                roster_rebuild = false;
                 presence_requested = false;
                 peers.reset();
                 room.reset();
@@ -1394,6 +1431,7 @@ struct Slus21050Online::Impl {
                               << ")\n";
                 }
                 race_over = false;
+                roster_rebuild = false;
                 if (room.has_value()) {
                     for (auto& ref : refs) {
                         if (ref.used && ref.connected && ref.persona) {
@@ -1802,6 +1840,8 @@ struct Slus21050Online::Impl {
             if (room.has_value() && room->find("started")->as_bool() && !race_over) {
                 race_over = true;
                 std::clog << "Native online: back from the race in lobby " << number(*room, "id") << '\n';
+                roster_rebuild = true;
+                roster_rebuild_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
                 if (number(*room, "host") == player && next_request != 0U) {
                     // Only the host may finish; the server then sends every member the lobby as not started.
                     // Its answer has no pending entry, so it reaches no game ref.
@@ -2552,6 +2592,10 @@ struct Slus21050Online::Impl {
         }
         if (address == 4207352U || address == 4207808U) {
             // 4207352 peeks at the next reply; 4207808 copies it out and consumes it.
+            if (roster_rebuild && room.has_value() && m.read_u32_le(0x1E6545CU) == 1U) {
+                roster_rebuild = false;
+                publish_room();
+            }
             flush_slots(ref);
             if ((a1 != 0U && !ram(m, a1, 4U)) || (a2 != 0U && !ram(m, a2, 4U)) || ref.replies.empty()) {
                 return -1;
@@ -2579,6 +2623,12 @@ struct Slus21050Online::Impl {
                 for (std::size_t i = 0U; i < std::min<std::size_t>(length, f); ++i) {
                     m.write_u8(a3 + static_cast<Address>(i), m.read_u8(a0 + static_cast<Address>(i) + 256U));
                 }
+            }
+            if (reply_trace) {
+                std::string line = item.text.substr(0U, 400U);
+                std::replace(line.begin(), line.end(), '\n', ' ');
+                std::clog << "Native online: reply " << tag_text(item.kind) << " code=" << item.code << ' ' << line
+                          << '\n';
             }
             ref.replies.pop_front();
             return static_cast<std::int64_t>(length);

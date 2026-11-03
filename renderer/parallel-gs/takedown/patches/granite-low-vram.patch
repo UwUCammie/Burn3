@@ -1,0 +1,430 @@
+diff --git a/vulkan/CMakeLists.txt b/vulkan/CMakeLists.txt
+index 1b108d3..af2fb50 100644
+--- a/vulkan/CMakeLists.txt
++++ b/vulkan/CMakeLists.txt
+@@ -29,6 +29,8 @@ add_granite_internal_lib(granite-vulkan
+         vulkan_common.hpp
+         event_manager.cpp event_manager.hpp
+         breadcrumbs.cpp breadcrumbs.hpp
++        gpu_diag.cpp gpu_diag.hpp
++        low_vram.cpp low_vram.hpp
+         pipeline_event.cpp pipeline_event.hpp
+         query_pool.cpp query_pool.hpp
+         texture/texture_format.cpp texture/texture_format.hpp)
+diff --git a/vulkan/breadcrumbs.cpp b/vulkan/breadcrumbs.cpp
+index c699981..73a58dc 100644
+--- a/vulkan/breadcrumbs.cpp
++++ b/vulkan/breadcrumbs.cpp
+@@ -24,6 +24,7 @@
+ #include "shader.hpp"
+ #include "device.hpp"
+ #include "timer.hpp"
++#include "gpu_diag.hpp"
+ #include <time.h>
+ 
+ #ifdef _WIN32
+@@ -75,7 +76,8 @@ void CheckpointMultiIndirectBase::report(FILE *file)
+ 
+ void CheckpointShader::report(FILE *file)
+ {
+-	fprintf(file, "Shader (#%016llx)\n", static_cast<unsigned long long>(shader->get_hash()));
++	fprintf(file, "Shader (#%016llx) %s\n", static_cast<unsigned long long>(shader->get_hash()),
++	        GpuDiag::shader_name(shader->get_hash()).c_str());
+ }
+ 
+ static void *nv_encode_checkpoint(uint32_t index, uint32_t counter)
+diff --git a/vulkan/command_buffer.cpp b/vulkan/command_buffer.cpp
+index 9f2534d..ad91327 100644
+--- a/vulkan/command_buffer.cpp
++++ b/vulkan/command_buffer.cpp
+@@ -29,6 +29,7 @@
+ #include "indirect_layout.hpp"
+ #include "timer.hpp"
+ #include "breadcrumbs.hpp"
++#include "gpu_diag.hpp"
+ #include <string.h>
+ 
+ using namespace Util;
+@@ -2229,6 +2230,21 @@ void CommandBuffer::set_program(Program *program)
+ 
+ 	set_program_layout(program->get_pipeline_layout());
+ 
++	if (GpuDiag::sync_submits())
++	{
++		auto *shader = program->get_shader(ShaderStage::Compute);
++		if (!shader)
++			shader = program->get_shader(ShaderStage::Fragment);
++		if (shader)
++		{
++			Util::Hash h = shader->get_hash();
++			if (!diag_programs.empty() && diag_programs.back().first == h)
++				diag_programs.back().second++;
++			else
++				diag_programs.emplace_back(h, 1u);
++		}
++	}
++
+ 	if (program && device->get_device_features().supports_post_mortem)
+ 	{
+ 		static const ShaderStage stages[] = {
+@@ -4539,6 +4555,20 @@ void CommandBuffer::begin_debug_channel(DebugChannelInterface *iface, const char
+ 	set_storage_buffer(VULKAN_NUM_DESCRIPTOR_SETS - 1, VULKAN_NUM_BINDINGS - 1, *debug_channel_buffer);
+ }
+ 
++std::string CommandBuffer::describe_programs() const
++{
++	std::string str;
++	for (auto &entry : diag_programs)
++	{
++		if (!str.empty())
++			str += ", ";
++		str += GpuDiag::shader_name(entry.first);
++		if (entry.second > 1)
++			str += " x" + std::to_string(entry.second);
++	}
++	return str.empty() ? std::string("(no programs: copies/clears/barriers only)") : str;
++}
++
+ void CommandBuffer::end_debug_channel()
+ {
+ 	if (!debug_channel_buffer)
+diff --git a/vulkan/command_buffer.hpp b/vulkan/command_buffer.hpp
+index 4c631f9..3dd7d92 100644
+--- a/vulkan/command_buffer.hpp
++++ b/vulkan/command_buffer.hpp
+@@ -850,6 +850,11 @@ public:
+ 	void begin_debug_channel(DebugChannelInterface *iface, const char *tag, VkDeviceSize size);
+ 	void end_debug_channel();
+ 
++	// Takedown (TAKEDOWN_GPU_SYNC): programs bound in order, by compute or
++	// fragment shader hash, with repeat counts.
++	std::vector<std::pair<Util::Hash, uint32_t>> diag_programs;
++	std::string describe_programs() const;
++
+ 	void extract_pipeline_state(DeferredPipelineCompile &compile) const;
+ 
+ 	enum class CompileMode
+diff --git a/vulkan/device.cpp b/vulkan/device.cpp
+index 4ee4f96..2920106 100644
+--- a/vulkan/device.cpp
++++ b/vulkan/device.cpp
+@@ -30,6 +30,8 @@
+ #include "type_to_string.hpp"
+ #include "quirks.hpp"
+ #include "timer.hpp"
++#include "gpu_diag.hpp"
++#include <deque>
+ #include <algorithm>
+ #include <string.h>
+ #include <stdlib.h>
+@@ -1360,6 +1362,9 @@ void Device::submit_nolock(CommandBufferHandle cmd, Fence *fence, unsigned semap
+ 	}
+ 
+ 	cmd->end();
++	std::string diag_desc;
++	if (GpuDiag::sync_submits())
++		diag_desc = cmd->describe_programs();
+ 	submissions.push_back(std::move(cmd));
+ 
+ 	InternalFence signalled_fence;
+@@ -1393,9 +1398,58 @@ void Device::submit_nolock(CommandBufferHandle cmd, Fence *fence, unsigned semap
+ 		query_pool.report();
+ 	}
+ 
++	if (GpuDiag::sync_submits())
++		diag_sync_submission(physical_type, diag_desc);
++
+ 	decrement_frame_counter_nolock();
+ }
+ 
++// Takedown (TAKEDOWN_GPU_SYNC): waits for the submission just made, so a hang
++// is reported with the one submission that did not finish.
++void Device::diag_sync_submission(QueueIndices physical_type, const std::string &desc)
++{
++	static uint64_t count = 0;
++	static bool reported = false;
++	static std::deque<std::string> recent;
++	static const char *queue_names[] = { "graphics", "compute", "transfer", "video-decode", "video-encode" };
++	const char *queue_name = unsigned(physical_type) < 5 ? queue_names[physical_type] : "?";
++	count++;
++	if (count == 1)
++		LOGI("[GPU-DIAG] TAKEDOWN_GPU_SYNC: waiting for every submission (timeout %u s).\n",
++		     GpuDiag::sync_timeout_seconds());
++
++	Fence drain;
++	submit_empty_nolock(physical_type, &drain, nullptr, -1);
++	const uint64_t start = Util::get_current_time_nsecs();
++	const bool done = drain && drain->wait_timeout(uint64_t(GpuDiag::sync_timeout_seconds()) * 1000000000ull);
++	const double ms = 1e-6 * double(Util::get_current_time_nsecs() - start);
++	if (drain)
++		drain->set_internal_sync_object();
++
++	char line[96];
++	snprintf(line, sizeof(line), "#%llu %s %.2f ms: ", static_cast<unsigned long long>(count), queue_name, ms);
++	if (done)
++	{
++		if (count <= 3 || (count % 2000) == 0)
++			LOGI("[GPU-DIAG] ok %s%s\n", line, desc.c_str());
++		recent.push_back(line + desc);
++		if (recent.size() > 8)
++			recent.pop_front();
++		return;
++	}
++
++	if (reported)
++		return;
++	reported = true;
++	LOGE("[GPU-DIAG] HANG: submission %sdid not finish in %u s (or the device was lost).\n", line,
++	     GpuDiag::sync_timeout_seconds());
++	LOGE("[GPU-DIAG] HANG: its programs: %s\n", desc.c_str());
++	for (auto &prev : recent)
++		LOGE("[GPU-DIAG] finished before it: %s\n", prev.c_str());
++	fflush(stdout);
++	fflush(stderr);
++}
++
+ void Device::submit_external(CommandBuffer::Type type)
+ {
+ 	LOCK();
+diff --git a/vulkan/device.hpp b/vulkan/device.hpp
+index a17385e..cdbe43c 100644
+--- a/vulkan/device.hpp
++++ b/vulkan/device.hpp
+@@ -858,6 +858,7 @@ private:
+ 	CommandBufferHandle request_command_buffer_nolock(unsigned thread_index, CommandBuffer::Type type, bool profiled);
+ 	void submit_discard_nolock(CommandBufferHandle &cmd);
+ 	void submit_and_sync_to_queues(CommandBufferHandle &cmd, uint32_t sync_to_queues);
++	void diag_sync_submission(QueueIndices physical_type, const std::string &desc);
+ 	void submit_nolock(CommandBufferHandle cmd, Fence *fence,
+ 	                   unsigned semaphore_count, Semaphore *semaphore);
+ 	void submit_empty_nolock(QueueIndices physical_type, Fence *fence,
+diff --git b/vulkan/gpu_diag.cpp b/vulkan/gpu_diag.cpp
+new file mode 100644
+index 0000000..7fbcf63
+--- /dev/null
++++ b/vulkan/gpu_diag.cpp
+@@ -0,0 +1,49 @@
++#include "gpu_diag.hpp"
++#include "environment.hpp"
++#include <mutex>
++#include <unordered_map>
++#include <stdio.h>
++
++namespace Vulkan
++{
++namespace GpuDiag
++{
++static std::mutex names_lock;
++static std::unordered_map<Util::Hash, std::string> &names()
++{
++	static std::unordered_map<Util::Hash, std::string> map;
++	return map;
++}
++
++bool sync_submits()
++{
++	static const bool on = Util::get_environment_bool("TAKEDOWN_GPU_SYNC", false);
++	return on;
++}
++
++unsigned sync_timeout_seconds()
++{
++	static const unsigned seconds = Util::get_environment_uint("TAKEDOWN_GPU_SYNC_TIMEOUT", 5);
++	return seconds ? seconds : 5;
++}
++
++void name_shader(Util::Hash hash, const std::string &name)
++{
++	std::lock_guard<std::mutex> holder{names_lock};
++	names().emplace(hash, name);
++}
++
++std::string shader_name(Util::Hash hash)
++{
++	{
++		std::lock_guard<std::mutex> holder{names_lock};
++		auto itr = names().find(hash);
++		if (itr != names().end())
++			return itr->second;
++	}
++	char buf[24];
++	snprintf(buf, sizeof(buf), "#%016llx", static_cast<unsigned long long>(hash));
++	return buf;
++}
++}
++}
+diff --git b/vulkan/gpu_diag.hpp b/vulkan/gpu_diag.hpp
+new file mode 100644
+index 0000000..bd5010c
+--- /dev/null
++++ b/vulkan/gpu_diag.hpp
+@@ -0,0 +1,25 @@
++// Takedown: GPU hang diagnostics for players' machines (no debugger there).
++//
++// TAKEDOWN_GPU_SYNC=1 waits for every submission to finish before the next one
++// is recorded into the queue, so a GPU hang is pinned to the one submission
++// that never completed; its programs (by name) and the last good ones are
++// logged with [GPU-DIAG]. Slow, for diagnosis only.
++//
++// Shader names (template path and defines, or the GS program name) are kept
++// for every shader so these logs and Granite's post-mortem report name them.
++#pragma once
++
++#include "hash.hpp"
++#include <string>
++
++namespace Vulkan
++{
++namespace GpuDiag
++{
++bool sync_submits();
++// Seconds a synchronous submission may take before it is reported as hung.
++unsigned sync_timeout_seconds();
++void name_shader(Util::Hash hash, const std::string &name);
++std::string shader_name(Util::Hash hash);
++}
++}
+diff --git b/vulkan/low_vram.cpp b/vulkan/low_vram.cpp
+new file mode 100644
+index 0000000..cff0345
+--- /dev/null
++++ b/vulkan/low_vram.cpp
+@@ -0,0 +1,57 @@
++#include "low_vram.hpp"
++#include "device.hpp"
++#include "environment.hpp"
++#include "logging.hpp"
++#include <algorithm>
++#include <atomic>
++#include <mutex>
++#include <string>
++
++namespace Vulkan
++{
++namespace LowVram
++{
++static constexpr VkDeviceSize kLowVramHeapLimit = VkDeviceSize(1024) * 1024 * 1024;
++static std::once_flag decided;
++static std::atomic<bool> low_vram{ false };
++
++bool enabled(const Device &device)
++{
++	std::call_once(decided, [&]() {
++		const auto &props = device.get_memory_properties();
++		VkDeviceSize heap = 0;
++		for (uint32_t i = 0; i < props.memoryHeapCount; i++)
++			if ((props.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0)
++				heap = std::max(heap, props.memoryHeaps[i].size);
++
++		std::string setting = Util::get_environment_string("TAKEDOWN_LOW_VRAM", "");
++		const char *why;
++		bool on;
++		if (setting == "1")
++		{
++			on = true;
++			why = "forced by TAKEDOWN_LOW_VRAM=1";
++		}
++		else if (setting == "0")
++		{
++			on = false;
++			why = "turned off by TAKEDOWN_LOW_VRAM=0";
++		}
++		else
++		{
++			on = heap != 0 && heap <= kLowVramHeapLimit;
++			why = "automatic";
++		}
++		LOGI("Low video memory mode: %s (device-local heap %llu MiB, %s).\n", on ? "on" : "off",
++		     static_cast<unsigned long long>(heap / (1024 * 1024)), why);
++		low_vram = on;
++	});
++	return low_vram;
++}
++
++bool active()
++{
++	return low_vram;
++}
++}
++}
+diff --git b/vulkan/low_vram.hpp b/vulkan/low_vram.hpp
+new file mode 100644
+index 0000000..58755f0
+--- /dev/null
++++ b/vulkan/low_vram.hpp
+@@ -0,0 +1,21 @@
++// Takedown: low video memory mode, for GPUs whose largest device-local heap is
++// 1 GiB or less (on many APUs it is only the 256 MiB BIOS carve-out). The GS
++// image slab, the texture budget and the native scene's caches are then kept
++// small so the heap is not overfilled; it only costs some speed.
++//
++// On by itself on such GPUs; TAKEDOWN_LOW_VRAM=1 forces it on, =0 off.
++#pragma once
++
++#include "vulkan_headers.hpp"
++
++namespace Vulkan
++{
++class Device;
++namespace LowVram
++{
++// Decided on the first call (one device per process) and logged once.
++bool enabled(const Device &device);
++// The decision made by the first enabled() call; false before it.
++bool active();
++}
++}
+diff --git a/vulkan/managers/resource_manager.cpp b/vulkan/managers/resource_manager.cpp
+index 7ee5005..ede3cb0 100644
+--- a/vulkan/managers/resource_manager.cpp
++++ b/vulkan/managers/resource_manager.cpp
+@@ -22,6 +22,7 @@
+ 
+ #define NOMINMAX
+ #include "resource_manager.hpp"
++#include "low_vram.hpp"
+ #include "device.hpp"
+ #include "memory_mapped_texture.hpp"
+ #include "texture_files.hpp"
+@@ -230,6 +231,10 @@ void ResourceManager::init()
+ 			if ((device->get_memory_properties().memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0)
+ 				size = std::max(size, budget[i].budget_size / 2);
+ 
++		// Takedown: a sixth in low video memory mode (see low_vram.hpp).
++		if (LowVram::enabled(*device))
++			size /= 3;
++
+ 		if (size == 0)
+ 		{
+ 			LOGW("No DEVICE_LOCAL heap was found, assuming 2 GiB budget.\n");
+diff --git a/vulkan/managers/shader_manager.cpp b/vulkan/managers/shader_manager.cpp
+index 9277e27..a1da9fd 100644
+--- a/vulkan/managers/shader_manager.cpp
++++ b/vulkan/managers/shader_manager.cpp
+@@ -22,6 +22,7 @@
+ 
+ #define NOMINMAX
+ #ifdef GRANITE_VULKAN_SHADER_MANAGER_RUNTIME_COMPILER
++#include "gpu_diag.hpp"
+ #include "compiler.hpp"
+ #endif
+ #include "shader_manager.hpp"
+@@ -229,6 +230,18 @@ const ShaderTemplateVariant *ShaderTemplate::register_variant(
+ 		if (defines)
+ 			variant->defines = *defines;
+ 
++		{
++			std::string name = path;
++			if (defines)
++				for (auto &def : *defines)
++					name += " " + def.first + "=" + std::to_string(def.second);
++			Util::Hash spirv_hash = variant->precompiled_shader ? variant->precompiled_shader->get_hash()
++			                        : !variant->spirv.empty()
++			                            ? Shader::hash(variant->spirv.data(), variant->spirv.size() * sizeof(uint32_t))
++			                            : variant->spirv_hash;
++			GpuDiag::name_shader(spirv_hash, name);
++		}
++
+ 		ret = variants.insert_yield(hash, variant);
+ 	}
+ 	return ret;

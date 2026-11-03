@@ -2,6 +2,9 @@
 
 #include "takedown/platform/native_cmd_emitter.hpp"
 
+#include "takedown/platform/native_car_submit.hpp"
+#include "takedown/platform/native_world_submit.hpp"
+
 #include "takedown/runtime/slus_21050_car_trusted.hpp"
 
 #include <algorithm>
@@ -10,6 +13,8 @@
 #include <tuple>
 #include <chrono>
 #include <cstdio>
+#include <deque>
+#include <unordered_map>
 #include <unordered_set>
 #include <cstdlib>
 #include <cstring>
@@ -18,6 +23,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #endif
+#include <atomic>
 #include <optional>
 #include <x86intrin.h>
 
@@ -184,6 +190,18 @@ bool native_cmd_renderer_supports(const std::filesystem::path& pipe_path, const 
     return false;
 #endif
 }
+
+namespace {
+std::atomic<CarSubmitRing*> g_car_submit_ring{nullptr};
+std::atomic<world_submit::Ring*> g_world_submit_ring{nullptr};
+std::atomic<world_submit::Ring*> g_world_shadow_ring{nullptr};
+std::atomic<const nc::ProgramInfo*> g_program_override{nullptr};
+} // namespace
+
+CarSubmitRing* native_car_submit_ring() noexcept { return g_car_submit_ring.load(std::memory_order_acquire); }
+world_submit::Ring* native_world_submit_ring() noexcept { return g_world_submit_ring.load(std::memory_order_acquire); }
+world_submit::Ring* native_world_shadow_ring() noexcept { return g_world_shadow_ring.load(std::memory_order_acquire); }
+void native_cmd_set_program_override_for_test(const nc::ProgramInfo* info) noexcept { g_program_override.store(info, std::memory_order_relaxed); }
 
 struct NativeCmdEmitter::Impl {
     // ---- TAKEDOWN_NATIVE_CMD_STATECHECK=1: what a world/prop microprogram leaves behind (opt3x trusted-mode analysis) ----
@@ -587,6 +605,14 @@ struct NativeCmdEmitter::Impl {
         trust_on = cfg_.mode == 2 && env_flag("TAKEDOWN_NATIVE_CMD_TRUST", true) && !chk_on && !scr_on;
         car_check_on = env_flag("TAKEDOWN_NATIVE_CMD_CARCHECK", false);
         car_trust_on = trust_on && env_flag("TAKEDOWN_NATIVE_CMD_TRUST_CARS", true) && !env_flag("TAKEDOWN_NATIVE_CARS_VERIFY", false) && !car_check_on;
+        // P1: the native DrawCar's submissions need the trusted-car token path (same records, same tokens) and are off by default. The
+        // gate is read here, once: it must not change while markers can be in flight.
+        car_on = car_trust_on && env_flag("TAKEDOWN_NATIVE_CAR_SUBMIT", true);
+        if (car_on) {
+            car_ring = std::make_unique<CarSubmitRing>();
+            g_car_submit_ring.store(car_ring.get(), std::memory_order_release);
+        }
+        world_submit_init(); // P2: TAKEDOWN_NATIVE_WORLD_SUBMIT / TAKEDOWN_P2_SHADOW
         if (const char* tp = std::getenv("TAKEDOWN_NATIVE_CMD_TRAIN"); tp != nullptr && *tp != '\0') {
             train_file = std::fopen(tp, "wb");
         }
@@ -692,11 +718,11 @@ struct NativeCmdEmitter::Impl {
         std::uint64_t code;    // FNV-1a of those bytes
     };
     static constexpr CodeId kCodeIds[] = {
-        {0x59e3769eddeb1139ULL, 683U, 0xaa01036acba5b324ULL}, // p10: instructions 0..682
-        {0xd97899d60f3b5654ULL, 613U, 0x90b1dcb66499f30eULL}, // p11: instructions 0..612
-        {0x5b236e64bcb56d57ULL, 804U, 0x792eac321f44a463ULL}, // p3: instructions 0..803
-        {0xcd4cffe7f78f5fd5ULL, 683U, 0xaa01036acba5b324ULL}, // pfe: instructions 0..682
-        {0x353b67ba772484f1ULL, 670U, 0x1c18b5addf2729d4ULL}, // p5_car: instructions 0..669
+    {0x59e3769eddeb1139ULL, 683U, 0xaa01036acba5b324ULL}, // p10: instructions 0..682
+    {0xd97899d60f3b5654ULL, 613U, 0x90b1dcb66499f30eULL}, // p11: instructions 0..612
+    {0x5b236e64bcb56d57ULL, 804U, 0x792eac321f44a463ULL}, // p3: instructions 0..803
+    {0xcd4cffe7f78f5fd5ULL, 683U, 0xaa01036acba5b324ULL}, // pfe: instructions 0..682
+    {0x353b67ba772484f1ULL, 670U, 0x1c18b5addf2729d4ULL}, // p5_car: instructions 0..669
     };
     static std::uint64_t fnv1a(const std::uint8_t* p, std::size_t n) noexcept {
         std::uint64_t h = 1469598103934665603ULL;
@@ -723,6 +749,9 @@ struct NativeCmdEmitter::Impl {
     }
 
     const nc::ProgramInfo* identify(std::span<const std::byte> micro) {
+        if (const nc::ProgramInfo* forced = g_program_override.load(std::memory_order_relaxed); forced != nullptr) {
+            return forced; // unit tests (native_cmd_set_program_override_for_test)
+        }
         if (micro.size() < 16384U) {
             return nullptr;
         }
@@ -749,8 +778,25 @@ struct NativeCmdEmitter::Impl {
         return probes.back().info;
     }
 
+    static constexpr std::uint64_t kViewSeed = 0x7669657755ULL;
     std::shared_ptr<ViewSlot> view_slot(const nc::VuData& vu) {
-        const std::uint64_t h = nc::hash64(vu.bytes + 1014U * 16U, 160U, 0x7669657755ULL);
+        return view_slot_for(nc::hash64(vu.bytes + 1014U * 16U, 160U, kViewSeed), vu);
+    }
+    // The slot of a view block that did not come from VU1 memory (a car submission: qw 1014..1023 as 40 floats). Same hash, same
+    // ViewParams / ViewBlock as view_slot() makes from VU memory holding the same 160 bytes.
+    std::shared_ptr<ViewSlot> view_slot_block(const float* block40) {
+        const std::uint64_t h = nc::hash64(block40, 160U, kViewSeed);
+        const auto found = views.find(h);
+        if (found != views.end()) {
+            found->second->last_frame = frame;
+            return found->second;
+        }
+        view_scratch.resize(16384U);
+        std::memcpy(view_scratch.data() + 1014U * 16U, block40, 160U);
+        return view_slot_for(h, nc::VuData{view_scratch.data()});
+    }
+    std::vector<std::uint8_t> view_scratch;
+    std::shared_ptr<ViewSlot> view_slot_for(std::uint64_t h, const nc::VuData& vu) {
         const auto found = views.find(h);
         if (found != views.end()) {
             found->second->last_frame = frame;
@@ -767,7 +813,7 @@ struct NativeCmdEmitter::Impl {
     }
 
     // Programs 3/4: qw 1007..1009 and 1013.z, the inputs of the specular term besides the vertex (see nc::SpecularLight).
-    std::shared_ptr<SpecSlot> spec_slot(const nc::VuData& vu) {
+    static nc::SpecularLight spec_body(const nc::VuData& vu) noexcept {
         nc::SpecularLight b{};
         for (std::uint32_t l = 0; l != 4U; ++l) {
             b.direction[l] = vu.f(1007U, l);
@@ -775,6 +821,11 @@ struct NativeCmdEmitter::Impl {
         }
         b.minimum = vu.f(1009U, 0);
         b.enabled = vu.word(1013U, 2) == 0U ? 1U : 0U;
+        return b;
+    }
+    std::shared_ptr<SpecSlot> spec_slot(const nc::VuData& vu) { return spec_slot_body(spec_body(vu)); }
+    // The slot of a specular light (found or made by the hash of its body): shared by the trusted launches and the world submissions.
+    std::shared_ptr<SpecSlot> spec_slot_body(const nc::SpecularLight& b) {
         const std::uint64_t h = nc::hash64(&b, sizeof b, 0x7370656375ULL);
         const auto found = specs.find(h);
         if (found != specs.end()) {
@@ -832,13 +883,8 @@ struct NativeCmdEmitter::Impl {
             wkey = nc::hash_mix(wkey, (static_cast<std::uint64_t>(vu.word(1005U, 1)) << 32U) | vu.word(1005U, 2));
         }
         static_cast<void>(qw);
-        const auto it = meshes.find(wkey);
-        if (it != meshes.end()) {
-            if (it->second->last_frame != frame) {
-                it->second->last_frame = frame;
-                touched.push_back(wkey);
-            }
-            return it->second;
+        if (std::shared_ptr<MeshEntry> hit = mesh_lookup(wkey)) {
+            return hit;
         }
         auto e = std::make_shared<MeshEntry>();
         e->wkey = wkey;
@@ -855,20 +901,40 @@ struct NativeCmdEmitter::Impl {
                 }
             }
         }
+        return mesh_insert(std::move(e));
+    }
+    // The cached geometry of a key, touched for this frame, or null.
+    std::shared_ptr<MeshEntry> mesh_lookup(std::uint64_t wkey) {
+        const auto it = meshes.find(wkey);
+        if (it == meshes.end()) {
+            return nullptr;
+        }
+        if (it->second->last_frame != frame) {
+            it->second->last_frame = frame;
+            touched.push_back(wkey);
+        }
+        return it->second;
+    }
+    static void mesh_bounds(MeshEntry& e) noexcept {
+        const std::uint32_t n = e.m.n;
         if (n != 0U) {
             for (std::uint32_t c = 0; c != 3U; ++c) {
-                e->lo[c] = e->hi[c] = e->m.pos[c];
+                e.lo[c] = e.hi[c] = e.m.pos[c];
             }
             for (std::uint32_t i = 1; i != n; ++i) {
                 for (std::uint32_t c = 0; c != 3U; ++c) {
-                    e->lo[c] = std::min(e->lo[c], e->m.pos[3U * i + c]);
-                    e->hi[c] = std::max(e->hi[c], e->m.pos[3U * i + c]);
+                    e.lo[c] = std::min(e.lo[c], e.m.pos[3U * i + c]);
+                    e.hi[c] = std::max(e.hi[c], e.m.pos[3U * i + c]);
                 }
             }
         }
+    }
+    // Registers a decoded entry (bounds, budget, touch list). `e->wkey`, `info`, `last_frame` and `m` are set.
+    std::shared_ptr<MeshEntry> mesh_insert(std::shared_ptr<MeshEntry> e) {
+        mesh_bounds(*e);
         mesh_bytes += e->bytes();
-        touched.push_back(wkey);
-        meshes.emplace(wkey, e);
+        touched.push_back(e->wkey);
+        meshes.emplace(e->wkey, e);
         return e;
     }
 
@@ -881,6 +947,56 @@ struct NativeCmdEmitter::Impl {
         std::shared_ptr<ViewSlot> vslot;
         std::uint32_t aux{};
     };
+    // Damage zones 974..1005 (CarConst qw 12..43). A part sends only its first 4*T of them (T = 1013.z low half: 0, 2 panel, 8 body);
+    // the car program reads the rest as VU1 left them, usually the body's zones of the same car. Native submissions never reach VU1, so
+    // VU1 memory lacks their zones: `zones_` mirrors what VU1 would hold, `zones_native_` marks the quadwords a submission wrote since
+    // the last guest launch that sent them. Both paths fill the unsent quadwords from the mirror where VU1 is stale, and from VU1
+    // (trusted launch) otherwise, so the constants are the ones the original VU1 would have had.
+    std::array<std::array<std::uint32_t, 4>, 32> zones_{};
+    std::uint32_t zones_native_{};
+    // VU1 974..1005 as last seen at a launch (submissions on). A quadword that changed since was written by the guest (another
+    // program's packet or output, or a call's VU1 tail): VU1 is current there again.
+    std::array<std::array<std::uint32_t, 4>, 32> zones_seen_{};
+    void observe_zones(std::span<const std::byte> data) {
+        if (data.size() < 1006U * 16U) {
+            return;
+        }
+        for (std::uint32_t i = 0; i != 32U; ++i) {
+            std::array<std::uint32_t, 4> q;
+            std::memcpy(q.data(), data.data() + (974U + i) * 16U, 16U);
+            if (q != zones_seen_[i]) {
+                zones_seen_[i] = q;
+                zones_[i] = q;
+                zones_native_ &= ~(1U << i);
+            }
+        }
+    }
+    void merge_zones(nc::CarConst& c, bool native_submit) {
+        const std::uint32_t t = std::min<std::uint32_t>(c.qw[51][2] & 0xFFFFU, 8U);
+        for (std::uint32_t i = 0; i != 32U; ++i) {
+            auto& q = c.qw[12U + i];
+            const std::uint32_t bit = 1U << i;
+            if (i < 4U * t) {
+                for (std::uint32_t k = 0; k != 4U; ++k) zones_[i][k] = q[k];
+                zones_native_ = native_submit ? (zones_native_ | bit) : (zones_native_ & ~bit);
+            } else if (native_submit || (zones_native_ & bit) != 0U) {
+                for (std::uint32_t k = 0; k != 4U; ++k) q[k] = zones_[i][k];
+            } else {
+                for (std::uint32_t k = 0; k != 4U; ++k) zones_[i][k] = q[k];
+            }
+        }
+    }
+    // The slot of a part's constants (found or made by their key): shared by the trusted launches and the car submissions.
+    std::shared_ptr<CarConstSlot> car_const_slot(const nc::CarConst& c, std::uint64_t& ckey) {
+        ckey = car_submit::const_key(c);
+        std::shared_ptr<CarConstSlot>& cslot = car_consts[ckey];
+        if (!cslot) {
+            cslot = std::make_shared<CarConstSlot>();
+            cslot->body = c;
+        }
+        cslot->last_frame = frame;
+        return cslot;
+    }
     CarCommon car_common(const guest::Vu1Launch& l, const guest::Vu1LaunchReplacement& r) {
         CarCommon cc;
         const nc::VuData vu{reinterpret_cast<const std::uint8_t*>(l.data.data())};
@@ -905,17 +1021,9 @@ struct NativeCmdEmitter::Impl {
         }
         car_meshes[mkey].last_frame = frame;
         // part constants
-        nc::CarConst c{};
+        nc::CarConst c = car_submit::make_const_base(vu.bytes + 962U * 16U, vu.bytes + 1022U * 16U);
         const bool prepared_here = (vu.word(965U, 3U) & 0xFFFFU) == 0U;
         c.flags = (prepared_here ? nc::kCarPreparedHere : 0U);
-        for (std::uint32_t i = 0; i != 52U; ++i) {
-            const nc::Quad q = vu.quad(962U + i);
-            std::memcpy(c.qw[i], q.data(), 16U);
-        }
-        for (std::uint32_t i = 0; i != 2U; ++i) {
-            const nc::Quad q = vu.quad(1022U + i);
-            std::memcpy(c.guard[i], q.data(), 16U);
-        }
         const bool damaged = (vu.word(1013U, 2U) & 0xFFFFU) != 0U;
         const bool reflective = (vu.word(1013U, 1U) & 0xFFFFU) == 0U;
         bool clip = false;
@@ -952,18 +1060,12 @@ struct NativeCmdEmitter::Impl {
                 c.offset[k] = std::bit_cast<float>(l.state.vectors[2].words[k]);
             }
         }
+        merge_zones(c, false);
         c.flags |= (clip ? nc::kCarClip : 0U) | (damaged ? nc::kCarDamaged : 0U) | (reflective ? nc::kCarReflective : 0U);
-        const std::uint64_t ckey = nc::hash64(&c, sizeof c, 0xC0457ULL);
-        std::shared_ptr<CarConstSlot>& cslot = car_consts[ckey];
-        if (!cslot) {
-            cslot = std::make_shared<CarConstSlot>();
-            cslot->body = c;
-        }
-        cslot->last_frame = frame;
         cc.mkey = mkey;
-        cc.ckey = ckey;
-        cc.cslot = cslot;
+        cc.cslot = car_const_slot(c, cc.ckey);
         cc.vslot = view_slot(vu);
+        p2_last_car_view = cc.vslot->hash;
         cc.aux = l.state.flag_history_initialized ? l.state.clip_flag_history[3] : l.state.control[18];
         return cc;
     }
@@ -1017,6 +1119,28 @@ struct NativeCmdEmitter::Impl {
         std::uint64_t launches{}, draws{}, declined{}, check_launches{}, check_bad{};
     } cts;
     bool car_trust_on{false};
+    // The DRAW of one strip of a car batch (pass 0 the body strip, pass 1 the environment strip): what a trusted launch queues for its
+    // token and what a car submission emits at its marker. Both build it here so the records cannot differ.
+    static void fill_car_decision(Decision& d, const nc::Tags& tg, std::uint32_t count, std::uint32_t pass, const CarCommon& cc) {
+        d.matched = true;
+        d.is_car = true;
+        d.draw.nverts = count;
+        d.draw.prim = tg.prim | (tg.pre ? (1U << 11U) : 0U);
+        d.draw.tint[0] = d.draw.tint[1] = d.draw.tint[2] = d.draw.tint[3] = 1.0F;
+        d.draw.xform[0] = d.draw.xform[5] = d.draw.xform[10] = 1.0F;
+        d.draw.category = static_cast<std::uint16_t>(nc::Category::kCar);
+        d.draw.program = 5;
+        d.draw.pass = static_cast<std::uint16_t>(pass);
+        d.draw.flags = nc::kDrawAdcMesh | (pass != 0U ? nc::kDrawEnvPass : 0U);
+        d.draw.mesh_key = cc.mkey;
+        d.draw.const_key = cc.ckey;
+        d.draw.aux = cc.aux;
+        d.draw.view_id = cc.vslot->id;
+        d.view = cc.vslot;
+        d.cslot = cc.cslot;
+        d.const_key = cc.ckey;
+        d.mesh_key = cc.mkey;
+    }
     bool handle_trusted_car(const guest::Vu1Launch& l, guest::Vu1LaunchReplacement& rep) {
         runtime::Slus21050CarTrusted::Strips strips;
         const std::uint32_t count = l.itop;
@@ -1046,25 +1170,7 @@ struct NativeCmdEmitter::Impl {
             if (next_trust_id > 0xFFFFFFU) {
                 next_trust_id = 1;
             }
-            Decision& d = td.d;
-            d.matched = true;
-            d.is_car = true;
-            d.draw.nverts = count;
-            d.draw.prim = tg.prim | (tg.pre ? (1U << 11U) : 0U);
-            d.draw.tint[0] = d.draw.tint[1] = d.draw.tint[2] = d.draw.tint[3] = 1.0F;
-            d.draw.xform[0] = d.draw.xform[5] = d.draw.xform[10] = 1.0F;
-            d.draw.category = static_cast<std::uint16_t>(nc::Category::kCar);
-            d.draw.program = 5;
-            d.draw.pass = static_cast<std::uint16_t>(pass);
-            d.draw.flags = nc::kDrawAdcMesh | (pass != 0U ? nc::kDrawEnvPass : 0U);
-            d.draw.mesh_key = cc.mkey;
-            d.draw.const_key = cc.ckey;
-            d.draw.aux = cc.aux;
-            d.draw.view_id = cc.vslot->id;
-            d.view = cc.vslot;
-            d.cslot = cc.cslot;
-            d.const_key = cc.ckey;
-            d.mesh_key = cc.mkey;
+            fill_car_decision(td.d, tg, count, pass, cc);
             const nc::Token tok{td.id, count, tg.prim, tg.pre, tg.eop};
             res->packet[at] = nc::encode_token(tok, cfg.elide);
             at += per;
@@ -1315,6 +1421,7 @@ struct NativeCmdEmitter::Impl {
         std::uint64_t const_key{0};
         bool is_car{false};
         std::uint32_t mesh_bytes_count{0};
+        const std::vector<std::uint8_t>* car_body{nullptr}; // car submissions: the batch image (else looked up in car_meshes by mesh_key)
         std::vector<std::uint32_t> mask; // flag kDrawHasMask: triangles drawn (bit per triangle of the mesh's list)
         std::uint32_t mask_triangles{0};
     };
@@ -1656,9 +1763,13 @@ struct NativeCmdEmitter::Impl {
     void write_defs_and_draw(Decision& d, const nc::Tags& tg, bool shadow) {
         cb.clear();
         if (d.is_car) {
-            const auto cm = car_meshes.find(d.mesh_key);
-            if (cm != car_meshes.end() && registry.acquire(d.mesh_key, frame, static_cast<std::uint32_t>(cm->second.body.size()))) {
-                cb.add(nc::Op::kMeshDef, static_cast<std::uint16_t>(nc::MeshLayout::kCarBatch), d.mesh_key, cm->second.body.data(), cm->second.body.size());
+            const std::vector<std::uint8_t>* body = d.car_body;
+            if (body == nullptr) {
+                const auto cm = car_meshes.find(d.mesh_key);
+                body = cm != car_meshes.end() ? &cm->second.body : nullptr;
+            }
+            if (body != nullptr && registry.acquire(d.mesh_key, frame, static_cast<std::uint32_t>(body->size()))) {
+                cb.add(nc::Op::kMeshDef, static_cast<std::uint16_t>(nc::MeshLayout::kCarBatch), d.mesh_key, body->data(), body->size());
                 ++st.mesh_defs;
                 ++f_mesh_defs;
             }
@@ -1985,6 +2096,108 @@ struct NativeCmdEmitter::Impl {
                      std::bit_cast<float>(r[2]), std::bit_cast<float>(r[3]));
     }
 
+    // ---- the decision core, shared by trusted launches and native submissions (P2) ----
+    // Everything the core needs of one vertex group, however it was obtained: read from VU1 memory (handle_trusted_launch) or supplied by
+    // a world / prop submission (world_submit::Submit, native_world_submit_impl.inc).
+    struct TrustedInput {
+        const nc::ProgramInfo* info{};
+        std::uint32_t n{};                 // vertices: the DRAW's and the token's nverts
+        std::uint32_t prim{};              // token PRIM (11 bits) | PRE << 11
+        double near_w{}, far_w{};          // qw 1021.w / 1020.w
+        std::shared_ptr<MeshEntry> mesh;
+        std::shared_ptr<ViewSlot> view;
+        nc::SpecularLight spec_body{};     // programs 3/4 (info->decoder == kWorld3N)
+        float mirror_y0{};                 // program 12: 2 * qw 1009.y
+        const nc::PropInstance* inst{};    // props: the instances
+        std::uint32_t ninst{1};            // props: their number; world: 1
+    };
+
+    // The draws of one group in order: one per visible instance, each with its mask. `count` false: no statistics (the shadow check
+    // recomputes a group's draws without counting them twice). Pure function of `in` and the emitter's caches.
+    void trusted_build_draws(const TrustedInput& in, std::vector<TrustedDraw>& out, bool count = true) {
+        const nc::ProgramInfo* info = in.info;
+        const bool prop = info->decoder == nc::Decoder::kProp;
+        const std::shared_ptr<MeshEntry>& mesh = in.mesh;
+        const std::shared_ptr<ViewSlot>& view = in.view;
+        const nc::ViewParams& vp = view->params;
+        std::shared_ptr<SpecSlot> spec;
+        float mirror[12] = {1, 0, 0, 0, 0, -1, 0, 0, 0, 0, 1, 0};
+        if (info->program == 12U) {
+            mirror[7] = in.mirror_y0;
+        }
+        for (std::uint32_t k = 0; k != in.ninst; ++k) {
+            const float* xform = prop ? in.inst[k].xform : (info->program == 12U ? mirror : nullptr);
+            if (box_outside(vp, mesh->lo, mesh->hi, xform, in.far_w)) {
+                if (count) {
+                    ++ts.instances_off;
+                }
+                continue;
+            }
+            std::uint32_t front = 0;
+            const std::uint32_t kept = trusted_mask(vp, *mesh, xform, program_culls(info->program), std::max(in.near_w, 1e-6), in.far_w, front);
+            const std::uint32_t ntri = static_cast<std::uint32_t>(mesh->tris.size() / 3U);
+            if (count) {
+                ts.tris_total += ntri;
+                ts.tris_kept += kept;
+            }
+            if (kept == 0U) {
+                continue;
+            }
+            if (info->decoder == nc::Decoder::kWorld3N && !spec) {
+                spec = spec_slot_body(in.spec_body);
+            }
+            TrustedDraw td;
+            Decision& d = td.d;
+            d.matched = true;
+            d.draw.nverts = in.n;
+            d.draw.prim = in.prim;
+            d.draw.tint[0] = d.draw.tint[1] = d.draw.tint[2] = d.draw.tint[3] = 1.0F;
+            d.draw.xform[0] = d.draw.xform[5] = d.draw.xform[10] = 1.0F;
+            d.draw.category = static_cast<std::uint16_t>(info->category);
+            d.draw.program = info->program;
+            d.draw.pass = static_cast<std::uint16_t>(prop ? k : static_cast<std::uint32_t>(out.size()));
+            d.draw.flags = nc::kDrawAdcMesh | nc::kDrawVerified | (prop ? 0U : nc::kDrawWorldSpace) | (info->program == 12U ? nc::kDrawMirror : 0U);
+            d.mesh_hold = mesh;
+            d.mesh_body = &wire_mesh_body(*mesh, false, d.mesh_key);
+            d.draw.mesh_key = d.mesh_key;
+            d.draw.view_id = view->id;
+            d.view = view;
+            if (spec) {
+                d.draw.flags |= nc::kDrawSpecular;
+                d.draw.const_key = spec->key;
+                d.spec = spec;
+            }
+            if (prop) {
+                std::memcpy(d.draw.xform, in.inst[k].xform, sizeof d.draw.xform);
+                std::memcpy(d.draw.tint, in.inst[k].tint, sizeof d.draw.tint);
+            } else if (info->program == 12U) {
+                std::memcpy(d.draw.xform, mirror, sizeof mirror);
+            }
+            d.draw.surv_pos = static_cast<std::uint16_t>(std::min<std::uint32_t>(kept, 65535U));
+            d.draw.kicks = kept;
+            if (kept != ntri) {
+                d.draw.flags |= nc::kDrawHasMask;
+                d.mask = t_mask;
+                d.mask_triangles = ntri;
+                if (count) {
+                    ++st.masked;
+                }
+            }
+            out.push_back(std::move(td));
+        }
+    }
+
+    // True when an instance's tint is not a colour: a lit prop (kind 5), whose strips the renderer cannot draw from a mesh.
+    static bool lit_instance(const nc::PropInstance& inst) noexcept {
+        for (const float t : inst.tint) {
+            if (!(t >= 0.0F && t * 255.0F < 255.5F)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Answers a launch of a world / prop program without running it. False: the launch is not handled (the program runs, legacy path).
     bool handle_trusted_launch(const guest::Vu1Launch& l, const nc::ProgramInfo* info, guest::Vu1LaunchReplacement& rep) {
         const std::uint32_t n = l.itop;
         if (info->decoder == nc::Decoder::kCar || info->decoder == nc::Decoder::kNone) {
@@ -2009,10 +2222,8 @@ struct NativeCmdEmitter::Impl {
                 return false;
             }
             for (std::uint32_t k = 0; k != ninst; ++k) {
-                for (const float t : inst[k].tint) {
-                    if (!(t >= 0.0F && t * 255.0F < 255.5F)) {
-                        return false; // a lit prop: the strip stays a legacy strip
-                    }
+                if (lit_instance(inst[k])) {
+                    return false; // a lit prop: the strip stays a legacy strip
                 }
             }
         }
@@ -2032,70 +2243,26 @@ struct NativeCmdEmitter::Impl {
             ++ts.stale_camera;   // the program draws with an older camera than data memory holds: it runs (legacy path), exact
             return false;
         }
-        std::shared_ptr<MeshEntry> mesh = mesh_for(vu, l, info);
-        const std::shared_ptr<ViewSlot> view = view_slot(vu);
-        const nc::ViewParams& vp = view->params;
-        std::shared_ptr<SpecSlot> spec;
-        float y0 = 0.0F;
-        float mirror[12] = {1, 0, 0, 0, 0, -1, 0, 0, 0, 0, 1, 0};
-        if (info->program == 12U) {
-            y0 = 2.0F * vu.f(1009U, 1);
-            mirror[7] = y0;
+        TrustedInput in;
+        in.info = info;
+        in.n = n;
+        in.prim = prim;
+        in.near_w = near_w;
+        in.far_w = far_w;
+        in.mesh = mesh_for(vu, l, info);
+        in.view = view_slot(vu);
+        if (info->decoder == nc::Decoder::kWorld3N) {
+            in.spec_body = spec_body(vu);
         }
+        if (info->program == 12U) {
+            in.mirror_y0 = 2.0F * vu.f(1009U, 1);
+        }
+        in.inst = inst;
+        in.ninst = ninst;
         std::vector<TrustedDraw> out;
-        for (std::uint32_t k = 0; k != ninst; ++k) {
-            const float* xform = prop ? inst[k].xform : (info->program == 12U ? mirror : nullptr);
-            if (box_outside(vp, mesh->lo, mesh->hi, xform, far_w)) {
-                ++ts.instances_off;
-                continue;
-            }
-            std::uint32_t front = 0;
-            const std::uint32_t kept = trusted_mask(vp, *mesh, xform, program_culls(info->program), std::max(near_w, 1e-6), far_w, front);
-            const std::uint32_t ntri = static_cast<std::uint32_t>(mesh->tris.size() / 3U);
-            ts.tris_total += ntri;
-            ts.tris_kept += kept;
-            if (kept == 0U) {
-                continue;
-            }
-            if (info->decoder == nc::Decoder::kWorld3N && !spec) {
-                spec = spec_slot(vu);
-            }
-            TrustedDraw td;
-            Decision& d = td.d;
-            d.matched = true;
-            d.draw.nverts = n;
-            d.draw.prim = prim;
-            d.draw.tint[0] = d.draw.tint[1] = d.draw.tint[2] = d.draw.tint[3] = 1.0F;
-            d.draw.xform[0] = d.draw.xform[5] = d.draw.xform[10] = 1.0F;
-            d.draw.category = static_cast<std::uint16_t>(info->category);
-            d.draw.program = info->program;
-            d.draw.pass = static_cast<std::uint16_t>(prop ? k : static_cast<std::uint32_t>(out.size()));
-            d.draw.flags = nc::kDrawAdcMesh | nc::kDrawVerified | (prop ? 0U : nc::kDrawWorldSpace) | (info->program == 12U ? nc::kDrawMirror : 0U);
-            d.mesh_hold = mesh;
-            d.mesh_body = &wire_mesh_body(*mesh, false, d.mesh_key);
-            d.draw.mesh_key = d.mesh_key;
-            d.draw.view_id = view->id;
-            d.view = view;
-            if (spec) {
-                d.draw.flags |= nc::kDrawSpecular;
-                d.draw.const_key = spec->key;
-                d.spec = spec;
-            }
-            if (prop) {
-                std::memcpy(d.draw.xform, inst[k].xform, sizeof d.draw.xform);
-                std::memcpy(d.draw.tint, inst[k].tint, sizeof d.draw.tint);
-            } else if (info->program == 12U) {
-                std::memcpy(d.draw.xform, mirror, sizeof mirror);
-            }
-            d.draw.surv_pos = static_cast<std::uint16_t>(std::min<std::uint32_t>(kept, 65535U));
-            d.draw.kicks = kept;
-            if (kept != ntri) {
-                d.draw.flags |= nc::kDrawHasMask;
-                d.mask = t_mask;
-                d.mask_triangles = ntri;
-                ++st.masked;
-            }
-            out.push_back(std::move(td));
+        trusted_build_draws(in, out);
+        if (shadow_ring) {
+            shadow_check(in, out); // P2 shadow mode (native_world_submit_impl.inc)
         }
         if (out.empty()) {
             ++ts.offscreen;
@@ -2147,7 +2314,14 @@ struct NativeCmdEmitter::Impl {
         }
         TrustedDraw td = std::move(trusted.front());
         trusted.pop_front();
-        Decision& d = td.d;
+        emit_decision_and_token(td.d, t);
+        ++ts.tokens_matched;
+        return true;
+    }
+
+    // A decided draw reached its position in the stream: its definitions and DRAW record, then its token with the final sequence number
+    // (one record per draw, the record first). `t` carries the token's vertex count, PRIM, PRE and EOP.
+    void emit_decision_and_token(Decision& d, const nc::Token& t) {
         d.draw.seq = next_seq;
         write_defs_and_draw(d, nc::Tags{}, false);
         emit_record();
@@ -2156,15 +2330,108 @@ struct NativeCmdEmitter::Impl {
         writer.write_gif_quadword(guest::GifPath::Path1, guest::GsQuadword{out[0], out[1], out[2], out[3]});
         ++st.tokens;
         ++f_tokens;
-        ++ts.tokens_matched;
         if (d.is_car) {
             ++st.matched_car;
         } else {
             ++st.matched_world;
         }
         ++next_seq;
-        return true;
     }
+
+    // ---- P1: native car submissions (TAKEDOWN_NATIVE_CAR_SUBMIT=1) ----
+    bool car_on{false};
+    std::unique_ptr<CarSubmitRing> car_ring;
+    car_submit::GifPacketCursor p2;
+    std::uint64_t car_markers{}, car_bad_batches{};
+
+    // The records and tokens of one submitted DrawCarList entry, as handle_trusted_car + trusted_token write them for the same constants
+    // and batches: the CAR_CONST (once per frame per key) and VIEW (once per frame) definitions ride with the first draw that needs them,
+    // each draw is MESH def if new + DRAW in one record, followed by its token (PATH1, elided unless the stream is not).
+    void emit_car_submit(const CarSubmit& s) {
+        CarCommon cc;
+        nc::CarConst c = car_submit::make_const(s);
+        merge_zones(c, true);
+        cc.cslot = car_const_slot(c, cc.ckey);
+        cc.vslot = view_slot_block(s.view);
+        cc.aux = 0U;
+        const std::uint32_t nb = std::min<std::uint32_t>(s.batch_count, car_submit::kMaxBatches);
+        for (std::uint32_t b = 0; b != nb; ++b) {
+            const car_submit::Batch& batch = s.batches[b];
+            const std::uint32_t count = batch.count;
+            if (!batch.mesh || count == 0U || count > nc::kMaxGroupVertices) {
+                ++car_bad_batches;
+                continue;
+            }
+            cc.mkey = batch.mesh_key;
+            const std::uint32_t passes = batch.env ? 2U : 1U;
+            for (std::uint32_t pass = 0; pass != passes; ++pass) {
+                const nc::Tags tg = nc::parse_gif_tag(car_submit::strip_tag(count, pass, batch.env));
+                Decision d;
+                fill_car_decision(d, tg, count, pass, cc);
+                d.car_body = batch.mesh.get();
+                emit_decision_and_token(d, nc::Token{0U, count, tg.prim, tg.pre, tg.eop});
+                if (!cfg.elide) {
+                    writer.on_gs_gif_quadwords(guest::GifPath::Path1, std::span<const guest::GsQuadword>(zeros.data(), static_cast<std::size_t>(count) * 3U));
+                }
+            }
+        }
+    }
+
+    // A marker quadword was found at a PATH2 tag position. Nothing is forwarded for it.
+    void handle_car_marker(const nc::Quad& q) {
+        ++car_markers;
+        const car_submit::Marker m = car_submit::decode_marker(q);
+        CarSubmit* s = car_ring->acquire(m.seq24, m.generation);
+        if (s == nullptr) {
+            return; // stale or lost: the renderer draws no car there (the ring counted it)
+        }
+        emit_car_submit(*s);
+        car_ring->release();
+    }
+
+    // PATH2 quadwords in arbitration order: everything is forwarded unchanged but the markers. The caller flushed the held PATH1 strip.
+    void path2_quadword(const guest::GsQuadword& q) {
+        const nc::Quad qq{q[0], q[1], q[2], q[3]};
+        if (p2.at_tag()) {
+            if (world_submit::is_marker(qq)) {
+                handle_marker(qq);
+                return;
+            }
+            p2.begin(qq);
+        } else {
+            p2.skip(1U);
+        }
+        writer.write_gif_quadword(guest::GifPath::Path2, q);
+    }
+    void path2_run(std::span<const guest::GsQuadword> run) {
+        std::size_t i = 0, forward_from = 0;
+        const auto forward_to = [&](std::size_t end) {
+            if (end > forward_from) {
+                writer.on_gs_gif_quadwords(guest::GifPath::Path2, run.subspan(forward_from, end - forward_from));
+            }
+        };
+        while (i < run.size()) {
+            if (!p2.at_tag()) {
+                const std::size_t take = std::min<std::size_t>(p2.remaining(), run.size() - i);
+                p2.skip(static_cast<std::uint32_t>(take));
+                i += take;
+                continue;
+            }
+            const nc::Quad qq{run[i][0], run[i][1], run[i][2], run[i][3]};
+            if (world_submit::is_marker(qq)) {
+                forward_to(i);
+                handle_marker(qq);
+                ++i;
+                forward_from = i;
+                continue;
+            }
+            p2.begin(qq);
+            ++i;
+        }
+        forward_to(run.size());
+    }
+
+#include "native_world_submit_impl.inc"
 
     void forward_legacy(const guest::GsQuadword* strip, std::size_t count) {
         writer.on_gs_gif_quadwords(guest::GifPath::Path1, std::span<const guest::GsQuadword>(strip, count));
@@ -2399,6 +2666,9 @@ struct NativeCmdEmitter::Impl {
         const std::uint64_t vb0 = tsc();
         std::uint64_t vl = vb0;
         flush_held_now();
+        if (shadow_ring) {
+            shadow_trim();
+        }
         // frees
         cb.clear();
         registry.expire(frame, cfg.mesh_ttl, [this](std::uint64_t key) {
@@ -2498,6 +2768,10 @@ NativeCmdEmitter::~NativeCmdEmitter() {
     if (native_cmd_stream_hooks() == this) {
         set_native_cmd_stream_hooks(nullptr);
     }
+    if (impl_->car_ring && g_car_submit_ring.load(std::memory_order_acquire) == impl_->car_ring.get()) {
+        g_car_submit_ring.store(nullptr, std::memory_order_release);
+    }
+    impl_->world_submit_shutdown();
     log_stats("final");
 }
 
@@ -2508,6 +2782,9 @@ std::optional<guest::Vu1LaunchReplacement> NativeCmdEmitter::before_vu1_launch(c
     ++stats_.launches;
     ++m.launch_counter;
     m.kick_base = memory.vu1_activity().xgkick_packets;
+    if (m.car_on) {
+        m.observe_zones(launch.data);
+    }
     std::uint64_t lc = m.tsc();
     const nc::ProgramInfo* info = nullptr;
     bool car_done = false;
@@ -2597,6 +2874,9 @@ void NativeCmdEmitter::after_vu1_launch(const guest::EeMemory& memory, const gue
     if (impl_->chk_on) {
         impl_->chk_after(launch);
     }
+    if (impl_->car_on) {
+        impl_->observe_zones(launch.data);
+    }
     impl_->reset_learn(launch);
     if (impl_->inner != nullptr) {
         impl_->inner->after_vu1_launch(memory, launch);
@@ -2607,6 +2887,10 @@ void NativeCmdEmitter::on_gs_gif_quadword(const guest::GifPath path, const guest
     Impl& m = *impl_;
     if (path != guest::GifPath::Path1) {
         m.flush_held_now();
+        if (m.marker_on && path == guest::GifPath::Path2) {
+            m.path2_quadword(quadword);
+            return;
+        }
         m.writer.write_gif_quadword(path, quadword);
         return;
     }
@@ -2617,6 +2901,10 @@ void NativeCmdEmitter::on_gs_gif_quadwords(const guest::GifPath path, const std:
     Impl& m = *impl_;
     if (path != guest::GifPath::Path1) {
         m.flush_held_now();
+        if (m.marker_on && path == guest::GifPath::Path2) {
+            m.path2_run(quadwords);
+            return;
+        }
         m.writer.on_gs_gif_quadwords(path, quadwords);
         return;
     }
@@ -2634,10 +2922,17 @@ void NativeCmdEmitter::on_gs_gif_reset() noexcept {
     } catch (...) {
     }
     m.remaining = 0;
+    m.p2.reset();
+    if (m.car_ring) {
+        m.car_ring->bump_generation(); // markers still in the chain and entries in the ring belong to the state that was just reset
+    }
+    m.world_submit_reset();
     m.pkt_entry = nullptr;
     m.pkt_strips = 0;
     m.writer.on_gs_gif_reset();
 }
+
+CarSubmitRing* NativeCmdEmitter::car_submit_ring() noexcept { return impl_->car_ring.get(); }
 
 void NativeCmdEmitter::flush_held() { impl_->flush_held_now(); }
 
@@ -2686,6 +2981,16 @@ void NativeCmdEmitter::log_stats(const char* tag) const {
     if (impl_->car_check_on) {
         impl_->car_check_report();
     }
+    if (impl_->car_ring) {
+        const CarSubmitRing::Counters c = impl_->car_ring->counters();
+        std::fprintf(stderr,
+                     "[CARSUBMIT] %s car_markers=%llu car_lost=%llu car_declined=%llu | pushed=%llu popped=%llu ring_full=%llu stale=%llu missing=%llu bad_batches=%llu generation=%u\n", tag,
+                     static_cast<unsigned long long>(impl_->car_markers), static_cast<unsigned long long>(c.lost), static_cast<unsigned long long>(c.declined),
+                     static_cast<unsigned long long>(c.pushed), static_cast<unsigned long long>(c.popped), static_cast<unsigned long long>(c.full),
+                     static_cast<unsigned long long>(c.stale), static_cast<unsigned long long>(c.missing), static_cast<unsigned long long>(impl_->car_bad_batches),
+                     static_cast<unsigned>(impl_->car_ring->generation()));
+    }
+    impl_->p2_log_stats(tag);
     std::fprintf(stderr, "[NATIVECMD] %s v2: lines/odd-tint strips left to the GS=%llu unmapped strips left=%llu masked draws=%llu\n", tag, static_cast<unsigned long long>(s.v2_left), static_cast<unsigned long long>(s.v2_unmapped), static_cast<unsigned long long>(s.masked));
 }
 

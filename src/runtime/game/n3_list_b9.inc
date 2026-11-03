@@ -1,0 +1,15 @@
+// Batch 9 (2026-11-03): GS/UI packet builders (texture upload, sprite/UI batches, vertex batches, screen tint, light flares, skinned model).
+N3(00222ca0)
+// N3(0021f790)  off 2026-11-03: VU0 dry run costs more than it saves (A/B b9off); replaced by native car drawing
+N3(003655a0)
+N3(002253c0)
+N3(0021de50)
+N3(0021dc50)
+N3(00365640)
+N3(002f3c80)
+N3(00365040)
+N3(001f5510)
+N3(002f4320)
+N3(002274b0)
+N3(0024b390)
+N3(00364e10)
